@@ -1,0 +1,1118 @@
+{
+  "abi": "dart/2.7.2",
+  "_meta": {
+    "generator_rev": 3
+  },
+  "word_size": 8,
+  "compressed_pointers": false,
+  "status": "unverified",
+  "format": {
+    "ref_encoding": "unsigned_leb128",
+    "instructions_table_source": "none",
+    "cluster_header": "raw_cid",
+    "single_snapshot": false,
+    "class_alloc": "pre_ids",
+    "code_leading_refs": 0,
+    "string_clusters_separate": true,
+    "code_alloc": "count_only",
+    "type_dual_count": true,
+    "instance_legacy": true,
+    "objectpool_legacy": true,
+    "objectpool_type_low7": false,
+    "objectpool_type_low7_swapped": false,
+    "code_refs": 7,
+    "code_has_text_offset": false,
+    "class_fill_adj": 0,
+    "code_fill_adj": 0,
+    "elf_name_backfill": false
+  },
+  "header_fields": [
+    {
+      "name": "num_base_objects",
+      "kind": "unsigned"
+    },
+    {
+      "name": "num_objects",
+      "kind": "unsigned"
+    },
+    {
+      "name": "num_clusters",
+      "kind": "unsigned"
+    },
+    {
+      "name": "code_order_length",
+      "kind": "unsigned"
+    }
+  ],
+  "tagging": {
+    "heap_object_tag": 1,
+    "object_alignment": 16,
+    "object_alignment_log2": 4,
+    "smi_mask": 1,
+    "smi_shift": 1,
+    "cid_tag_pos": 16,
+    "cid_tag_mask": 65535,
+    "num_predefined_cids": 144
+  },
+  "full_aot_kind": 3,
+  "object_start_alignment": 16,
+  "alloc": {
+    "rodata_cids": [
+      20,
+      21,
+      22,
+      74,
+      75,
+      76
+    ],
+    "var_cids": [
+      19,
+      23,
+      24,
+      25,
+      26,
+      40,
+      72,
+      73
+    ],
+    "mint_cid": 49,
+    "code_cid": 16,
+    "class_cid": 4,
+    "instance_cid": 38,
+    "instance_min": 144,
+    "library_cid": 13,
+    "function_cid": 6,
+    "type_cid": 42,
+    "type_parameter_cid": 0,
+    "ffi_cids": [
+      60,
+      61,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95
+    ],
+    "canonical_table_cids": [],
+    "typed_data_first": 96,
+    "typed_data_count": 42,
+    "typed_data_stride": 3,
+    "typed_data_elem_widths": [
+      1,
+      1,
+      1,
+      2,
+      2,
+      4,
+      4,
+      8,
+      8,
+      4,
+      8,
+      16,
+      16,
+      16
+    ],
+    "typed_data_var_rem": [
+      0,
+      2
+    ],
+    "typed_data_view_rem": [
+      1
+    ],
+    "string_cid": 74,
+    "one_byte_string_cid": 75,
+    "two_byte_string_cid": 76,
+    "canonical_subset_table_cids": [],
+    "cid_only_alloc_cids": []
+  },
+  "runtime_offsets": {
+    "thread_field_table_values": 96,
+    "thread_stack_limit": 56,
+    "array_data": 24,
+    "typed_data_payload": 24,
+    "one_byte_string_data": 16,
+    "two_byte_string_data": 16,
+    "array_data_minus_tag": 23
+  },
+  "typed_data_names": [
+    "Int8",
+    "Uint8",
+    "Uint8Clamped",
+    "Int16",
+    "Uint16",
+    "Int32",
+    "Uint32",
+    "Int64",
+    "Uint64",
+    "Float32",
+    "Float64",
+    "Float32x4",
+    "Int32x4",
+    "Float64x2"
+  ],
+  "cluster_layouts": {
+    "4": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 16,
+          "aliases": [
+            "name_ref",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "library_ref",
+            null,
+            "super_type_ref",
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        },
+        {
+          "op": "svarint",
+          "alias": "class_id"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint",
+          "alias": "nfo"
+        },
+        {
+          "op": "svarint",
+          "alias": "tao"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "cond",
+          "on": "class_id",
+          "lt": 1,
+          "then": [],
+          "set_default": {
+            "fbm": 0
+          }
+        },
+        {
+          "op": "emit",
+          "store": "classes",
+          "fields": {
+            "name_ref": "name_ref",
+            "library_ref": "library_ref",
+            "class_id": "class_id",
+            "super_type_ref": "super_type_ref",
+            "next_field_off": "nfo",
+            "type_arg_off": "tao",
+            "field_bitmap": "fbm"
+          }
+        }
+      ]
+    },
+    "5": {
+      "_doc": "PatchClass: 2 refs (wrapped_class, script)",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 3,
+          "aliases": [
+            "wrapped_class",
+            null,
+            null
+          ]
+        },
+        {
+          "op": "emit",
+          "store": "patch_classes",
+          "fields": {
+            "wrapped_class": "wrapped_class"
+          }
+        }
+      ]
+    },
+    "6": {
+      "_doc": "Function: name, owner, signature, data refs + code_index(ReadUnsigned) + kind_tag(uint32 有符号变长)",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 7,
+          "aliases": [
+            "name_ref",
+            "owner_ref",
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        },
+        {
+          "op": "refs",
+          "n": 1,
+          "aliases": [
+            "code_index"
+          ]
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint",
+          "alias": "kind_tag"
+        },
+        {
+          "op": "emit",
+          "store": "functions",
+          "fields": {
+            "name_ref": "name_ref",
+            "owner_ref": "owner_ref",
+            "code_index": "code_index",
+            "kind_tag": "kind_tag"
+          }
+        }
+      ]
+    },
+    "7": {
+      "_doc": "ClosureData (AOT: context_scope 不写): 2 refs + packed_fields(ReadUnsigned)",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 3
+        }
+      ]
+    },
+    "11": {
+      "_doc": "Field: 4 refs + kind_bits uint16 + host_offset_or_field_id (Smi ref)",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 6,
+          "aliases": [
+            "name_ref",
+            "owner_ref",
+            null,
+            null,
+            null,
+            null
+          ]
+        },
+        {
+          "op": "svarint",
+          "alias": "kind_bits"
+        }
+      ]
+    },
+    "12": {
+      "_doc": "Script (AOT PRODUCT): url ref + kernel_script_index int32",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "byte"
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "13": {
+      "_doc": "Library: 10 refs (name=0, url=1) + index + num_imports + load_state + flags",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 9,
+          "aliases": [
+            "name_ref",
+            "url_ref"
+          ]
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "byte"
+        },
+        {
+          "op": "byte"
+        },
+        {
+          "op": "emit",
+          "store": "libraries",
+          "fields": {
+            "name_ref": "name_ref",
+            "url_ref": "url_ref"
+          }
+        }
+      ]
+    },
+    "14": {
+      "_doc": "Namespace (AOT: 仅 target)",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    },
+    "16": {
+      "_doc": "Code: payload_info(uvarint, 仅 k<nondef) + 6 refs，捕获 payload_infos/code_start_ref",
+      "steps": [
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "refs",
+          "n": 8
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "19": {
+      "_doc": "ObjectPool: 每对象 length + 每 entry bits 派遣（捕获 pp.txt entries）",
+      "steps": [
+        {
+          "op": "objectpool"
+        }
+      ]
+    },
+    "20": {
+      "_doc": "PcDescriptors (ROData): fill 空",
+      "steps": []
+    },
+    "21": {
+      "_doc": "CodeSourceMap (ROData): fill 空",
+      "steps": []
+    },
+    "22": {
+      "_doc": "CompressedStackMaps (ROData): fill 空",
+      "steps": []
+    },
+    "24": {
+      "_doc": "ExceptionHandlers: packed_fields + handled_types ref + N*(pc,svarint×2,byte×3)",
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "loop",
+          "times": "lengths",
+          "steps": [
+            {
+              "op": "svarint"
+            },
+            {
+              "op": "svarint"
+            },
+            {
+              "op": "byte"
+            },
+            {
+              "op": "byte"
+            },
+            {
+              "op": "byte"
+            }
+          ]
+        }
+      ]
+    },
+    "25": {
+      "_doc": "Context: length + parent ref + N refs",
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "loop",
+          "times": "lengths",
+          "steps": [
+            {
+              "op": "refs",
+              "n": 1
+            }
+          ]
+        }
+      ]
+    },
+    "29": {
+      "_doc": "UnlinkedCall: 2 refs + can_patch_to_monomorphic byte",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 2
+        },
+        {
+          "op": "byte"
+        }
+      ]
+    },
+    "32": {
+      "_doc": "SubtypeTestCache: cache ref + num_inputs + num_occupied",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    },
+    "40": {
+      "_doc": "TypeArguments: length + hash int32 + nullability + instantiations ref + N types refs",
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "loop",
+          "times": "lengths",
+          "steps": [
+            {
+              "op": "refs",
+              "n": 1
+            }
+          ]
+        }
+      ]
+    },
+    "42": {
+      "_doc": "Type: 3 refs + flags(ReadUnsigned)，type_class_id=(flags>>4)&cid_tag_mask",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 5,
+          "aliases": [
+            null,
+            "tc",
+            null,
+            null,
+            null
+          ]
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "byte"
+        },
+        {
+          "op": "emit",
+          "store": "type_cids",
+          "fields": {
+            "type_cid": "tc"
+          }
+        }
+      ]
+    },
+    "44": {
+      "_doc": "TypeParameter: 3 refs + base int16 + index int16 + flags uint8",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 5
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "byte"
+        }
+      ]
+    },
+    "45": {
+      "_doc": "Closure: 6 refs",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 6
+        }
+      ]
+    },
+    "49": {
+      "_doc": "Mint: fill 空（值在 alloc 捕获）",
+      "steps": []
+    },
+    "50": {
+      "_doc": "Double: 每对象 1 有符号变长 int64",
+      "steps": [
+        {
+          "op": "byte"
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "72": {
+      "_doc": "Array: length + type_arguments ref + N refs → array_elements",
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "refs",
+          "n": 1,
+          "aliases": [
+            "ta"
+          ]
+        },
+        {
+          "op": "loop",
+          "times": "lengths",
+          "steps": [
+            {
+              "op": "refs",
+              "n": 1,
+              "collect": "elems"
+            }
+          ]
+        },
+        {
+          "op": "emit",
+          "store": "array_elements",
+          "fields": {
+            "ta": "ta",
+            "elems": "elems"
+          }
+        }
+      ]
+    },
+    "73": {
+      "_doc": "ImmutableArray: 同 Array",
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "refs",
+          "n": 1,
+          "aliases": [
+            "ta"
+          ]
+        },
+        {
+          "op": "loop",
+          "times": "lengths",
+          "steps": [
+            {
+              "op": "refs",
+              "n": 1,
+              "collect": "elems"
+            }
+          ]
+        },
+        {
+          "op": "emit",
+          "store": "array_elements",
+          "fields": {
+            "ta": "ta",
+            "elems": "elems"
+          }
+        }
+      ]
+    },
+    "52": {
+      "_doc": "GrowableObjectArray: 3 refs",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 3
+        }
+      ]
+    },
+    "74": {
+      "_doc": "String (ROData): fill 空（引擎按 offsets 解码）",
+      "steps": []
+    },
+    "43": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    },
+    "26": {
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "byte"
+        },
+        {
+          "op": "loop",
+          "times": "lengths",
+          "steps": [
+            {
+              "op": "refs",
+              "n": 1
+            }
+          ]
+        }
+      ]
+    },
+    "8": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 2
+        }
+      ]
+    },
+    "9": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 3
+        }
+      ]
+    },
+    "30": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 4,
+          "aliases": [
+            "entries",
+            "target_name",
+            "args_descriptor",
+            "owner"
+          ]
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "31": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 4
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "65": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 3
+        }
+      ]
+    },
+    "33": {
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    },
+    "34": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "byte"
+        }
+      ]
+    },
+    "35": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "36": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "37": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    }
+  },
+  "frida_cid_constants": [
+    [
+      "ClassIdTagPos",
+      "16"
+    ],
+    [
+      "ClassIdTagMask",
+      "0xffff"
+    ],
+    [
+      "NumPredefinedCids",
+      "144"
+    ],
+    [
+      "CidObject",
+      "38"
+    ],
+    [
+      "CidNull",
+      "140"
+    ],
+    [
+      "CidSmi",
+      "48"
+    ],
+    [
+      "CidMint",
+      "49"
+    ],
+    [
+      "CidDouble",
+      "50"
+    ],
+    [
+      "CidBool",
+      "51"
+    ],
+    [
+      "CidString",
+      "75"
+    ],
+    [
+      "CidTwoByteString",
+      "76"
+    ],
+    [
+      "CidArray",
+      "72"
+    ],
+    [
+      "CidGrowableArray",
+      "52"
+    ],
+    [
+      "CidClosure",
+      "45"
+    ],
+    [
+      "CidUint8Array",
+      "99"
+    ],
+    [
+      "CidInt8Array",
+      "96"
+    ],
+    [
+      "CidInt16Array",
+      "105"
+    ],
+    [
+      "CidUint16Array",
+      "108"
+    ],
+    [
+      "CidInt32Array",
+      "111"
+    ],
+    [
+      "CidUint32Array",
+      "114"
+    ],
+    [
+      "CidInt64Array",
+      "117"
+    ],
+    [
+      "CidUint64Array",
+      "120"
+    ]
+  ],
+  "frida_special_layouts": {
+    "51": {
+      "name": "bool",
+      "fields": {
+        "valOffset": 8
+      }
+    },
+    "49": {
+      "name": "int",
+      "fields": {
+        "valOffset": 8
+      }
+    },
+    "50": {
+      "name": "double",
+      "fields": {
+        "valOffset": 8
+      }
+    },
+    "75": {
+      "name": "String",
+      "fields": {
+        "lenOffset": 8,
+        "dataOffset": 16
+      }
+    },
+    "76": {
+      "name": "TwoByteString",
+      "fields": {
+        "lenOffset": 8,
+        "dataOffset": 16
+      }
+    },
+    "72": {
+      "name": "List",
+      "fields": {
+        "lenOffset": 16,
+        "dataOffset": 24,
+        "typeOffset": 8
+      }
+    },
+    "52": {
+      "name": "GrowableList",
+      "fields": {
+        "lenOffset": 16,
+        "dataOffset": 24,
+        "typeOffset": 8
+      }
+    },
+    "45": {
+      "name": "Closure",
+      "fields": {
+        "fnOffset": 32,
+        "contextOffset": 40,
+        "epOffset": 56
+      }
+    },
+    "38": {
+      "name": "Object",
+      "fields": {
+        "size": 8
+      }
+    }
+  },
+  "frida_int_typed_cids": [
+    96,
+    99,
+    105,
+    108,
+    111,
+    114,
+    117,
+    120
+  ],
+  "class_id_names": {
+    "0": "Illegal",
+    "1": "FreeListElement",
+    "2": "ForwardingCorpse",
+    "3": "Object",
+    "4": "Class",
+    "5": "PatchClass",
+    "6": "Function",
+    "7": "ClosureData",
+    "8": "SignatureData",
+    "9": "RedirectionData",
+    "10": "FfiTrampolineData",
+    "11": "Field",
+    "12": "Script",
+    "13": "Library",
+    "14": "Namespace",
+    "15": "KernelProgramInfo",
+    "16": "Code",
+    "17": "Bytecode",
+    "18": "Instructions",
+    "19": "ObjectPool",
+    "20": "PcDescriptors",
+    "21": "CodeSourceMap",
+    "22": "CompressedStackMaps",
+    "23": "LocalVarDescriptors",
+    "24": "ExceptionHandlers",
+    "25": "Context",
+    "26": "ContextScope",
+    "27": "ParameterTypeCheck",
+    "28": "SingleTargetCache",
+    "29": "UnlinkedCall",
+    "30": "ICData",
+    "31": "MegamorphicCache",
+    "32": "SubtypeTestCache",
+    "33": "Error",
+    "34": "ApiError",
+    "35": "LanguageError",
+    "36": "UnhandledException",
+    "37": "UnwindError",
+    "38": "Instance",
+    "39": "LibraryPrefix",
+    "40": "TypeArguments",
+    "41": "AbstractType",
+    "42": "Type",
+    "43": "TypeRef",
+    "44": "TypeParameter",
+    "45": "Closure",
+    "46": "Number",
+    "47": "Integer",
+    "48": "Smi",
+    "49": "Mint",
+    "50": "Double",
+    "51": "Bool",
+    "52": "GrowableObjectArray",
+    "53": "Float32x4",
+    "54": "Int32x4",
+    "55": "Float64x2",
+    "56": "TypedDataBase",
+    "57": "TypedData",
+    "58": "ExternalTypedData",
+    "59": "TypedDataView",
+    "60": "Pointer",
+    "61": "DynamicLibrary",
+    "62": "Capability",
+    "63": "ReceivePort",
+    "64": "SendPort",
+    "65": "StackTrace",
+    "66": "RegExp",
+    "67": "WeakProperty",
+    "68": "MirrorReference",
+    "69": "LinkedHashMap",
+    "70": "UserTag",
+    "71": "TransferableTypedData",
+    "72": "Array",
+    "73": "ImmutableArray",
+    "74": "String",
+    "75": "OneByteString",
+    "76": "TwoByteString",
+    "77": "ExternalOneByteString",
+    "78": "ExternalTwoByteString",
+    "79": "FfiPointer",
+    "97": "TypedDataInt8View",
+    "98": "ExternalTypedDataInt8",
+    "100": "TypedDataUint8View",
+    "101": "ExternalTypedDataUint8",
+    "103": "TypedDataUint8ClampedView",
+    "104": "ExternalTypedDataUint8Clamped",
+    "106": "TypedDataInt16View",
+    "107": "ExternalTypedDataInt16",
+    "109": "TypedDataUint16View",
+    "110": "ExternalTypedDataUint16",
+    "112": "TypedDataInt32View",
+    "113": "ExternalTypedDataInt32",
+    "115": "TypedDataUint32View",
+    "116": "ExternalTypedDataUint32",
+    "118": "TypedDataInt64View",
+    "119": "ExternalTypedDataInt64",
+    "121": "TypedDataUint64View",
+    "122": "ExternalTypedDataUint64",
+    "124": "TypedDataFloat32View",
+    "125": "ExternalTypedDataFloat32",
+    "127": "TypedDataFloat64View",
+    "128": "ExternalTypedDataFloat64",
+    "130": "TypedDataFloat32x4View",
+    "131": "ExternalTypedDataFloat32x4",
+    "133": "TypedDataInt32x4View",
+    "134": "ExternalTypedDataInt32x4",
+    "136": "TypedDataFloat64x2View",
+    "137": "ExternalTypedDataFloat64x2",
+    "138": "_ByteDataView",
+    "139": "_ByteBuffer",
+    "140": "Null",
+    "141": "dynamic",
+    "142": "void",
+    "143": "Never",
+    "96": "TypedDataInt8",
+    "99": "TypedDataUint8",
+    "102": "TypedDataUint8Clamped",
+    "105": "TypedDataInt16",
+    "108": "TypedDataUint16",
+    "111": "TypedDataInt32",
+    "114": "TypedDataUint32",
+    "117": "TypedDataInt64",
+    "120": "TypedDataUint64",
+    "123": "TypedDataFloat32",
+    "126": "TypedDataFloat64",
+    "129": "TypedDataFloat32x4",
+    "132": "TypedDataInt32x4",
+    "135": "TypedDataFloat64x2"
+  }
+}

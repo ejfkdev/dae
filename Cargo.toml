@@ -1,0 +1,31 @@
+[package]
+name = "dae-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Dart AOT snapshot symbol exporter for reverse engineering (IDA/radare2/Frida)"
+license = "MIT"
+repository = "https://github.com/ejfkdev/dae"
+authors = ["ejfkdev"]
+keywords = ["dart", "aot", "snapshot", "reverse-engineering", "blutter"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+# crates.io 包名是 dae-rs（`dae` 已被占用），但库名/命令名保持 dae，代码零改动
+[lib]
+name = "dae"
+
+[features]
+default = ["asm"]
+asm = ["dep:capstone"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+mimalloc = "0.1"
+capstone = { version = "0.12", optional = true }
+
+[profile.release]
+lto = true
+
+[[bin]]
+name = "dae"
+path = "src/main.rs"

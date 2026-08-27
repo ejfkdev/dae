@@ -1,0 +1,14 @@
+/target
+
+# 本地开发/验证工作区（各版本 Dart SDK、回归样本、Python 参考实现；14GB 级，不入库）
+/dart/
+
+# 跨平台/多版本验证工作区（临时 SDK、触发源码、编译产物、对照输出；可随时重建，不入库）
+/testing/
+
+# 开发/验证工具与脚本（profile 生成器、回归对拍；不入库，接入流程见 tools/NEW_VERSION.md）
+/tools/
+/scripts/
+
+# macOS
+.DS_Store

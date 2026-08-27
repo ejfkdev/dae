@@ -1,0 +1,26 @@
+{
+  "_doc": "Platform Profile: Linux/Android ELF x64。寄存器取值 dart-lang/sdk 3.3.4 constants_x64.h（THR=R14, PP=R15, CODE_REG=R12, TMP=R11, SPREG=RSP, FPREG=RBP, IC_DATA_REG=RBX；x64 无 DISPATCH/NULL/HEAP_BITS/BARRIER 寄存器）。asm/IL 现阶段仅 arm64——x64 样本到货后再补 IL 模式。TODO: 验证 polymorphic 偏移与 frida heap 寄存器。",
+  "name": "elf-x64",
+  "arch": "x64",
+  "endianness": "little",
+  "container": { "kind": "elf" },
+  "symbols": {
+    "vm_data": "_kDartVmSnapshotData",
+    "isolate_data": "_kDartIsolateSnapshotData",
+    "isolate_instructions": "_kDartIsolateSnapshotInstructions"
+  },
+  "registers": {
+    "thr": "r14",
+    "pp": "r15",
+    "code_reg": "r12",
+    "tmp": "r11",
+    "sp": "rsp",
+    "fp": "rbp",
+    "ic_data": "rbx"
+  },
+  "register_aliases": {},
+  "non_field_base": ["r14", "rsp", "rbp", "r15", "r12", "rbx"],
+  "polymorphic_entry_offset_aot": 0,
+  "frida_heap_address_reg": "",
+  "status": "unverified"
+}

@@ -1,0 +1,26 @@
+{
+  "_doc": "Platform Profile: Windows PE x64。COFF 符号表解析已实现（符号表缺失时回退导出目录），但无 Windows 样本端到端验证（status=unverified）。注意：Windows release 构建若剥掉 COFF 符号且未导出 _kDart* 符号，需要配合符号文件（如 .pdb/objcopy 转出来的 symtab）使用。TODO: 验证 polymorphic 偏移、frida heap 寄存器。",
+  "name": "pe-x64",
+  "arch": "x64",
+  "endianness": "little",
+  "container": { "kind": "pe" },
+  "symbols": {
+    "vm_data": "_kDartVmSnapshotData",
+    "isolate_data": "_kDartIsolateSnapshotData",
+    "isolate_instructions": "_kDartIsolateSnapshotInstructions"
+  },
+  "registers": {
+    "thr": "r14",
+    "pp": "r15",
+    "code_reg": "r12",
+    "tmp": "r11",
+    "sp": "rsp",
+    "fp": "rbp",
+    "ic_data": "rbx"
+  },
+  "register_aliases": {},
+  "non_field_base": ["r14", "rsp", "rbp", "r15", "r12", "rbx"],
+  "polymorphic_entry_offset_aot": 0,
+  "frida_heap_address_reg": "",
+  "status": "unverified"
+}

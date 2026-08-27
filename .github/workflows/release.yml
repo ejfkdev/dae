@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            zip: upx
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zip: none
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            zip: none
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zip: none
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            zip: upx
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            zip: none
+    runs-on: ${{ matrix.os }}
+    env:
+      # 构建出的二进制内嵌版本号与触发构建的 GitHub tag 一致
+      DAE_VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cross (for aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross
+
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: UPX compress
+        if: matrix.zip == 'upx'
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          files: target/${{ matrix.target }}/release/dae*
+
+      # macOS 产物默认未签名，ad-hoc 签名避免下载后被 Gatekeeper 拦（不做公证）
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --sign - target/${{ matrix.target }}/release/dae
+
+      - name: Set binary name
+        id: bin
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64*) arch="x64" ;;
+            aarch64*) arch="arm64" ;;
+            *) exit 1 ;;
+          esac
+          ext=""
+          case "${{ matrix.target }}" in
+            *windows*) ext=".exe" ;;
+          esac
+          echo "name=dae-${{ runner.os }}-${arch}${ext}" >> $GITHUB_OUTPUT
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/dae"
+          case "${{ matrix.target }}" in
+            *windows*) src="${src}.exe" ;;
+          esac
+          mv "$src" "${{ steps.bin.outputs.name }}"
+
+      - name: Upload binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.bin.outputs.name }}
