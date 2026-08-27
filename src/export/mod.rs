@@ -1,5 +1,6 @@
-//! 六类导出（与 blutter / 参考实现格式对齐）：
-//! r2_script/addNames.r2、blutter_frida.js、asm/、pp.txt、objs.txt。
+//! 七类导出（与 blutter / 参考实现格式对齐）：
+//! r2_script/addNames.r2、ida_script/addNames.py、blutter_frida.js、asm/、pp.txt、objs.txt
+//! （另附 r2/ida 共用的 Dart 结构头 r2_dart_struct.h / ida_dart_struct.h）。
 //!
 //! 与 Python 参考实现的两处有意修正（README 有说明）：
 //! 1. addNames.r2 的 Library()/Class() 编号正确自增（参考实现漏了自增）；
@@ -7,6 +8,7 @@
 //! 3. frida 模板的 PointerCompressedEnabled/CompressedWordSize/HeapAddressReg 按 Profile 重写。
 
 pub mod frida;
+pub mod ida;
 pub mod ppobjs;
 pub mod r2;
 #[cfg(feature = "asm")]
@@ -15,8 +17,13 @@ pub mod asm;
 use crate::analyzer::Analyzer;
 use std::path::{Path, PathBuf};
 
+/// 与 r2 同源的 Dart 结构头模板（r2_dart_struct.h 与 ida_dart_struct.h 共用；
+/// blutter 派生，MIT 归因见文件头部）
+pub(crate) const R2_STRUCT_TEMPLATE: &str = include_str!("../../templates/r2_dart_struct.h");
+
 pub struct ExportSummary {
     pub r2_functions: usize,
+    pub ida_functions: usize,
     pub frida_classes: usize,
     pub pp_entries: usize,
     pub objs_instances: usize,
@@ -73,6 +80,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     let do_asm = asm_enabled && analyzer.platform.arch == "arm64";
     enum TaskDone {
         R2(Result<usize, String>),
+        Ida(Result<usize, String>),
         Frida(Result<usize, String>),
         Asm(Result<usize, String>),
         PpObjs(Result<(usize, usize), String>),
@@ -83,6 +91,12 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
             let tx = tx.clone();
             scope.spawn(move || {
                 let _ = tx.send(TaskDone::R2(r2::write(analyzer, libs_ref, out_dir)));
+            });
+        }
+        {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let _ = tx.send(TaskDone::Ida(ida::write(analyzer, libs_ref, out_dir)));
             });
         }
         {
@@ -113,6 +127,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     });
 
     let mut n_r2 = 0usize;
+    let mut n_ida = 0usize;
     let mut n_frida = 0usize;
     let mut n_pp = 0usize;
     let mut n_objs = 0usize;
@@ -120,6 +135,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     for done in rx {
         match done {
             TaskDone::R2(Ok(n)) => n_r2 = n,
+            TaskDone::Ida(Ok(n)) => n_ida = n,
             TaskDone::Frida(Ok(n)) => n_frida = n,
             TaskDone::Asm(Ok(n)) => asm_functions = n,
             TaskDone::PpObjs(Ok((p, o))) => {
@@ -127,6 +143,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
                 n_objs = o;
             }
             TaskDone::R2(Err(e))
+            | TaskDone::Ida(Err(e))
             | TaskDone::Frida(Err(e))
             | TaskDone::Asm(Err(e))
             | TaskDone::PpObjs(Err(e)) => return Err(e),
@@ -142,6 +159,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
 
     Ok(ExportSummary {
         r2_functions: n_r2,
+        ida_functions: n_ida,
         frida_classes: n_frida,
         pp_entries: n_pp,
         objs_instances: n_objs,

@@ -85,12 +85,9 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
             let _ = std::fs::copy(src, dir.join("r2_dart_struct.h"));
         }
         None => {
-            let _ = std::fs::write(dir.join("r2_dart_struct.h"), R2_STRUCT_TEMPLATE);
+            let _ = std::fs::write(dir.join("r2_dart_struct.h"), crate::export::R2_STRUCT_TEMPLATE);
         }
     }
     std::fs::write(&path, of).map_err(|e| format!("写 addNames.r2 失败: {e}"))?;
     Ok(count)
 }
-
-/// 内嵌副本：find_template 均未命中时的兜底
-const R2_STRUCT_TEMPLATE: &str = include_str!("../../templates/r2_dart_struct.h");

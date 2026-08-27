@@ -10,6 +10,8 @@ dae 本身以 MIT 协议发布（见根目录 `LICENSE`）。本文件列出随�
 - 协议：MIT License
 - Copyright (c) 2023 Worawit Wangwarunyoo
 - 原始版权声明已保留于上述模板文件头部
+- `ida_script/addNames.py` 的脚本结构与函数命名格式对齐 blutter 的 Dump4IDA
+  约定（格式对齐，非代码复制）
 
 ## Dart SDK
 

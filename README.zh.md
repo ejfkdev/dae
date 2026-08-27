@@ -14,6 +14,7 @@
 - 函数名 ↔ 地址（library::class::method 三级归属，含混淆名还原）
 - 对象池条目（`pp.txt`）、用户类实例递归 dump（`objs.txt`）
 - radare2 命名脚本（`r2_script/addNames.r2` + `r2_dart_struct.h`）
+- IDA 导入脚本（`ida_script/addNames.py`，IDAPython + Dart 结构头——IDA 9.3/9.4 实测，8.x 兼容）
 - Frida 运行时 Classes 数组（`blutter_frida.js`）
 - capstone 反汇编 + IL 伪指令注释（`asm/`，arm64）
 

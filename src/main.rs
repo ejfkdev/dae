@@ -239,6 +239,7 @@ fn run(
     let summary = export::run(&analyzer, std::path::Path::new(out))?;
     println!("导出完成 → {}:", out);
     println!("  r2_script/addNames.r2     {} 条函数名/地址", summary.r2_functions);
+    println!("  ida_script/addNames.py    {} 个函数命名 + Dart 结构头", summary.ida_functions);
     println!("  blutter_frida.js          {} 个 Classes 条目", summary.frida_classes);
     if summary.asm_enabled {
         println!("  asm/                      {} 个函数反汇编 + IL", summary.asm_functions);
@@ -279,6 +280,7 @@ fn print_help() {
     println!();
     println!("输出文件:");
     println!("  r2_script/addNames.r2  radare2 函数命名脚本");
+    println!("  ida_script/addNames.py  IDA 命名脚本（IDAPython + Dart 结构头）");
     println!("  blutter_frida.js       Frida 运行时 Classes 数组");
     println!("  asm/                   capstone 反汇编 + IL 注释（arm64）");
     println!("  pp.txt                 对象池条目");

@@ -14,6 +14,7 @@ Config-driven Dart AOT snapshot debug-info exporter (Rust). Zero Dart SDK depend
 - Function name ↔ address (library::class::method hierarchy, obfuscated-name recovery)
 - Object pool entries (`pp.txt`), recursive user-class instance dump (`objs.txt`)
 - radare2 naming script (`r2_script/addNames.r2` + `r2_dart_struct.h`)
+- IDA import script (`ida_script/addNames.py`, IDAPython — tested on IDA 9.3/9.4, 8.x compatible)
 - Frida runtime Classes array (`blutter_frida.js`)
 - capstone disassembly + IL pseudo-instruction comments (`asm/`, arm64)
 
