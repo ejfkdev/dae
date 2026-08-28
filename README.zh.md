@@ -7,39 +7,25 @@
 [![crates.io](https://img.shields.io/crates/v/dae-rs)](https://crates.io/crates/dae-rs)
 [![Release CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/release.yml?label=release%20build)](https://github.com/ejfkdev/dae/actions/workflows/release.yml)
 
-配置驱动的 Dart AOT 快照调试信息导出工具（Rust），零依赖 Dart SDK、不运行目标。从 Mach-O / ELF / PE 中定位快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的调试数据。
+> 配置驱动的 Dart AOT 快照调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的调试数据。
 
-**兼容所有 Dart AOT 产物**：Flutter release（iOS/Android/macOS/Windows/Linux）、`dart compile exe`、`dart compile aot-snapshot`——只要二进制嵌有 Dart 2.7+ 的 cluster 快照，不依赖任何框架。
+**兼容所有 Dart AOT 产物**——Flutter release（iOS/Android/macOS/Windows/Linux）、`dart compile exe`、`dart compile aot-snapshot`——只要二进制嵌有 Dart 2.7+ 的 cluster 快照。
 
-- 函数名 ↔ 地址（library::class::method 三级归属，含混淆名还原）
-- 对象池条目（`pp.txt`）、用户类实例递归 dump（`objs.txt`）
-- radare2 命名脚本（`r2_script/addNames.r2` + `r2_dart_struct.h`）
-- IDA 导入脚本（`ida_script/addNames.py`，IDAPython + Dart 结构头——IDA 9.3/9.4 实测；
-  8.x 预期兼容（同一批 typed API 自 7.x 就存在，本机未装 8.x 实跑过））
-- Frida 运行时 Classes 数组（`blutter_frida.js`）
-- capstone 反汇编 + IL 伪指令注释（`asm/`，arm64）
+- **免配置、自动识别**：26 版 SDK Profile 全部内嵌在二进制里，Dart 版本自动识别（快照版本指纹精确命中；Flutter 引擎自编译/自定义构建走结构探针兜底）
+- **快**：24 MB 的 Flutter 样本约 **0.07 秒**导出完成（约为 Python 参考实现的 27×）
+- **零框架依赖**：直接解析三种容器格式，无需 Dart SDK / Flutter 工具链
 
 ## 安装
 
 ### 预编译 Release
 
-从 [GitHub Releases](https://github.com/ejfkdev/dae/releases/latest) 下载对应平台二进制（Windows/macOS/Linux × x64/arm64 六个资产，x64 版已 UPX 压缩），解压即用。
+从 [GitHub Releases](https://github.com/ejfkdev/dae/releases/latest) 下载对应平台二进制（Windows/macOS/Linux × x64/arm64，x64 版已 UPX 压缩）。
 
-macOS 产物为 ad-hoc 签名，若首次运行被 Gatekeeper 拦下，解除隔离属性即可：
+macOS 产物为 ad-hoc 签名，若首次运行被 Gatekeeper 拦下：
 
 ```bash
 xattr -dr com.apple.quarantine dae
 ```
-
-### cargo
-
-```bash
-cargo install dae-rs                                # crates.io（首次 publish 后可用）
-cargo install --git https://github.com/ejfkdev/dae  # 直接从 GitHub 仓库安装
-```
-
-两种方式装出的命令都是 `dae`。crates.io 包名为 `dae-rs`（`dae` 一名已被无关 crate
-占用）；仓库名、库名、二进制命令保持 `dae` 不变。克隆源码后也可 `cargo install --path .`。
 
 ### Homebrew（macOS）
 
@@ -47,65 +33,94 @@ cargo install --git https://github.com/ejfkdev/dae  # 直接从 GitHub 仓库安
 brew install ejfkdev/tap/dae
 ```
 
+### cargo
+
+```bash
+cargo install dae-rs                                # crates.io（首次 publish 后可用）
+cargo install --git https://github.com/ejfkdev/dae  # 或直接从本仓库安装
+```
+
+两种方式装出的命令都是 `dae`。（crates.io 包名为 `dae-rs` 是因 `dae` 一名已被占用；仓库、库名、二进制命令均保持 `dae`。）
+
 ### 源码构建
 
 ```bash
 cargo build --release
 ```
 
-## 快速开始
+## 使用
 
 ```bash
 dae <binary> <out_dir> [--sdk-profile <profile.json>]
 ```
 
-26 个 SDK Profile 与平台 Profile **全部编译进二进制**，运行时无需任何 profile 文件。
-Dart 版本自动识别：官方 SDK 构建的产物按快照版本指纹（32B hash，`version_hashes.json`）
-精确命中；Flutter 引擎自编译/自定义构建走结构探针（alloc 试解析 + fill 打分）推断。
-`--sdk-profile` / `--platform-profile` 仅用于特殊目标的强制覆盖。
+示例——编译一段小 Dart 程序并导出：
 
-## 版本支持
+```bash
+$ dart compile exe demo.dart -o demo
+$ dae demo out
+SDK Profile: dart/3.13.0（版本指纹命中）
+导出完成 → out:
+  r2_script/addNames.r2     5 条函数名/地址
+  ida_script/addNames.py    1175 个函数命名 + Dart 结构头
+  blutter_frida.js          617 个 Classes 条目
+  asm/                      5 个函数反汇编 + IL
+  pp.txt                    1424 个对象池条目
+  objs.txt                  17 个用户类实例
+```
 
-`profiles/sdk/` 内嵌 **26 个 Dart 版本**（1.24.3 → 3.14β），覆盖 cluster 快照格式全谱系。
+导入 IDA：`File → Script file…` 选择 `ida_script/addNames.py`——函数名、函数边界与 `DartThread`/`DartObjectPool` 结构自动落入当前数据库（装载基址自动重定）。radare2：`r2 -i r2_script/addNames.r2 <binary>`，随后 `to r2_dart_struct.h` 载入结构头。
 
-| 版本范围 | 状态 | 说明 |
+## 导出产物
+
+| 产物 | 用途 |
+|---|---|
+| `ida_script/addNames.py` | IDAPython 脚本：函数命名 + 边界 + Dart 结构 |
+| `r2_script/addNames.r2` | radare2 flag/注释脚本（库 → 类 → 方法三层） |
+| `r2_script/r2_dart_struct.h` | Dart 结构布局（IDA 侧另有 `ida_script/ida_dart_struct.h`） |
+| `blutter_frida.js` | Frida 模板 + 运行时 Classes 数组 |
+| `asm/` | capstone 反汇编 + blutter 风格 IL 注释（arm64） |
+| `pp.txt` / `objs.txt` | 对象池条目 / 用户类实例递归 dump |
+
+## Dart 版本支持
+
+| 版本范围 | 状态 |
+|---|---|
+| 3.0.0 – 3.14β | ✅ verified——用户函数完整 |
+| 2.15.0 – 2.17.0 | ✅ verified——用户函数完整 |
+| 2.10.4 – 2.14.4 | 函数名 + 地址可导出 |
+| 2.7.2 | 仅对象层 |
+| 1.24.3 / 2.0.0 | ❌ JIT 快照格式（非 AOT） |
+
+## 工具兼容性
+
+| 工具 | 状态 |
+|---|---|
+| IDA 9.3 / 9.4 | ✅ 真机端到端实测（命名 + 结构） |
+| IDA 8.x | 预期兼容（同一批 API 自 7.x 存在；本机未装 8.x 实跑） |
+| radare2 6.2 | ✅ 实测——脚本零错误、flag 与注释正常落地 |
+| radare2 5.x | 预期兼容（仅用长期稳定命令） |
+| rizin | 可解析执行；其「每地址单 flag」模型会跳过同址辅助标志（已如实注明） |
+| Frida 14 – 17 | 只依赖核心 API（`Interceptor`/`Module`/`ptr`）；运行时注入请在你的目标上验证 |
+
+## 工作原理
+
+三层分离，引擎跨版本不变，只加配置：
+
+| 层 | 路径 | 内容 |
 |---|---|---|
-| 1.24.3 / 2.0.0 | unsupported | JIT 快照格式，非 AOT |
-| 2.7.2 | objects 层 | ≤2.9 无指令表，仅对象层 |
-| 2.10.4–2.14.4 | 地址层 | 函数名+地址可导出 |
-| 2.15.0–2.17.0 | verified | 用户函数完整 |
-| 2.16.2 / 2.18.1 / 2.19.6 | ELF 回填 | 函数名按 ELF 符号补偿 |
-| 3.0.0–3.14β | verified | 用户函数完整 |
-
-**24 单测全绿**（`cargo test`）。无已知 2.x/3.x 残余。
-
-## 架构
-
-三层分离，引擎不变，只加配置：
-
-| 层 | 路径 | 内容 | 变化时 |
-|---|---|---|---|
-| 引擎 | `src/` | datastream 三种变长编码、cluster 流遍历、fill 解释器、命名还原、导出 writer | 不动 |
-| SDK Profile | `profiles/sdk/*.json` | cid 枚举、cluster 字段布局（fill DSL）、tagging、runtime offsets | 每 Dart 版本一份 |
-| 平台 Profile | `profiles/platform/*.json` | 容器解析器、符号名、寄存器角色 | 每 (容器 × 架构) 一份 |
+| 引擎 | `src/` | 变长编码、cluster 流遍历、fill 解释器、命名还原、导出 writer |
+| SDK Profile | `profiles/sdk/*.json` | cid 枚举、cluster 字段布局（fill DSL）、tagging、runtime offsets——每 Dart 版本一份 |
+| 平台 Profile | `profiles/platform/*.json` | 容器解析器、符号名、寄存器角色——每（容器 × 架构）一份 |
 
 规格：[`docs/PROFILES.md`](docs/PROFILES.md)
-
-## 性能
-
-macOS Flutter 样本（24MB → 14MB 产物）：**0.07s 墙钟**（Python 参考实现 1.9s，约 27×）。8 核并行（mimalloc 分配器、分块并行处理、填充解释器编译执行）。
 
 ## 已知边界
 
 - 地址是文件偏移空间（非运行时 VA），与 blutter 参考实现一致
-- radare2 ≥ 6 收紧了 flag 命名规则并变更了 `ic+` 用法：`addNames.r2` 已做适配
-  （命名字符清洗、`CCu` 注释、`s <addr>;` 寻址形式），旧版 r2 与 r2 6.2 实测整体
-  零错误；rizin 可解析执行但因其「每地址单 flag」模型会跳过与既有标志同址的辅助
-  标志（blutter 同址多标志分层在 rizin 下原理性受限）；
-  结构头用 `to r2_dart_struct.h` 命令导入
-- asm IL 目前仅覆盖 arm64；x64 反汇编可输出但 IL 注释待补充
+- `asm/` 的 IL 注释仅覆盖 arm64；x64 可输出反汇编但 IL 注释待补充
 - PE 若剥掉 COFF 符号表，需先用 .pdb 回填符号
-- 1.24/2.0 为 JIT 快照（`kMessageMagic`），不支持
+- Dart 1.24 / 2.0 为 JIT 快照（`kMessageMagic`），不支持
 
 ## License
 

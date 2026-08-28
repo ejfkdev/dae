@@ -7,38 +7,25 @@
 [![crates.io](https://img.shields.io/crates/v/dae-rs)](https://crates.io/crates/dae-rs)
 [![Release CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/release.yml?label=release%20build)](https://github.com/ejfkdev/dae/actions/workflows/release.yml)
 
-Config-driven Dart AOT snapshot debug-info exporter (Rust). Zero Dart SDK dependency, never runs the target. Locates the snapshot inside Mach-O / ELF / PE binaries and exports the same debug data as [blutter](https://github.com/worawit/blutter).
+> Config-driven Dart AOT snapshot debug-info exporter. Zero Dart SDK dependency, never runs the target binary: it locates the snapshot inside Mach-O / ELF / PE files and exports the same debug data as [blutter](https://github.com/worawit/blutter).
 
-**Works with every Dart AOT artifact**: Flutter release builds (iOS/Android/macOS/Windows/Linux), `dart compile exe`, `dart compile aot-snapshot` — as long as the binary embeds a Dart 2.7+ cluster snapshot, no framework assumptions.
+**Works with every Dart AOT artifact** — Flutter release builds (iOS/Android/macOS/Windows/Linux), `dart compile exe`, `dart compile aot-snapshot` — as long as the binary embeds a Dart 2.7+ cluster snapshot.
 
-- Function name ↔ address (library::class::method hierarchy, obfuscated-name recovery)
-- Object pool entries (`pp.txt`), recursive user-class instance dump (`objs.txt`)
-- radare2 naming script (`r2_script/addNames.r2` + `r2_dart_struct.h`)
-- IDA import script (`ida_script/addNames.py`, IDAPython — tested on IDA 9.3/9.4; expected compatible with
-  8.x, same typed APIs exist since 7.x, not yet run on an 8.x install)
-- Frida runtime Classes array (`blutter_frida.js`)
-- capstone disassembly + IL pseudo-instruction comments (`asm/`, arm64)
+- **No setup, self-detecting**: all 26 SDK profiles are embedded in the binary; the Dart version is detected automatically (snapshot version-hash match, with a structural probe fallback for custom/Flutter-engine builds)
+- **Fast**: a 24 MB Flutter sample exports in ~0.07 s wall-clock (≈27× the Python reference implementation)
+- **Zero-framework**: parses the container formats directly, no Dart SDK or Flutter toolchain required
 
-## Install
+## Installation
 
-### Prebuilt releases
+### Prebuilt binaries
 
-Download the binary for your platform (Windows/macOS/Linux × x64/arm64; x64 binaries are UPX-compressed) from [GitHub Releases](https://github.com/ejfkdev/dae/releases/latest) and run it directly.
+Download your platform binary (Windows/macOS/Linux × x64/arm64; x64 builds are UPX-compressed) from [GitHub Releases](https://github.com/ejfkdev/dae/releases/latest).
 
-macOS binaries are ad-hoc signed. If Gatekeeper blocks the first run, clear the quarantine attribute:
+macOS binaries are ad-hoc signed; if Gatekeeper blocks the first run:
 
 ```bash
 xattr -dr com.apple.quarantine dae
 ```
-
-### cargo
-
-```bash
-cargo install dae-rs                                # from crates.io (after first publish)
-cargo install --git https://github.com/ejfkdev/dae  # straight from this repository
-```
-
-Both install a command named `dae`. The crates.io package is `dae-rs` because the name `dae` was already taken; the repository, library, and binary all remain `dae`. From a local checkout you can also `cargo install --path .`.
 
 ### Homebrew (macOS)
 
@@ -46,63 +33,94 @@ Both install a command named `dae`. The crates.io package is `dae-rs` because th
 brew install ejfkdev/tap/dae
 ```
 
+### cargo
+
+```bash
+cargo install dae-rs                                # from crates.io (after first publish)
+cargo install --git https://github.com/ejfkdev/dae  # or straight from this repository
+```
+
+Both install a command named `dae`. (The crates.io package is `dae-rs` because the name `dae` was taken; the repository, library and binary all stay `dae`.)
+
 ### Build from source
 
 ```bash
 cargo build --release
 ```
 
-## Quick start
+## Usage
 
 ```bash
 dae <binary> <out_dir> [--sdk-profile <profile.json>]
 ```
 
-All 26 SDK profiles and the platform profiles are **embedded in the binary**; no profile files are needed at runtime. The Dart version is detected automatically — by snapshot version-hash match for official SDK builds (`version_hashes.json`), with a structural probe (alloc + fill scoring) as fallback for custom/Flutter engine builds. `--sdk-profile` / `--platform-profile` are only overrides for unusual targets.
+Example — compile a tiny Dart program and export it:
 
-## Version support
+```bash
+$ dart compile exe demo.dart -o demo
+$ dae demo out
+SDK Profile: dart/3.13.0（version-hash match）
+导出完成 → out:
+  r2_script/addNames.r2     5 个函数名/地址
+  ida_script/addNames.py    1175 个函数命名 + Dart 结构头
+  blutter_frida.js          617 个 Classes 条目
+  asm/                      5 个函数反汇编 + IL
+  pp.txt                    1424 个对象池条目
+  objs.txt                  17 个用户类实例
+```
 
-`profiles/sdk/` embeds **26 Dart versions** (1.24.3 → 3.14β), covering the full cluster-snapshot format lineage.
+Import into IDA: `File → Script file…` and pick `ida_script/addNames.py` — function names, boundaries and the `DartThread` / `DartObjectPool` structs land in the current database (image-base rebasing is handled automatically). For radare2: `r2 -i r2_script/addNames.r2 <binary>`, then `to r2_dart_struct.h` to load the struct header.
 
-| Version range | Status | Notes |
+## What it exports
+
+| Output | Purpose |
+|---|---|
+| `ida_script/addNames.py` | IDAPython script: function names + boundaries, Dart structs |
+| `r2_script/addNames.r2` | radare2 flag/comment script (libraries → classes → methods) |
+| `r2_script/r2_dart_struct.h` | Dart struct layouts (also `ida_script/ida_dart_struct.h` for IDA) |
+| `blutter_frida.js` | Frida template with the runtime Classes array |
+| `asm/` | capstone disassembly + blutter-style IL comments (arm64) |
+| `pp.txt` / `objs.txt` | object-pool entries / recursive user-class instance dump |
+
+## Dart version support
+
+| Version range | Status |
+|---|---|
+| 3.0.0 – 3.14β | ✅ verified — full user functions |
+| 2.15.0 – 2.17.0 | ✅ verified — full user functions |
+| 2.10.4 – 2.14.4 | function names + addresses |
+| 2.7.2 | objects layer only |
+| 1.24.3 / 2.0.0 | ❌ JIT snapshot format (non-AOT) |
+
+## Tool compatibility
+
+| Tool | Status |
+|---|---|
+| IDA 9.3 / 9.4 | ✅ tested end-to-end (naming + structs) |
+| IDA 8.x | expected — same typed APIs exist since 7.x (not run locally) |
+| radare2 6.2 | ✅ tested — zero script errors, flags and comments land |
+| radare2 5.x | expected — only long-stable commands are used |
+| rizin | script parses/executes; its one-flag-per-address model skips auxiliary same-address flags (documented as-is) |
+| Frida 14 – 17 | core-API surface (`Interceptor`/`Module`/`ptr`); runtime hooking to verify on your target |
+
+## How it works
+
+Three layers; the engine never changes between versions, only configuration is added:
+
+| Layer | Path | Contents |
 |---|---|---|
-| 1.24.3 / 2.0.0 | unsupported | JIT snapshot format, not AOT |
-| 2.7.2 | objects layer | ≤2.9 has no instruction table; object layer only |
-| 2.10.4–2.14.4 | address layer | function names + addresses exported |
-| 2.15.0–2.17.0 | verified | complete user functions |
-| 2.16.2 / 2.18.1 / 2.19.6 | ELF backfill | function names backfilled from ELF symbols |
-| 3.0.0–3.14β | verified | complete user functions |
-
-**24 unit tests** (`cargo test`) all green. No known 2.x/3.x gaps.
-
-## Architecture
-
-Three layers; the engine never changes, only configuration is added:
-
-| Layer | Path | Contents | Changes when |
-|---|---|---|---|
-| Engine | `src/` | three varint encodings for the datastream, cluster stream traversal, fill interpreter, name deobfuscation, export writers | never |
-| SDK profile | `profiles/sdk/*.json` | cid enums, cluster field layouts (fill DSL), tagging, runtime offsets | per Dart version |
-| Platform profile | `profiles/platform/*.json` | container parser, symbol names, register roles | per (container × arch) |
+| Engine | `src/` | varint encodings, cluster-stream traversal, fill interpreter, name deobfuscation, export writers |
+| SDK profile | `profiles/sdk/*.json` | cid enums, cluster field layouts (fill DSL), tagging, runtime offsets — one per Dart version |
+| Platform profile | `profiles/platform/*.json` | container parser, symbol names, register roles — one per (container × arch) |
 
 Spec: [`docs/PROFILES.md`](docs/PROFILES.md) (Chinese)
 
-## Performance
-
-macOS Flutter sample (24 MB binary → 14 MB of artifacts): **0.07 s wall-clock** (Python reference implementation: 1.9 s, ~27×). 8-core parallel processing (mimalloc allocator, chunked parallelism, compiled fill interpreter).
-
 ## Known limitations
 
-- Addresses are in file-offset space (not runtime VAs), matching the blutter reference implementation
-- radare2 ≥ 6 tightened flag naming and changed the `ic+` usage: `addNames.r2` is adapted
-  (character sanitization, `CCu` comments, `s <addr>;` addressing) and runs zero-error on
-  older r2 and r2 6.2; rizin parses and executes the script but skips auxiliary flags
-  sharing an address (rizin's one-flag-per-address model conflicts with blutter's layered
-  flags by design);
-  import the struct header with `to r2_dart_struct.h`
-- asm IL currently covers arm64 only; x64 disassembly is emitted but IL comments are pending
+- Addresses are in file-offset space (not runtime VAs), matching the blutter reference
+- `asm/` IL comments cover arm64 only; x64 disassembly is emitted but IL comments are pending
 - PE binaries stripped of the COFF symbol table need symbols backfilled from a .pdb first
-- 1.24 / 2.0 are JIT snapshots (`kMessageMagic`), unsupported
+- Dart 1.24 / 2.0 are JIT snapshots (`kMessageMagic`) and unsupported
 
 ## License
 
