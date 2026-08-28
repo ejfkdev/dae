@@ -25,10 +25,16 @@ pub fn write(analyzer: &Analyzer, _libs: &LibGroups, out_dir: &Path) -> Result<u
     py.push_str("#!/usr/bin/env python3\n");
     py.push_str("# 由 dae 生成：Dart AOT 符号导入 IDA（IDAPython）。\n");
     py.push_str("# 用法：IDA 内 File → Script file... 选择本文件。\n");
-    py.push_str("# API 对齐 IDA 9.x（typed API，9.3/9.4 实测），同时兼容 8.x。\n\n");
-    py.push_str("import os\nimport idc\nimport ida_name\nimport ida_funcs\nimport ida_typeinf\n\n");
+    py.push_str("# API 对齐 IDA 9.x（typed API，9.3/9.4 实测）；8.x 预期兼容\n");
+    py.push_str("# （同一批 API 自 7.x 存在，本机未装 8.x 实测）\n\n");
+    py.push_str("import os\nimport idc\nimport ida_name\nimport ida_funcs\nimport ida_typeinf\nimport ida_nalt\n\n");
     py.push_str("print(\"[dae] importing Dart names into current IDB...\")\n\n");
+    py.push_str("# 地址重定：MAC 可执行文件装载基址不为 0（如 0x100000000），ELF/Android 为 0\n");
+    py.push_str("BN = ida_nalt.get_imagebase()\n");
+    py.push_str("print(\"[dae] image base = {:#x}\".format(BN))\n\n");
     py.push_str("n_named = 0\nn_failed = 0\n\n");
+    // set_name 带 SN_NOWARN(0x80)：目标为文件头 tail byte 等不可命名地址时静默计数，
+    // 不再向 IDA 输出台刷 "can't rename byte..." 告警（去符号 exe 的快照回退场景必现）
 
     let mut count = 0usize;
     for (ep, name) in &analyzer.name_by_ep {
@@ -40,7 +46,9 @@ pub fn write(analyzer: &Analyzer, _libs: &LibGroups, out_dir: &Path) -> Result<u
             continue;
         }
         let ida_name = format!("{clean}_{ep:x}");
-        py.push_str(&format!("if ida_name.set_name({ep:#x}, \"{ida_name}\"):\n"));
+        py.push_str(&format!(
+            "if ida_name.set_name({ep:#x} + BN, \"{ida_name}\", 0x80):\n"
+        ));
         py.push_str("    n_named += 1\nelse:\n    n_failed += 1\n");
         if let Some(&(_, idx)) = analyzer
             .func_eps
@@ -51,7 +59,7 @@ pub fn write(analyzer: &Analyzer, _libs: &LibGroups, out_dir: &Path) -> Result<u
             let size = analyzer.code_size(idx);
             if size > 0 {
                 py.push_str(&format!(
-                    "ida_funcs.add_func({ep:#x}, {:#x})\n",
+                    "ida_funcs.add_func({ep:#x} + BN, {:#x} + BN)\n",
                     *ep + size
                 ));
             }

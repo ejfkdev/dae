@@ -2,7 +2,7 @@
 //! r2_script/addNames.r2、ida_script/addNames.py、blutter_frida.js、asm/、pp.txt、objs.txt
 //! （另附 r2/ida 共用的 Dart 结构头 r2_dart_struct.h / ida_dart_struct.h）。
 //!
-//! 与 Python 参考实现的两处有意修正（README 有说明）：
+//! 与 Python 参考实现的三处有意修正（README 有说明）：
 //! 1. addNames.r2 的 Library()/Class() 编号正确自增（参考实现漏了自增）；
 //! 2. addNames.r2 的 app.base 取容器 __TEXT 段 VM 地址（参考实现硬编码 0x106484000）；
 //! 3. frida 模板的 PointerCompressedEnabled/CompressedWordSize/HeapAddressReg 按 Profile 重写。

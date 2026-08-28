@@ -14,7 +14,8 @@
 - 函数名 ↔ 地址（library::class::method 三级归属，含混淆名还原）
 - 对象池条目（`pp.txt`）、用户类实例递归 dump（`objs.txt`）
 - radare2 命名脚本（`r2_script/addNames.r2` + `r2_dart_struct.h`）
-- IDA 导入脚本（`ida_script/addNames.py`，IDAPython + Dart 结构头——IDA 9.3/9.4 实测，8.x 兼容）
+- IDA 导入脚本（`ida_script/addNames.py`，IDAPython + Dart 结构头——IDA 9.3/9.4 实测；
+  8.x 预期兼容（同一批 typed API 自 7.x 就存在，本机未装 8.x 实跑过））
 - Frida 运行时 Classes 数组（`blutter_frida.js`）
 - capstone 反汇编 + IL 伪指令注释（`asm/`，arm64）
 
@@ -76,7 +77,7 @@ Dart 版本自动识别：官方 SDK 构建的产物按快照版本指纹（32B 
 | 2.16.2 / 2.18.1 / 2.19.6 | ELF 回填 | 函数名按 ELF 符号补偿 |
 | 3.0.0–3.14β | verified | 用户函数完整 |
 
-**21 单测全绿**（`cargo test`）。无已知 2.x/3.x 残余。
+**24 单测全绿**（`cargo test`）。无已知 2.x/3.x 残余。
 
 ## 架构
 
@@ -97,6 +98,11 @@ macOS Flutter 样本（24MB → 14MB 产物）：**0.07s 墙钟**（Python 参�
 ## 已知边界
 
 - 地址是文件偏移空间（非运行时 VA），与 blutter 参考实现一致
+- radare2 ≥ 6 收紧了 flag 命名规则并变更了 `ic+` 用法：`addNames.r2` 已做适配
+  （命名字符清洗、`CCu` 注释、`s <addr>;` 寻址形式），旧版 r2 与 r2 6.2 实测整体
+  零错误；rizin 可解析执行但因其「每地址单 flag」模型会跳过与既有标志同址的辅助
+  标志（blutter 同址多标志分层在 rizin 下原理性受限）；
+  结构头用 `to r2_dart_struct.h` 命令导入
 - asm IL 目前仅覆盖 arm64；x64 反汇编可输出但 IL 注释待补充
 - PE 若剥掉 COFF 符号表，需先用 .pdb 回填符号
 - 1.24/2.0 为 JIT 快照（`kMessageMagic`），不支持

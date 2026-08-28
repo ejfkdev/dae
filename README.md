@@ -14,7 +14,8 @@ Config-driven Dart AOT snapshot debug-info exporter (Rust). Zero Dart SDK depend
 - Function name ↔ address (library::class::method hierarchy, obfuscated-name recovery)
 - Object pool entries (`pp.txt`), recursive user-class instance dump (`objs.txt`)
 - radare2 naming script (`r2_script/addNames.r2` + `r2_dart_struct.h`)
-- IDA import script (`ida_script/addNames.py`, IDAPython — tested on IDA 9.3/9.4, 8.x compatible)
+- IDA import script (`ida_script/addNames.py`, IDAPython — tested on IDA 9.3/9.4; expected compatible with
+  8.x, same typed APIs exist since 7.x, not yet run on an 8.x install)
 - Frida runtime Classes array (`blutter_frida.js`)
 - capstone disassembly + IL pseudo-instruction comments (`asm/`, arm64)
 
@@ -72,7 +73,7 @@ All 26 SDK profiles and the platform profiles are **embedded in the binary**; no
 | 2.16.2 / 2.18.1 / 2.19.6 | ELF backfill | function names backfilled from ELF symbols |
 | 3.0.0–3.14β | verified | complete user functions |
 
-**21 unit tests** (`cargo test`) all green. No known 2.x/3.x gaps.
+**24 unit tests** (`cargo test`) all green. No known 2.x/3.x gaps.
 
 ## Architecture
 
@@ -93,6 +94,12 @@ macOS Flutter sample (24 MB binary → 14 MB of artifacts): **0.07 s wall-clock*
 ## Known limitations
 
 - Addresses are in file-offset space (not runtime VAs), matching the blutter reference implementation
+- radare2 ≥ 6 tightened flag naming and changed the `ic+` usage: `addNames.r2` is adapted
+  (character sanitization, `CCu` comments, `s <addr>;` addressing) and runs zero-error on
+  older r2 and r2 6.2; rizin parses and executes the script but skips auxiliary flags
+  sharing an address (rizin's one-flag-per-address model conflicts with blutter's layered
+  flags by design);
+  import the struct header with `to r2_dart_struct.h`
 - asm IL currently covers arm64 only; x64 disassembly is emitted but IL comments are pending
 - PE binaries stripped of the COFF symbol table need symbols backfilled from a .pdb first
 - 1.24 / 2.0 are JIT snapshots (`kMessageMagic`), unsupported
