@@ -54,7 +54,8 @@
 | `non_field_base` | 不能作为对象字段基址的固定角色寄存器 |
 | `polymorphic_entry_offset_aot` | monomorphic 入口偏移（arm64 AOT = 24） |
 | `frida_heap_address_reg` | frida 模板 HeapAddressReg 重写值 |
-| `status` | verified / unverified（当前只有 macho-arm64 是 verified） |
+| `code_floor` | 函数地址最小文件偏移（entry_for 过滤）：去符号 exec 的回退场景会从指令表尾部泄漏落在容器头区域的假条目，Mach-O 设 4096，其余容器 0（缺省） |
+| `status` | verified / unverified（当前只有 macho-arm64 是 verified；pe-arm64 为 unverified 推演组合，无真机样本） |
 
 ## 3. fill DSL（`cluster_layouts[<cid>].steps`）
 

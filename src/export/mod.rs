@@ -151,7 +151,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     }
     if asm_enabled && !do_asm {
         eprintln!(
-            "注意: IL 反汇编目前仅实现 arm64（当前平台 Profile arch={}），跳过 asm/",
+            "note: IL disassembly is currently arm64-only (platform profile arch={}); skipping asm/",
             analyzer.platform.arch
         );
     }

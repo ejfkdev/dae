@@ -1,11 +1,9 @@
 {
-  "_doc": "Platform Profile: macOS/iOS Mach-O arm64。已验证样本: a macOS Flutter app (macOS Flutter arm64)。寄存器取值来源 dart-lang/sdk 3.3.4 constants_arm64.h (THR=R26, PP=R27, CODE_REG=R24, DISPATCH_TABLE_REG=R21, HEAP_BITS=R28, NULL_REG=R22, TMP=R16, TMP2=R17, FP=R29, LR=R30)。",
-  "name": "macos-arm64",
+  "_doc": "Platform Profile: Windows PE arm64。容器/符号沿用 pe-x64（PE32+ 通用路径）；寄存器角色取自 dart-lang/sdk constants_arm64.h（与 macho/elf arm64 profile 一致：THR=X26、PP=X27、CODE_REG=X24、HEAP_BITS=X28 等）；polymorphic_entry_offset_aot 沿用 arm64 值 24。注意：本机无 Windows ARM64 样本，端到端未验证（status=unverified）——结构为「verified arm64 寄存器布局 + pe-x64 容器解析」的推演组合。",
+  "name": "pe-arm64",
   "arch": "arm64",
   "endianness": "little",
-  "container": {
-    "kind": "macho"
-  },
+  "container": { "kind": "pe" },
   "symbols": {
     "vm_data": "_kDartVmSnapshotData",
     "isolate_data": "_kDartIsolateSnapshotData",
@@ -38,19 +36,8 @@
     "x27": "PP",
     "x28": "HEAP"
   },
-  "non_field_base": [
-    "x29",
-    "x15",
-    "x26",
-    "x30",
-    "x27",
-    "x21",
-    "x24",
-    "x28",
-    "x22"
-  ],
+  "non_field_base": ["x29", "x15", "x26", "x30", "x27", "x21", "x24", "x28", "x22"],
   "polymorphic_entry_offset_aot": 24,
   "frida_heap_address_reg": "x28",
-  "status": "verified",
-  "code_floor": 4096
+  "status": "unverified"
 }

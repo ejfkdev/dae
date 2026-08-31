@@ -13,6 +13,7 @@
 
 - **No setup, self-detecting**: all 26 SDK profiles are embedded in the binary; the Dart version is detected automatically (snapshot version-hash match, with a structural probe fallback for custom/Flutter-engine builds)
 - **Fast**: a 24 MB Flutter sample exports in ~0.07 s wall-clock (≈27× the Python reference implementation)
+- **Bilingual CLI**: output follows the system locale — Chinese locales (Simplified/Traditional) print Chinese, everything else prints English; force with `DAE_LANG=zh|en`
 - **Zero-framework**: parses the container formats directly, no Dart SDK or Flutter toolchain required
 
 ## Installation

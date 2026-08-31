@@ -91,7 +91,7 @@ impl<'a> Analyzer<'a> {
         let (vm_off, iso_off, instr_off) = offsets;
         if used_fallback {
             warnings.push(
-                "平台符号缺失，已按快照魔数回退定位 VM/ISO 段；指令段地址不可用（对象层导出）".to_string(),
+                "platform symbols missing; VM/ISO sections located via snapshot-magic fallback; instruction-section addresses unavailable (object-layer export)".to_string(),
             );
         }
         let slice_off = crate::platform::macho::fat_slice_offset(data) as u64;
@@ -119,16 +119,16 @@ impl<'a> Analyzer<'a> {
                     // code_start_ref - 1 使首个 code 对象（ci=code_start_ref）→ idx 0
                     code_base_ref = iso.code_start_ref.unwrap_or(1).saturating_sub(1);
                 } else {
-                    warnings.push("code_text_offsets：Code 簇未产生 text-offset 序列，函数地址不可用".to_string());
+                    warnings.push("code_text_offsets: the Code cluster produced no text-offset sequence; function addresses unavailable".to_string());
                 }
             } else if profile.instr_table_in_image() {
                 if profile.format.instructions_table_source == "code_text_offsets_unsupported" {
-                    warnings.push("该 Dart 版本（2.10-2.14）为裸指令但 Code 簇为旧式布局，函数地址不可导出，仅对象层（frida/pp/objs）可用".to_string());
+                    warnings.push("this Dart version (2.10-2.14) uses bare instructions with the legacy Code-cluster layout; function addresses are not exportable (object layer only: frida/pp/objs)".to_string());
                 } else {
-                    warnings.push("该 Dart 版本的指令表既不在快照流表头、Code 簇也未捕获 text-offset：函数地址/r2/asm 不可导出，仅对象层（frida/pp/objs）可用".to_string());
+                    warnings.push("the instruction table is present neither in the snapshot stream header nor captured via Code-cluster text offsets; function addresses/r2/asm not exportable (object layer only: frida/pp/objs)".to_string());
                 }
             } else {
-                warnings.push("指令表解码为空：函数地址不可用（检查 SDK Profile 是否正确）".to_string());
+                warnings.push("instruction table decoded empty: function addresses unavailable (check that the SDK profile is correct)".to_string());
             }
         }
         t("指令表", &mut since);
@@ -331,6 +331,9 @@ impl<'a> Analyzer<'a> {
             0
         };
         let ep = self.instr_base + self.pc_offsets[idx] + eo;
+        if ep < self.platform.code_floor {
+            return None; // 容器头区域的假条目（去符号回退场景），见 PlatformProfile.code_floor
+        }
         Some((ep, idx))
     }
 

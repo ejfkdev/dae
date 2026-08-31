@@ -1,6 +1,7 @@
 pub mod analyzer;
 pub mod engine;
 pub mod export;
+pub mod locale;
 pub mod platform;
 pub mod profile;
 

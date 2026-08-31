@@ -19,8 +19,11 @@ const PLATFORM_ELF_ARM64: &str = include_str!("../profiles/platform/elf-arm64.js
 const PLATFORM_ELF_X64: &str = include_str!("../profiles/platform/elf-x64.json");
 const PLATFORM_MACHO_X64: &str = include_str!("../profiles/platform/macho-x64.json");
 const PLATFORM_PE_X64: &str = include_str!("../profiles/platform/pe-x64.json");
+const PLATFORM_PE_ARM64: &str = include_str!("../profiles/platform/pe-arm64.json");
 
 fn main() {
+    let lang = dae::locale::detect();
+    let s = dae::locale::messages(lang);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut positional: Vec<String> = Vec::new();
     let mut sdk_override: Option<PathBuf> = None;
@@ -30,7 +33,7 @@ fn main() {
         match args[i].as_str() {
             "--sdk-profile" => {
                 if i + 1 >= args.len() {
-                    eprintln!("错误: --sdk-profile 缺少参数");
+                    eprintln!("{}", s.err_sdk_arg);
                     std::process::exit(2);
                 }
                 sdk_override = Some(PathBuf::from(&args[i + 1]));
@@ -38,14 +41,14 @@ fn main() {
             }
             "--platform-profile" => {
                 if i + 1 >= args.len() {
-                    eprintln!("错误: --platform-profile 缺少参数");
+                    eprintln!("{}", s.err_platform_arg);
                     std::process::exit(2);
                 }
                 platform_override = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--help" | "-h" => {
-                print_help();
+                print_help(&s);
                 std::process::exit(0);
             }
             "--version" | "-V" => {
@@ -59,14 +62,14 @@ fn main() {
         }
     }
     if positional.len() < 2 {
-        print_help();
+        print_help(&s);
         std::process::exit(2);
     }
     let bin = &positional[0];
     let out = &positional[1];
 
-    if let Err(e) = run(bin, out, sdk_override.as_deref(), platform_override.as_deref()) {
-        eprintln!("错误: {e}");
+    if let Err(e) = run(bin, out, sdk_override.as_deref(), platform_override.as_deref(), &s) {
+        eprintln!("{}: {e}", s.err_prefix);
         std::process::exit(1);
     }
 }
@@ -76,10 +79,12 @@ fn run(
     out: &str,
     sdk_override: Option<&std::path::Path>,
     platform_override: Option<&std::path::Path>,
+    s: &dae::locale::Messages,
 ) -> Result<(), String> {
     let since = std::time::Instant::now();
-    let bin_path = resolve_binary(bin)?;
-    let data = std::fs::read(&bin_path).map_err(|e| format!("读二进制失败 {bin_path}: {e}"))?;
+    let bin_path = resolve_binary(bin, s)?;
+    let data = std::fs::read(&bin_path)
+        .map_err(|e| format!("{} {bin_path}: {e}", s.err_read_binary))?;
     if std::env::var("DART_AOT_TIMINGS").is_ok() {
         eprintln!("[timing] 读文件({} MB): {:?}", data.len() >> 20, since.elapsed());
     }
@@ -87,16 +92,16 @@ fn run(
     // 平台 Profile：显式覆盖或按容器+架构自动选择
     let plat_storage;
     let platform: PlatformProfile = if let Some(p) = platform_override {
-        let c = std::fs::read_to_string(p).map_err(|e| format!("读 --platform-profile: {e}"))?;
+        let c = std::fs::read_to_string(p).map_err(|e| format!("{}{e}", s.err_read_platform))?;
         plat_storage = parse_platform(&c)?;
         plat_storage
     } else {
         let kind = platform::detect_container(&data).ok_or_else(|| {
             // 裸 JIT 快照（app-jit）以 kMessageMagic（dc dc f6 f6）打头，无容器
             if data.len() >= 4 && data[..4] == [0xdc, 0xdc, 0xf6, 0xf6] {
-                "裸 app-JIT 快照（kMessageMagic）没有容器包裹，暂不支持（需 AOT 产物：dart compile aot-snapshot / dart2native / Flutter release 构建）".to_string()
+                s.err_bare_jit.to_string()
             } else {
-                "无法识别容器格式（不是 Mach-O/ELF/PE）".to_string()
+                s.err_container.to_string()
             }
         })?;
         let arch = match kind {
@@ -167,9 +172,15 @@ fn run(
                 PARSED
                     .get_or_init(|| parse_platform(PLATFORM_PE_X64).expect("内嵌平台 profile 损坏"))
             }
+            ("pe", Some("arm64")) => {
+                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
+                PARSED
+                    .get_or_init(|| parse_platform(PLATFORM_PE_ARM64).expect("内嵌平台 profile 损坏"))
+            }
             _ => {
                 return Err(format!(
-                    "容器 {kind} 架构 {arch:?} 暂无内嵌平台 Profile，请用 --platform-profile 指定（profiles/platform/ 下新建一份即可）"
+                    "container {kind} arch {arch:?}: {}",
+                    s.err_platform_missing
                 ));
             }
         }
@@ -186,13 +197,13 @@ fn run(
         sdk_storage = parse_sdk(&c)?;
         &sdk_storage
     } else {
-        dae::profile::detect::detect_or_default(&data, snap_offs)
+        dae::profile::detect::detect_or_default(&data, snap_offs, s)
     };
 
     if sdk.status != "verified" {
         eprintln!(
-            "警告: SDK Profile {} 状态为 unverified（该版本的样本对拍尚未全部完成）。导出结果仅供参考，请以 verified 版本结果为准",
-            sdk.abi
+            "{}: {} {} {}",
+            s.warn_prefix, s.sdk_profile_label, sdk.abi, s.sdk_unverified
         );
     }
     let analyzer = Analyzer::new_located(&data, sdk, &platform, snap_offs, used_fallback)?;
@@ -237,18 +248,18 @@ fn run(
     );
 
     let summary = export::run(&analyzer, std::path::Path::new(out))?;
-    println!("导出完成 → {}:", out);
-    println!("  r2_script/addNames.r2     {} 条函数名/地址", summary.r2_functions);
-    println!("  ida_script/addNames.py    {} 个函数命名 + Dart 结构头", summary.ida_functions);
-    println!("  blutter_frida.js          {} 个 Classes 条目", summary.frida_classes);
+    println!("{} {}:", s.export_done, out);
+    println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
+    println!("  ida_script/addNames.py    {} {}", summary.ida_functions, s.sum_ida);
+    println!("  blutter_frida.js          {} {}", summary.frida_classes, s.sum_frida);
     if summary.asm_enabled {
-        println!("  asm/                      {} 个函数反汇编 + IL", summary.asm_functions);
+        println!("  asm/                      {} {}", summary.asm_functions, s.sum_asm);
     }
-    println!("  pp.txt                    {} 个对象池条目", summary.pp_entries);
-    println!("  objs.txt                  {} 个用户类实例", summary.objs_instances);
+    println!("  pp.txt                    {} {}", summary.pp_entries, s.sum_pp);
+    println!("  objs.txt                  {} {}", summary.objs_instances, s.sum_objs);
 
     for w in &analyzer.warnings {
-        eprintln!("警告: {w}");
+        eprintln!("{}: {w}", s.warn_prefix);
     }
     if let Ok(dump) = std::env::var("DART_AOT_DUMP_STRINGS") {
         let mut csv = String::new();
@@ -262,46 +273,87 @@ fn run(
     Ok(())
 }
 
-fn print_help() {
-    println!("dae — Dart AOT 快照调试信息静态导出工具");
-    println!();
-    println!("用法: dae <binary> <out_dir> [选项]");
-    println!();
-    println!("参数:");
-    println!("  <binary>              目标二进制文件（Mach-O/ELF/PE，含 Dart AOT 快照）");
-    println!("                         支持直接传入 .app 目录（自动查找 Flutter 二进制）");
-    println!("  <out_dir>             输出目录（自动创建）");
-    println!();
-    println!("选项:");
-    println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，自动识别 Dart 版本）");
-    println!("  --platform-profile PATH 平台 Profile JSON（默认: 按容器+架构自动选择）");
-    println!("  -h, --help            显示此帮助");
-    println!("  -V, --version         显示版本");
-    println!();
-    println!("输出文件:");
-    println!("  r2_script/addNames.r2  radare2 函数命名脚本");
-    println!("  ida_script/addNames.py  IDA 命名脚本（IDAPython + Dart 结构头）");
-    println!("  blutter_frida.js       Frida 运行时 Classes 数组");
-    println!("  asm/                   capstone 反汇编 + IL 注释（arm64）");
-    println!("  pp.txt                 对象池条目");
-    println!("  objs.txt               用户类实例递归 dump");
-    println!();
-    println!("智能路径解析:");
-    println!("  macOS Flutter:  xxx.app → App.framework/App");
-    println!("  iOS Flutter:    xxx.app → App（同结构）");
-    println!("  dart2native:    xxx.exe / xxx（直接使用）");
-    println!();
-    println!("Profile 文档: docs/PROFILES.md | profiles/");
-    println!("版本列表: 内置 26 个 Dart 版本（1.24–3.14β），自动识别版本");
-    println!("项目主页: https://github.com/ejfkdev/dae");
-    println!();
-    println!("示例:");
-    println!("  dae App.app out/");
-    println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
+fn print_help(s: &dae::locale::Messages) {
+    if s.lang == dae::locale::Lang::Zh {
+        // 中文语系
+        println!("dae — Dart AOT 快照调试信息静态导出工具");
+        println!();
+        println!("用法: dae <binary> <out_dir> [选项]");
+        println!();
+        println!("参数:");
+        println!("  <binary>              目标二进制文件（Mach-O/ELF/PE，含 Dart AOT 快照）");
+        println!("                         支持直接传入 .app 目录（自动查找 Flutter 二进制）");
+        println!("  <out_dir>             输出目录（自动创建）");
+        println!();
+        println!("选项:");
+        println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，自动识别 Dart 版本）");
+        println!("  --platform-profile PATH 平台 Profile JSON（默认: 按容器+架构自动选择）");
+        println!("  -h, --help            显示此帮助");
+        println!("  -V, --version         显示版本");
+        println!();
+        println!("输出文件:");
+        println!("  r2_script/addNames.r2  radare2 函数命名脚本");
+        println!("  ida_script/addNames.py  IDA 命名脚本（IDAPython + Dart 结构头）");
+        println!("  blutter_frida.js       Frida 运行时 Classes 数组");
+        println!("  asm/                   capstone 反汇编 + IL 注释（arm64）");
+        println!("  pp.txt                 对象池条目");
+        println!("  objs.txt               用户类实例递归 dump");
+        println!();
+        println!("智能路径解析:");
+        println!("  macOS Flutter:  xxx.app → App.framework/App");
+        println!("  iOS Flutter:    xxx.app → App（同结构）");
+        println!("  dart2native:    xxx.exe / xxx（直接使用）");
+        println!();
+        println!("语言: 跟随系统语系自动选择（中文语系输出中文，其余英文）；可用 DAE_LANG=zh|en 强制");
+        println!("Profile 文档: docs/PROFILES.md | profiles/");
+        println!("版本列表: 内置 26 个 Dart 版本（1.24–3.14β），自动识别版本");
+        println!("项目主页: https://github.com/ejfkdev/dae");
+        println!();
+        println!("示例:");
+        println!("  dae App.app out/");
+        println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
+    } else {
+        println!("dae — static Dart AOT snapshot debug-info exporter");
+        println!();
+        println!("usage: dae <binary> <out_dir> [options]");
+        println!();
+        println!("arguments:");
+        println!("  <binary>              target binary (Mach-O/ELF/PE with a Dart AOT snapshot)");
+        println!("                         accepts an .app directory directly (locates the Flutter binary)");
+        println!("  <out_dir>             output directory (created if missing)");
+        println!();
+        println!("options:");
+        println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected)");
+        println!("  --platform-profile PATH platform profile JSON (default: auto by container + arch)");
+        println!("  -h, --help            show this help");
+        println!("  -V, --version         show version");
+        println!();
+        println!("outputs:");
+        println!("  r2_script/addNames.r2  radare2 naming script");
+        println!("  ida_script/addNames.py  IDA naming script (IDAPython + Dart struct header)");
+        println!("  blutter_frida.js       Frida runtime Classes array");
+        println!("  asm/                   capstone disassembly + IL comments (arm64)");
+        println!("  pp.txt                 object pool entries");
+        println!("  objs.txt               recursive user class instance dump");
+        println!();
+        println!("smart path resolution:");
+        println!("  macOS Flutter:  xxx.app -> App.framework/App");
+        println!("  iOS Flutter:    xxx.app -> App (same layout)");
+        println!("  dart2native:    xxx.exe / xxx (used directly)");
+        println!();
+        println!("language: follows the system locale (Chinese locales print Chinese, others English); override with DAE_LANG=zh|en");
+        println!("profile docs: docs/PROFILES.md | profiles/");
+        println!("versions: 26 embedded Dart versions (1.24-3.14beta), auto-detected");
+        println!("homepage: https://github.com/ejfkdev/dae");
+        println!();
+        println!("examples:");
+        println!("  dae App.app out/");
+        println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
+    }
 }
 
 /// 智能路径解析：如果输入是 .app 目录，自动查找 Flutter 二进制。
-fn resolve_binary(path: &str) -> Result<String, String> {
+fn resolve_binary(path: &str, s: &dae::locale::Messages) -> Result<String, String> {
     let p = std::path::Path::new(path);
     if p.is_dir() {
         // macOS Flutter: xxx.app/Contents/Frameworks/App.framework/App
@@ -316,7 +368,8 @@ fn resolve_binary(path: &str) -> Result<String, String> {
             }
         }
         return Err(format!(
-            "目录 {path} 内未找到 Flutter 二进制（尝试了 {})",
+            "{} {path}（{}）",
+            s.err_flutter_dir,
             candidates.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join(", ")
         ));
     }

@@ -493,6 +493,12 @@ pub struct PlatformProfile {
     /// 验证状态："verified" | "unverified"
     #[serde(default)]
     pub status: String,
+    /// 函数地址最小文件偏移（entry_for 过滤）：去符号 exec 的回退场景下，
+    /// 指令表尾部 stub 会泄漏出落在容器头区域的假条目（如低至 0x80 级）。
+    /// Mach-O 设 4096（header/load commands 区域），其余容器 0（未观察到该
+    /// 现象，且 ELF 真代码可低至 0x1080 级，不宜误伤）。
+    #[serde(default)]
+    pub code_floor: u64,
 }
 
 // ------------------------------------------------------------------ 内嵌 profile

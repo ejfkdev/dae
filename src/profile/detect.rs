@@ -120,28 +120,30 @@ pub fn detect_sdk(
 
 /// main 入口的默认选择：识别成功打印所选版本与判定方式；
 /// 识别失败回退内嵌 dart-3.3.4 并显式告警。
-pub fn detect_or_default(data: &[u8], offs: (u64, u64, u64)) -> &'static SdkProfile {
+pub fn detect_or_default(
+    data: &[u8],
+    offs: (u64, u64, u64),
+    s: &crate::locale::Messages,
+) -> &'static SdkProfile {
     match detect_sdk(data, offs.0 as usize, offs.1 as usize) {
         Some((p, det)) => {
             let basis = if det.hash_hit {
-                "版本指纹命中"
+                s.detect_basis_hash
             } else if det.clean {
-                "结构推断"
+                s.detect_basis_probe
             } else {
-                "结构推断·低置信"
+                s.detect_basis_low
             };
-            println!("SDK Profile: {}（{basis}）", p.abi);
+            println!("{}: {}（{basis}）", s.sdk_profile_label, p.abi);
             p
         }
         None => {
-            eprintln!(
-                "警告: 无法自动识别 Dart 版本，回退内嵌 dart/3.3.4（可用 --sdk-profile 显式指定）"
-            );
+            eprintln!("{}", s.detect_fallback);
             sdk_registry()
                 .iter()
                 .find(|(abi, _)| abi == "dart/3.3.4")
                 .map(|(_, p)| p)
-                .expect("内嵌 dart/3.3.4 profile 缺失")
+                .expect("内嵌 dart-3.3.4 profile 缺失")
         }
     }
 }
