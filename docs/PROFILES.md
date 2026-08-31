@@ -11,20 +11,43 @@ Top-level fields (`SdkProfile`; serde definition in `src/profile/mod.rs`):
 | field | meaning |
 |---|---|
 | `abi` | version identifier (documentation use) |
+| `status` | `verified` / `unverified`: export-time notice when a version's sample comparison is incomplete |
+| `format` | snapshot-format switches (see §1.1) |
 | `word_size` / `compressed_pointers` | affect frida constants and runtime offsets |
 | `tagging` | heap_object_tag / object_alignment(_log2) / smi_mask / smi_shift / cid_tag_pos / cid_tag_mask / num_predefined_cids |
-| `header_fields` | snapshot stream header fields, read order (name → header map) |
+| `header_fields` | snapshot stream header fields, read order (name → header map); each entry is either `"name"` (unsigned) or `{"name": ..., "kind": "signed"}` (1.24.3 reads everything signed) |
 | `full_aot_kind` / `object_start_alignment` | kind=3 (Snapshot::kFullAOT); data_image alignment 64 |
-| `alloc` | allocation-phase classification (see below) |
+| `alloc` | allocation-phase classification (see §1.2) |
 | `cluster_layouts` | fill layout per cid (fill DSL, see §3) |
 | `runtime_offsets` | object layout offsets used by asm IL (thread_field_table_values / array_data_minus_tag, etc.) |
 | `frida_cid_constants` | header constants for `blutter_frida.js` (values emitted verbatim; ClassIdTagMask kept as the string "0xfffff" to preserve the original form) |
 | `frida_special_layouts` | special class entries in the frida Classes array (static names + offsets for bool/int/String/List/Map/Closure/Object; key order = output order) |
 | `frida_int_typed_cids` | the 8 integer TypedData cids that carry lenOffset/dataOffset |
 | `class_id_names` | cid → predefined class name (sparse map, from the class_id.h enum + expanded TypedData names) |
-| `typed_data_names` | names of the 14 TypedData base classes (reserved) |
 
-### alloc classification
+### 1.1 FormatConfig (`format`)
+
+Snapshot-format differences that used to be engine code branches; all serde-defaulted:
+
+| field | values / meaning |
+|---|---|
+| `ref_encoding` | `ref_id_128` (2.19+, big-endian 7-bit groups +128) / `unsigned_leb128` (≤2.17) |
+| `instructions_table_source` | `snapshot_rodata` (default) / `image` (2.15: table lives in the AOT image) / `code_text_offsets` (2.15-2.16 bare instructions) |
+| `cluster_header` | `cid_and_canonical` (≤3.5: cid=value>>1, canonical=value&1) / `cid_tags` (3.6+: full object tags, ClassIdTag decode) |
+| `single_snapshot` | 3.13+: VM/ISO merged into a single snapshot |
+| `class_alloc` | `pre_ids` (≤3.12) / `fixed` (3.13+) |
+| `code_leading_refs` | 3.13+: 2 leading refs before Code fill objects |
+| `string_clusters_separate` | ≤2.14: string data spread over three cids |
+| `code_alloc` | `state_deferred` (2.10+) / `count_only` (≤2.9) |
+| `type_dual_count` | ≤2.9: Type cluster dual-segment dual-count alloc |
+| `instance_legacy` / `instance_alloc_nfo_only` | ≤2.9 no-bitmap instances / 2.10 alloc reads nfo only |
+| `objectpool_legacy` / `objectpool_type_low7` / `objectpool_type_low7_swapped` | ObjectPool entry bitfield eras (≤2.9 / 2.10–3.1 / 3.2.x swap) |
+| `code_refs` | refs per Code object (default 6; 2.15 = 7) |
+| `code_has_text_offset` | ≤2.16: leading text-offset uvarint in Code fill |
+| `class_fill_adj` / `code_fill_adj` | 2.18.x-only fill start corrections (bytes; -2 / -4, recovered by byte-diffing) |
+| `elf_name_backfill` | transitional versions (2.16/2.18/2.19.6): backfill function names from ELF symbols by entry address |
+
+### 1.2 alloc classification
 
 | key | meaning |
 |---|---|
@@ -32,8 +55,12 @@ Top-level fields (`SdkProfile`; serde definition in `src/profile/mod.rs`):
 | `var_cids` | variable-length classes (`{17,22,27,28,29,46,66,89,90}`): alloc reads `count` lengths |
 | `mint_cid`(60) / `code_cid`(18) / `class_cid`(5) / `instance_cid`(44) / `library_cid`(13) / `function_cid`(7) | special alloc sections |
 | `instance_min`(176) / `ffi_cids` | instance alloc (first reads the nfo/isize pair as svarints) |
+| `type_cid` / `type_parameter_cid` | Type / TypeParameter cluster cids (≤2.10 dual-segment dual-count alloc) |
 | `canonical_table_cids` | additionally read the canonical table when canonical=1 |
-| `typed_data_first/count/elem_widths/var_rem/view_rem` | TypedData classification: rem=(cid-first)%4 ∈ var_rem{0,2} → variable-length; view_rem{1,3} → view |
+| `canonical_subset_table_cids` | subset-style canonical tables (2.13/2.14 only Type): extra `first_element` varint |
+| `cid_only_alloc_cids` | clusters whose alloc writes cid only, no count (2.13 WeakSerializationReference) |
+| `typed_data_first/count/stride` | TypedData classification: slot=(cid-first)/stride, rem=(cid-first)%stride |
+| `typed_data_elem_widths/var_rem/view_rem` | elem widths per slot; rem ∈ var_rem → variable-length, view_rem → view |
 | `string_cid`(92) / `one_byte_string_cid`(93) / `two_byte_string_cid`(94) | string decoding |
 
 ## 2. Platform profile (`profiles/platform/*.json`)
@@ -44,11 +71,13 @@ Table of `(container, arch)`: `macho/elf/pe × arm64/x64/…`. Fields (`Platform
 |---|---|
 | `container.kind` | macho / elf / pe (selects the parser) |
 | `symbols` | the three entry symbol names (`_kDartVmSnapshotData` etc., same names across platforms) |
+| `symbols_alt` | backup symbol set (e.g. the 3.13 single-snapshot three-segment names); used when the primary set is incomplete |
 | `registers` | role registers for IL/disassembly (thr/pp/null/barrier/fp/sp/lr/code_reg…) |
 | `register_aliases` | op_str rewrite alias table (x29→fp etc., matching blutter's output style) |
 | `non_field_base` | fixed-role registers that must never be used as an object-field base |
 | `polymorphic_entry_offset_aot` | monomorphic entry offset (arm64 AOT = 24) |
 | `frida_heap_address_reg` | HeapAddressReg rewrite value for the frida template |
+| `r2_app_base` | optional override for `f app.base` in addNames.r2 (default: the container's text-segment VM address) |
 | `code_floor` | minimum file offset for function addresses (entry_for filter): the stripped-executable fallback path can leak bogus entries from the tail of the instruction table into container-header offsets; Mach-O uses 4096, other containers 0 (default) |
 | `status` | verified / unverified (currently only macho-arm64 is verified; pe-arm64 is an unverified structural combination, no real device sample) |
 
@@ -64,7 +93,10 @@ The step list is interpreted per object (`k = 0..count`); captured values go int
 | `uvarint` | `alias` / `collect` / `transform:"shr4_and_mask"` | ReadUnsigned; transform = Type's `(flags>>4)&cid_tag_mask` |
 | `svarint` | `alias` / `collect` | signed variable-length Read\<T\> |
 | `byte` | `alias` / `collect` | 1 byte |
+| `u32` | `alias` / `collect` | fixed 4-byte little-endian uint32 (2.15–2.17 Function packed_fields_/kind_tag_) |
+| `text_offset` | `signed`(bool, 2.10 special) | read one varint and accumulate it into the snapshot-level text_offsets (≤2.16 bare-instruction entry addressing, `code_text_offsets` source) |
 | `skip_raw_elem_width` | — | skip `lengths[k] * elem_width(cid)` raw bytes (TypedData) |
+| `skip_align` | `n` | alignment padding: jump to position % n == 0 (≤2.9 ExternalTypedData, n=8) |
 | `skip_const` | `n` | skip n bytes |
 
 ### Structure
@@ -98,3 +130,4 @@ Built-in layouts (no JSON declaration needed): string classes (cid==string_cid, 
 - A cid > 60000 in the stream is treated as drift: parsing stops with a warning.
 - fill fails explicitly for a cid without a layout, suggesting to add one to `cluster_layouts` (the reference implementation aborts silently; we fail loudly instead).
 - The engine errors on any uncaptured field of an emitted record (a `cond` missing `set_default` is the most common cause).
+- Version auto-detection is two-stage: exact snapshot version-hash match (`version_hashes.json`), then a structural probe (alloc trial-parse + fill scoring) when the hash is unknown; if neither produces a result the embedded dart/3.3.4 profile is used with an explicit warning (see `src/profile/detect.rs`).
