@@ -312,6 +312,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("示例:");
         println!("  dae App.app out/");
         println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
+        println!();
+        println!("使用产物: 见 README「使用导出产物」一节（IDA: File → Script file… 选择 ida_script/addNames.py）");
     } else {
         println!("dae — static Dart AOT snapshot debug-info exporter");
         println!();
@@ -349,6 +351,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("examples:");
         println!("  dae App.app out/");
         println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
+        println!();
+        println!("using outputs: see README 'Using the outputs' (IDA: File -> Script file... then pick ida_script/addNames.py)");
     }
 }
 

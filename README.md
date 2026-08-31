@@ -83,6 +83,39 @@ Import into IDA: `File → Script file…` and pick `ida_script/addNames.py` —
 | `asm/` | capstone disassembly + blutter-style IL comments (arm64) |
 | `pp.txt` / `objs.txt` | object-pool entries / recursive user-class instance dump |
 
+## Using the outputs
+
+### IDA
+
+1. Open the binary in IDA and let the initial auto-analysis finish.
+2. `File → Script file…` and select `ida_script/addNames.py` — function names and boundaries are applied to the current database, and the `DartThread` / `DartObjectPool` structs are parsed in (the script auto-rebases to the image base).
+3. Verify: jump to an address printed in the script (or any renamed function); the structs appear under `View → Open subviews → Structures`.
+
+### radare2
+
+```bash
+r2 -i out/r2_script/addNames.r2 <binary>      # libraries/classes/methods become flags
+# inside the session:
+to out/r2_script/r2_dart_struct.h             # load the Dart struct header
+f~method.                                     # browse the flags
+```
+
+### Frida
+
+`blutter_frida.js` is a **template**: replace the marked hook line/address with an entry point you want to hook (pick one from the named functions), then:
+
+```bash
+frida -f <app> -l out/blutter_frida.js
+```
+
+The `Classes` array exposes per-class metadata (field bitmaps, sizes, argument offsets) for building hooks.
+
+### Text outputs
+
+- `asm/*.dart` — per-library disassembly with blutter-style IL pseudo-instruction comments; plain text, read directly or search.
+- `pp.txt` — object-pool entries (immediates, object references, native/stub entries); useful for finding embedded data and constants.
+- `objs.txt` — recursive dump of user-class instances (super chains, bool/List/Map contents); useful for recovering runtime object values.
+
 ## Dart version support
 
 | Version range | Status |

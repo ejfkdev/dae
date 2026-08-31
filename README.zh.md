@@ -83,6 +83,39 @@ SDK Profile: dart/3.13.0（版本指纹命中）
 | `asm/` | capstone 反汇编 + blutter 风格 IL 注释（arm64） |
 | `pp.txt` / `objs.txt` | 对象池条目 / 用户类实例递归 dump |
 
+## 使用导出产物
+
+### IDA
+
+1. 在 IDA 中打开目标二进制，等待初始自动分析完成
+2. `File → Script file…` 选择 `ida_script/addNames.py`——函数命名与边界落入当前数据库，`DartThread`/`DartObjectPool` 结构自动解析入库（脚本自动按装载基址重定）
+3. 验证：跳转到脚本里打印的地址（或任意已命名函数）；结构在 `View → Open subviews → Structures` 中可见
+
+### radare2
+
+```bash
+r2 -i out/r2_script/addNames.r2 <binary>      # 库/类/方法变成 flag
+# 会话内:
+to out/r2_script/r2_dart_struct.h             # 载入 Dart 结构头
+f~method.                                     # 浏览 flag
+```
+
+### Frida
+
+`blutter_frida.js` 是**模板**：把标记的 hook 行/地址换成你要挂钩的入口（从命名函数里挑一个），然后：
+
+```bash
+frida -f <app> -l out/blutter_frida.js
+```
+
+`Classes` 数组提供逐类元数据（字段位图、大小、参数偏移），可用于构造 hook。
+
+### 文本产物
+
+- `asm/*.dart`——按库一份的反汇编，带 blutter 风格 IL 伪指令注释；纯文本，直接阅读或检索
+- `pp.txt`——对象池条目（立即数、对象引用、native/stub）；用于找内嵌数据与常量
+- `objs.txt`——用户类实例递归 dump（super 链、bool/List/Map 内容）；用于还原运行时对象值
+
 ## Dart 版本支持
 
 | 版本范围 | 状态 |
