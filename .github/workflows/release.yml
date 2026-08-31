@@ -10,6 +10,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -59,7 +60,9 @@ jobs:
         if: matrix.zip == 'upx'
         uses: crazy-max/ghaction-upx@v3
         with:
-          files: target/${{ matrix.target }}/release/dae*
+          # 精确指向产物本体：`dae*` 通配会误吞同目录的 dae.d（dep-info 文本），
+          # UPX 报 UnknownExecutableFormatException 导致整条流水线失败
+          files: target/${{ matrix.target }}/release/dae${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}
 
       # macOS 产物默认未签名，ad-hoc 签名避免下载后被 Gatekeeper 拦（不做公证）
       - name: Ad-hoc codesign (macOS)
