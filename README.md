@@ -147,7 +147,7 @@ Three layers; the engine never changes between versions, only configuration is a
 | SDK profile | `profiles/sdk/*.json` | cid enums, cluster field layouts (fill DSL), tagging, runtime offsets — one per Dart version |
 | Platform profile | `profiles/platform/*.json` | container parser, symbol names, register roles — one per (container × arch) |
 
-Spec: [`docs/PROFILES.md`](docs/PROFILES.md) (Chinese)
+Spec: [`docs/PROFILES.md`](docs/PROFILES.md)
 
 ## Known limitations
 
@@ -158,4 +158,4 @@ Spec: [`docs/PROFILES.md`](docs/PROFILES.md) (Chinese)
 
 ## License
 
-[MIT](LICENSE) · third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+[MIT](LICENSE)

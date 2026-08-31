@@ -147,7 +147,7 @@ frida -f <app> -l out/blutter_frida.js
 | SDK Profile | `profiles/sdk/*.json` | cid 枚举、cluster 字段布局（fill DSL）、tagging、runtime offsets——每 Dart 版本一份 |
 | 平台 Profile | `profiles/platform/*.json` | 容器解析器、符号名、寄存器角色——每（容器 × 架构）一份 |
 
-规格：[`docs/PROFILES.md`](docs/PROFILES.md)
+规格：[`docs/PROFILES.zh.md`](docs/PROFILES.zh.md)
 
 ## 已知边界
 
@@ -158,4 +158,4 @@ frida -f <app> -l out/blutter_frida.js
 
 ## License
 
-[MIT](LICENSE) · 第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+[MIT](LICENSE)

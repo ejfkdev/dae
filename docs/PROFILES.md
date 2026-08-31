@@ -1,107 +1,100 @@
-# fill DSL & Profile 规范
+# fill DSL & Profile Specification
 
-引擎（`src/engine/`）跨 Dart 版本/平台不变；一切随版本/平台变化的数据都在 `profiles/` 的 JSON 里。
-本文件是这两类配置的规范，也是「新增一个 Dart 版本/新平台时只改配置」的契约。
+The engine (`src/engine/`) is invariant across Dart versions/platforms; everything that varies by version/platform lives in the JSON files under `profiles/`. This document specifies both configuration kinds and defines the contract that "adding a new Dart version/platform requires configuration changes only."
 
-## 1. SDK Profile（`profiles/sdk/*.json`）
+## 1. SDK profile (`profiles/sdk/*.json`)
 
-标识为 `(Dart 版本, word_size, compressed_pointers)`。`profiles/sdk/` 内 26 个版本
-（1.24.3 → 3.14β）**全部编译进二进制**：`dae` 运行时按快照版本指纹（32B hash，
-见 `version_hashes.json`）精确命中，未命中时对嵌入版本做结构探针 + fill 决胜
-（见 `src/profile/detect.rs`）。全量对拍基准版本为 `dart-3.3.4-w64-no-compressed.json`
-（a macOS Flutter app / arm64 / 3.3.4 / 无压缩指针 / --obfuscate 全量对拍通过）。
+Keyed by `(Dart version, word_size, compressed_pointers)`. All 26 versions in `profiles/sdk/` (1.24.3 → 3.14β) are **compiled into the binary**: at runtime `dae` matches the exact version by snapshot version fingerprint (32-byte hash, see `version_hashes.json`); on a miss it runs structural probes against the embedded versions with fill scoring (see `src/profile/detect.rs`). The byte-comparison baseline is `dart-3.3.4-w64-no-compressed.json` (a macOS Flutter app / arm64 / 3.3.4 / no pointer compression / `--obfuscate` — full comparison passed).
 
-顶层字段（`SdkProfile`，serde 结构见 `src/profile/mod.rs`）：
+Top-level fields (`SdkProfile`; serde definition in `src/profile/mod.rs`):
 
-| 字段 | 含义 |
+| field | meaning |
 |---|---|
-| `abi` | 版本标识（文档用） |
-| `word_size` / `compressed_pointers` | 影响 frida 常量与 runtime offsets |
+| `abi` | version identifier (documentation use) |
+| `word_size` / `compressed_pointers` | affect frida constants and runtime offsets |
 | `tagging` | heap_object_tag / object_alignment(_log2) / smi_mask / smi_shift / cid_tag_pos / cid_tag_mask / num_predefined_cids |
-| `header_fields` | 快照流头字段读取顺序（名字 → Header map） |
-| `full_aot_kind` / `object_start_alignment` | kind=3（Snapshot::kFullAOT）；data_image 对齐 64 |
-| `alloc` | 分配阶段分类（见下） |
-| `cluster_layouts` | 每 cid 的 fill 布局（fill DSL，见 §3） |
-| `runtime_offsets` | asm IL 用的对象布局偏移（thread_field_table_values / array_data_minus_tag 等） |
-| `frida_cid_constants` | `blutter_frida.js` 头部常量（值原样输出；ClassIdTagMask 用字符串 "0xfffff" 保持原型） |
-| `frida_special_layouts` | frida Classes 数组特殊类条目（bool/int/String/List/Map/Closure/Object 的静态名+偏移；键序即输出序） |
-| `frida_int_typed_cids` | 带 lenOffset/dataOffset 的 8 个整数 TypedData cid |
-| `class_id_names` | cid → 预定义类名（稀疏 map，来自 class_id.h 枚举 + TypedData 展开名） |
-| `typed_data_names` | 14 个 TypedData 基类名（预留） |
+| `header_fields` | snapshot stream header fields, read order (name → header map) |
+| `full_aot_kind` / `object_start_alignment` | kind=3 (Snapshot::kFullAOT); data_image alignment 64 |
+| `alloc` | allocation-phase classification (see below) |
+| `cluster_layouts` | fill layout per cid (fill DSL, see §3) |
+| `runtime_offsets` | object layout offsets used by asm IL (thread_field_table_values / array_data_minus_tag, etc.) |
+| `frida_cid_constants` | header constants for `blutter_frida.js` (values emitted verbatim; ClassIdTagMask kept as the string "0xfffff" to preserve the original form) |
+| `frida_special_layouts` | special class entries in the frida Classes array (static names + offsets for bool/int/String/List/Map/Closure/Object; key order = output order) |
+| `frida_int_typed_cids` | the 8 integer TypedData cids that carry lenOffset/dataOffset |
+| `class_id_names` | cid → predefined class name (sparse map, from the class_id.h enum + expanded TypedData names) |
+| `typed_data_names` | names of the 14 TypedData base classes (reserved) |
 
-### alloc 分类
+### alloc classification
 
-| 键 | 含义 |
+| key | meaning |
 |---|---|
-| `rodata_cids` | ROData 类（`{23,24,25,92,93,94}`）：alloc 读 delta 偏移，fill 空 |
-| `var_cids` | 变长类（`{17,22,27,28,29,46,66,89,90}`）：alloc 读 count 个长度 |
-| `mint_cid`(60) / `code_cid`(18) / `class_cid`(5) / `instance_cid`(44) / `library_cid`(13) / `function_cid`(7) | 特殊 alloc 段 |
-| `instance_min`(176) / `ffi_cids` | instance alloc（先读 nfo/isize 两个 svarint） |
-| `canonical_table_cids` | canonical=1 时额外读 canonical table |
-| `typed_data_first/count/elem_widths/var_rem/view_rem` | TypedData 分类：rem=(cid-first)%4 ∈ var_rem{0,2} → 变长；view_rem{1,3} → view |
-| `string_cid`(92) / `one_byte_string_cid`(93) / `two_byte_string_cid`(94) | 字符串解码 |
+| `rodata_cids` | ROData classes (`{23,24,25,92,93,94}`): alloc reads delta offsets; fill is empty |
+| `var_cids` | variable-length classes (`{17,22,27,28,29,46,66,89,90}`): alloc reads `count` lengths |
+| `mint_cid`(60) / `code_cid`(18) / `class_cid`(5) / `instance_cid`(44) / `library_cid`(13) / `function_cid`(7) | special alloc sections |
+| `instance_min`(176) / `ffi_cids` | instance alloc (first reads the nfo/isize pair as svarints) |
+| `canonical_table_cids` | additionally read the canonical table when canonical=1 |
+| `typed_data_first/count/elem_widths/var_rem/view_rem` | TypedData classification: rem=(cid-first)%4 ∈ var_rem{0,2} → variable-length; view_rem{1,3} → view |
+| `string_cid`(92) / `one_byte_string_cid`(93) / `two_byte_string_cid`(94) | string decoding |
 
-## 2. Platform Profile（`profiles/platform/*.json`）
+## 2. Platform profile (`profiles/platform/*.json`)
 
-表 `(容器, 架构)`：`macho/elf/pe × arm64/x64/…`。字段（`PlatformProfile`）：
+Table of `(container, arch)`: `macho/elf/pe × arm64/x64/…`. Fields (`PlatformProfile`):
 
-| 字段 | 含义 |
+| field | meaning |
 |---|---|
-| `container.kind` | macho / elf / pe（决定解析器） |
-| `symbols` | 三个入口符号名（`_kDartVmSnapshotData` 等，跨平台同名） |
-| `registers` | IL/反汇编用角色寄存器（thr/pp/null/barrier/fp/sp/lr/code_reg…） |
-| `register_aliases` | op_str 重写别名表（x29→fp 等，对齐 blutter 输出风格） |
-| `non_field_base` | 不能作为对象字段基址的固定角色寄存器 |
-| `polymorphic_entry_offset_aot` | monomorphic 入口偏移（arm64 AOT = 24） |
-| `frida_heap_address_reg` | frida 模板 HeapAddressReg 重写值 |
-| `code_floor` | 函数地址最小文件偏移（entry_for 过滤）：去符号 exec 的回退场景会从指令表尾部泄漏落在容器头区域的假条目，Mach-O 设 4096，其余容器 0（缺省） |
-| `status` | verified / unverified（当前只有 macho-arm64 是 verified；pe-arm64 为 unverified 推演组合，无真机样本） |
+| `container.kind` | macho / elf / pe (selects the parser) |
+| `symbols` | the three entry symbol names (`_kDartVmSnapshotData` etc., same names across platforms) |
+| `registers` | role registers for IL/disassembly (thr/pp/null/barrier/fp/sp/lr/code_reg…) |
+| `register_aliases` | op_str rewrite alias table (x29→fp etc., matching blutter's output style) |
+| `non_field_base` | fixed-role registers that must never be used as an object-field base |
+| `polymorphic_entry_offset_aot` | monomorphic entry offset (arm64 AOT = 24) |
+| `frida_heap_address_reg` | HeapAddressReg rewrite value for the frida template |
+| `code_floor` | minimum file offset for function addresses (entry_for filter): the stripped-executable fallback path can leak bogus entries from the tail of the instruction table into container-header offsets; Mach-O uses 4096, other containers 0 (default) |
+| `status` | verified / unverified (currently only macho-arm64 is verified; pe-arm64 is an unverified structural combination, no real device sample) |
 
-## 3. fill DSL（`cluster_layouts[<cid>].steps`）
+## 3. fill DSL (`cluster_layouts[<cid>].steps`)
 
-步骤列表逐对象（`k = 0..count`）解释执行，捕获进 per-object ctx（键值表）与 collect 列表。
-`alloc` 阶段的产物按 `times:"lengths"` 引用。
+The step list is interpreted per object (`k = 0..count`); captured values go into the per-object ctx (a key/value table) and the collect lists. Allocation-phase products are referenced with `times:"lengths"`.
 
-### 原子读取
+### Atomic reads
 
-| op | 字段 | 语义 |
+| op | fields | semantics |
 |---|---|---|
-| `refs` | `n`、`aliases`(按序捕获名，null 跳过)、`collect`(n=1 时把值追加进列表名) | 读 n 个 ref-id |
-| `uvarint` | `alias` / `collect` / `transform:"shr4_and_mask"` | ReadUnsigned；transform 为 Type 的 `(flags>>4)&cid_tag_mask` |
-| `svarint` | `alias` / `collect` | Read\<T\> 有符号变长 |
-| `byte` | `alias` / `collect` | 1 字节 |
-| `skip_raw_elem_width` | — | 跳过 `lengths[k] * elem_width(cid)` 原始字节（TypedData） |
-| `skip_const` | `n` | 跳过 n 字节 |
+| `refs` | `n`, `aliases` (capture names in order, null skipped), `collect` (with n=1, append the value to the named list) | read n ref-ids |
+| `uvarint` | `alias` / `collect` / `transform:"shr4_and_mask"` | ReadUnsigned; transform = Type's `(flags>>4)&cid_tag_mask` |
+| `svarint` | `alias` / `collect` | signed variable-length Read\<T\> |
+| `byte` | `alias` / `collect` | 1 byte |
+| `skip_raw_elem_width` | — | skip `lengths[k] * elem_width(cid)` raw bytes (TypedData) |
+| `skip_const` | `n` | skip n bytes |
 
-### 结构
+### Structure
 
-| op | 字段 | 语义 |
+| op | fields | semantics |
 |---|---|---|
-| `loop` | `times` = `"lengths"`（alloc 长度）或常量；`steps` | 子循环 |
-| `cond` | `on`(已捕获字段)、`lt`/`ge` 数域、`then`；`set_default`(不命中时写入的默认捕获) | 条件执行（Class 的 top-level 判空 bitmap 用） |
-| `objectpool` | — | 特殊：length + 逐 entry bits 派遣（捕获 pp.txt 条目） |
-| `instance_fields` | — | 特殊：cluster 级 bitmap + nfo-1 个 slot（ref 或 word32x2） |
-| `code` | — | 特殊：payload_info（k\<nondef 才读）+ 6 refs |
-| `emit` | `store`、`fields`（记录字段名 → alias 名 / `{"builtin":"cid"|"ref"}`） | 产出记录 |
+| `loop` | `times` = `"lengths"` (alloc lengths) or a constant; `steps` | sub-loop |
+| `cond` | `on` (captured field), `lt`/`ge` numeric tests, `then`; `set_default` (defaults captured when not matched) | conditional execution (used for the Class top-level nullable bitmap) |
+| `objectpool` | — | special: length + per-entry bits dispatch (captures pp.txt entries) |
+| `instance_fields` | — | special: cluster-level bitmap + nfo-1 slots (ref or word32x2) |
+| `code` | — | special: payload_info (read only when k\<nondef) + 6 refs |
+| `emit` | `store`, `fields` (record field → alias name / `{"builtin":"cid"|"ref"}`) | emit a record |
 
-内置布局（无需在 JSON 声明）：string 类（cid==string_cid，按 rodata offsets 解码）、rodata/mint（fill 空）、
-instance 类（对应 `instance_fields` 步骤）、TypedData 与 View（原子 skip / 3 refs + 2 svarint）。
+Built-in layouts (no JSON declaration needed): string classes (cid==string_cid, decoded via rodata offsets), rodata/mint (empty fill), instance classes (handled by the `instance_fields` step), TypedData and View (atomic skip / 3 refs + 2 svarint).
 
-### emit store 表
+### emit store tables
 
-| store | 记录字段 | 产出 |
+| store | record fields | produced |
 |---|---|---|
-| `functions` | name_ref, owner_ref, code_index, kind_tag | 函数表 |
-| `classes` | name_ref, library_ref, class_id, super_type_ref, next_field_off, type_arg_off, field_bitmap | 类表 |
-| `libraries` | name_ref, url_ref | 库表 |
-| `patch_classes` | wrapped_class | PatchClass → 被包装类 |
-| `type_cids` | type_cid | Type 对象的 class id |
-| `map_data` | data_ref, used_ref（cid 自动取 cluster cid） | ConstMap/ConstSet |
-| `array_elements` | ta, elems（collect 列表） | Array/ImmutableArray |
+| `functions` | name_ref, owner_ref, code_index, kind_tag | function table |
+| `classes` | name_ref, library_ref, class_id, super_type_ref, next_field_off, type_arg_off, field_bitmap | class table |
+| `libraries` | name_ref, url_ref | library table |
+| `patch_classes` | wrapped_class | PatchClass → wrapped class |
+| `type_cids` | type_cid | class id of Type objects |
+| `map_data` | data_ref, used_ref (cid taken automatically from the cluster cid) | ConstMap/ConstSet |
+| `array_elements` | ta, elems (collect list) | Array/ImmutableArray |
 
-## 4. 容错与校验
+## 4. Fault tolerance and validation
 
-- alloc 结束后校验 `next_ref - 1 == num_objects`，不等则告警（对应参考实现 alloc mismatch）。
-- 某 cid 的流中出现 >60000 视为漂移，停止解析并告警。
-- fill 遇到无布局的 cid 直接报错并给出「往 cluster_layouts 里加」的提示（参考实现是静默中断，这里选择显式失败）。
-- 引擎对每条 emit 的未捕获字段报错（缺 `set_default` 的 cond 默认值是最常见原因）。
+- After alloc, `next_ref - 1 == num_objects` is checked; a mismatch raises a warning (corresponds to the reference implementation's alloc mismatch).
+- A cid > 60000 in the stream is treated as drift: parsing stops with a warning.
+- fill fails explicitly for a cid without a layout, suggesting to add one to `cluster_layouts` (the reference implementation aborts silently; we fail loudly instead).
+- The engine errors on any uncaptured field of an emitted record (a `cond` missing `set_default` is the most common cause).

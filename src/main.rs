@@ -305,7 +305,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  dart2native:    xxx.exe / xxx（直接使用）");
         println!();
         println!("语言: 跟随系统语系自动选择（中文语系输出中文，其余英文）；可用 DAE_LANG=zh|en 强制");
-        println!("Profile 文档: docs/PROFILES.md | profiles/");
+        println!("Profile 文档: docs/PROFILES.zh.md | profiles/");
         println!("版本列表: 内置 26 个 Dart 版本（1.24–3.14β），自动识别版本");
         println!("项目主页: https://github.com/ejfkdev/dae");
         println!();
