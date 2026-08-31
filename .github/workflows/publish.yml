@@ -1,0 +1,34 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # 凭据在 crates 环境里（CARGO_REGISTRY_TOKEN），手动触发时选择同一环境
+    environment: crates
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -o pipefail
+          ver="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])')"
+          echo "Package version: ${ver}"
+          code="$(curl -s -A 'dae-release-check' -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/dae-rs/${ver}")"
+          if [ "${code}" = "200" ]; then
+            echo "dae-rs ${ver} already exists on crates.io — skipping publish"
+          else
+            echo "Publishing dae-rs ${ver}..."
+            cargo publish
+          fi

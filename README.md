@@ -6,6 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/ejfkdev/dae)](https://github.com/ejfkdev/dae/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/dae-rs)](https://crates.io/crates/dae-rs)
 [![Release CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/release.yml?label=release%20build)](https://github.com/ejfkdev/dae/actions/workflows/release.yml)
+[![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=crates.io%20publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 
 > Config-driven Dart AOT snapshot debug-info exporter. Zero Dart SDK dependency, never runs the target binary: it locates the snapshot inside Mach-O / ELF / PE files and exports the same debug data as [blutter](https://github.com/worawit/blutter).
 

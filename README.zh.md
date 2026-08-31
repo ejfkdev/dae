@@ -6,6 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/ejfkdev/dae)](https://github.com/ejfkdev/dae/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/dae-rs)](https://crates.io/crates/dae-rs)
 [![Release CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/release.yml?label=release%20build)](https://github.com/ejfkdev/dae/actions/workflows/release.yml)
+[![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=crates.io%20publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 
 > 配置驱动的 Dart AOT 快照调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的调试数据。
 
