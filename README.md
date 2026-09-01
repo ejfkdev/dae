@@ -61,14 +61,15 @@ Example — compile a tiny Dart program and export it:
 ```bash
 $ dart compile exe demo.dart -o demo
 $ dae demo out
-SDK Profile: dart/3.13.0（version-hash match）
-导出完成 → out:
-  r2_script/addNames.r2     5 个函数名/地址
-  ida_script/addNames.py    1175 个函数命名 + Dart 结构头
-  blutter_frida.js          617 个 Classes 条目
-  asm/                      5 个函数反汇编 + IL
-  pp.txt                    1424 个对象池条目
-  objs.txt                  17 个用户类实例
+SDK profile: dart/3.13.0 (version-hash match)
+target: /path/to/demo (macho arm64)
+export done -> out:
+  r2_script/addNames.r2     5 named functions/addresses
+  ida_script/addNames.py    1175 named functions + Dart struct header
+  frida.js                  617 Classes entries
+  asm/                      5 disassembled functions + IL
+  pp.txt                    1424 object pool entries
+  objs.txt                  17 user class instances
 ```
 
 Import into IDA: `File → Script file…` and pick `ida_script/addNames.py` — function names, boundaries and the `DartThread` / `DartObjectPool` structs land in the current database (image-base rebasing is handled automatically). For radare2: `r2 -i r2_script/addNames.r2 <binary>`, then `to r2_dart_struct.h` to load the struct header.
@@ -80,7 +81,7 @@ Import into IDA: `File → Script file…` and pick `ida_script/addNames.py` —
 | `ida_script/addNames.py` | IDAPython script: function names + boundaries, Dart structs |
 | `r2_script/addNames.r2` | radare2 flag/comment script (libraries → classes → methods) |
 | `r2_script/r2_dart_struct.h` | Dart struct layouts (also `ida_script/ida_dart_struct.h` for IDA) |
-| `blutter_frida.js` | Frida template with the runtime Classes array |
+| `frida.js` | Frida template with the runtime Classes array |
 | `asm/` | capstone disassembly + blutter-style IL comments (arm64) |
 | `pp.txt` / `objs.txt` | object-pool entries / recursive user-class instance dump |
 
@@ -91,6 +92,8 @@ Import into IDA: `File → Script file…` and pick `ida_script/addNames.py` —
 1. Open the binary in IDA and let the initial auto-analysis finish.
 2. `File → Script file…` and select `ida_script/addNames.py` — function names and boundaries are applied to the current database, and the `DartThread` / `DartObjectPool` structs are parsed in (the script auto-rebases to the image base).
 3. Verify: jump to an address printed in the script (or any renamed function); the structs appear under `View → Open subviews → Structures`.
+
+The script also loads `ida_script/ida_dart_struct.h` — a static C header defining the Dart runtime layouts (`DartThread`, `DartObjectPool`, …) so Dart objects can be typed in IDA. The header is vendored from blutter; the MIT attribution in its file header is required by the license.
 
 ### radare2
 
@@ -103,10 +106,10 @@ f~method.                                     # browse the flags
 
 ### Frida
 
-`blutter_frida.js` is a **template**: replace the marked hook line/address with an entry point you want to hook (pick one from the named functions), then:
+`frida.js` is a **template**: replace the marked hook line/address with an entry point you want to hook (pick one from the named functions), then:
 
 ```bash
-frida -f <app> -l out/blutter_frida.js
+frida -f <app> -l out/frida.js
 ```
 
 The `Classes` array exposes per-class metadata (field bitmaps, sizes, argument offsets) for building hooks.

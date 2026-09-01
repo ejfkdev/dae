@@ -59,6 +59,8 @@ pub fn detect() -> Lang {
 pub struct Messages {
     pub lang: Lang,
     pub target_label: &'static str,
+    pub done_label: &'static str,
+    pub elapsed_label: &'static str,
     pub err_prefix: &'static str,
     pub warn_prefix: &'static str,
     pub err_sdk_arg: &'static str,
@@ -90,6 +92,8 @@ pub fn messages(lang: Lang) -> Messages {
     Messages {
         lang,
         target_label: p("目标", "target"),
+        done_label: p("完成 →", "done ->"),
+        elapsed_label: p("耗时", "elapsed"),
         err_prefix: p("错误", "error"),
         warn_prefix: p("警告", "warning"),
         err_sdk_arg: p("错误: --sdk-profile 缺少参数", "error: --sdk-profile requires an argument"),

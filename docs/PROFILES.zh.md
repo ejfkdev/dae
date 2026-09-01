@@ -25,7 +25,7 @@
 | `alloc` | 分配阶段分类（见 §1.2） |
 | `cluster_layouts` | 每 cid 的 fill 布局（fill DSL，见 §3） |
 | `runtime_offsets` | asm IL 用的对象布局偏移（thread_field_table_values / array_data_minus_tag 等） |
-| `frida_cid_constants` | `blutter_frida.js` 头部常量（值原样输出；ClassIdTagMask 用字符串 "0xfffff" 保持原型） |
+| `frida_cid_constants` | `frida.js` 头部常量（值原样输出；ClassIdTagMask 用字符串 "0xfffff" 保持原型） |
 | `frida_special_layouts` | frida Classes 数组特殊类条目（bool/int/String/List/Map/Closure/Object 的静态名+偏移；键序即输出序） |
 | `frida_int_typed_cids` | 带 lenOffset/dataOffset 的 8 个整数 TypedData cid |
 | `class_id_names` | cid → 预定义类名（稀疏 map，来自 class_id.h 枚举 + TypedData 展开名） |

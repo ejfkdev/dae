@@ -62,10 +62,11 @@ dae <binary> <out_dir> [--sdk-profile <profile.json>]
 $ dart compile exe demo.dart -o demo
 $ dae demo out
 SDK Profile: dart/3.13.0（版本指纹命中）
+目标: /path/to/demo (macho arm64)
 导出完成 → out:
   r2_script/addNames.r2     5 条函数名/地址
   ida_script/addNames.py    1175 个函数命名 + Dart 结构头
-  blutter_frida.js          617 个 Classes 条目
+  frida.js                  617 个 Classes 条目
   asm/                      5 个函数反汇编 + IL
   pp.txt                    1424 个对象池条目
   objs.txt                  17 个用户类实例
@@ -80,7 +81,7 @@ SDK Profile: dart/3.13.0（版本指纹命中）
 | `ida_script/addNames.py` | IDAPython 脚本：函数命名 + 边界 + Dart 结构 |
 | `r2_script/addNames.r2` | radare2 flag/注释脚本（库 → 类 → 方法三层） |
 | `r2_script/r2_dart_struct.h` | Dart 结构布局（IDA 侧另有 `ida_script/ida_dart_struct.h`） |
-| `blutter_frida.js` | Frida 模板 + 运行时 Classes 数组 |
+| `frida.js` | Frida 模板 + 运行时 Classes 数组 |
 | `asm/` | capstone 反汇编 + blutter 风格 IL 注释（arm64） |
 | `pp.txt` / `objs.txt` | 对象池条目 / 用户类实例递归 dump |
 
@@ -91,6 +92,8 @@ SDK Profile: dart/3.13.0（版本指纹命中）
 1. 在 IDA 中打开目标二进制，等待初始自动分析完成
 2. `File → Script file…` 选择 `ida_script/addNames.py`——函数命名与边界落入当前数据库，`DartThread`/`DartObjectPool` 结构自动解析入库（脚本自动按装载基址重定）
 3. 验证：跳转到脚本里打印的地址（或任意已命名函数）；结构在 `View → Open subviews → Structures` 中可见
+
+脚本同时载入 `ida_script/ida_dart_struct.h`——定义 Dart 运行时布局（`DartThread`、`DartObjectPool` 等）的静态 C 头，用于在 IDA 里给 Dart 对象套结构。该头文件派生自 blutter，文件内的 MIT 归因头是许可证要求，需保留。
 
 ### radare2
 
@@ -103,10 +106,10 @@ f~method.                                     # 浏览 flag
 
 ### Frida
 
-`blutter_frida.js` 是**模板**：把标记的 hook 行/地址换成你要挂钩的入口（从命名函数里挑一个），然后：
+`frida.js` 是**模板**：把标记的 hook 行/地址换成你要挂钩的入口（从命名函数里挑一个），然后：
 
 ```bash
-frida -f <app> -l out/blutter_frida.js
+frida -f <app> -l out/frida.js
 ```
 
 `Classes` 数组提供逐类元数据（字段位图、大小、参数偏移），可用于构造 hook。

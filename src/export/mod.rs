@@ -1,5 +1,5 @@
 //! 七类导出（与 blutter / 参考实现格式对齐）：
-//! r2_script/addNames.r2、ida_script/addNames.py、blutter_frida.js、asm/、pp.txt、objs.txt
+//! r2_script/addNames.r2、ida_script/addNames.py、frida.js、asm/、pp.txt、objs.txt
 //! （另附 r2/ida 共用的 Dart 结构头 r2_dart_struct.h / ida_dart_struct.h）。
 //!
 //! 与 Python 参考实现的三处有意修正（README 有说明）：

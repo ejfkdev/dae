@@ -139,7 +139,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                             Ok(v) => v,
                             Err(e) => {
                                 *err.lock().unwrap() =
-                                    Some(format!("capstone 反汇编失败: {e}"));
+                                    Some(format!("capstone disassembly failed: {e}"));
                                 return;
                             }
                         };
@@ -169,7 +169,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                     }
                     if let Err(e) = std::fs::write(&job.path, of) {
                         *err.lock().unwrap() =
-                            Some(format!("写 {} 失败: {e}", job.path.display()));
+                            Some(format!("failed to write {}: {e}", job.path.display()));
                         return;
                     }
                 }
@@ -182,7 +182,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
     }
     if std::env::var("DART_AOT_TIMINGS").is_ok() {
         eprintln!(
-            "[timing]   asm内: build={:?} 决策={:?} 并行(disasm+format+写)={:?} ({n_threads}线程)",
+            "[timing]   asm: build={:?} plan={:?} parallel(disasm+format+write)={:?} ({n_threads} threads)",
             acc_build, acc_plan, acc_parallel
         );
     }

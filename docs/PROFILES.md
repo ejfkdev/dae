@@ -20,7 +20,7 @@ Top-level fields (`SdkProfile`; serde definition in `src/profile/mod.rs`):
 | `alloc` | allocation-phase classification (see §1.2) |
 | `cluster_layouts` | fill layout per cid (fill DSL, see §3) |
 | `runtime_offsets` | object layout offsets used by asm IL (thread_field_table_values / array_data_minus_tag, etc.) |
-| `frida_cid_constants` | header constants for `blutter_frida.js` (values emitted verbatim; ClassIdTagMask kept as the string "0xfffff" to preserve the original form) |
+| `frida_cid_constants` | header constants for `frida.js` (values emitted verbatim; ClassIdTagMask kept as the string "0xfffff" to preserve the original form) |
 | `frida_special_layouts` | special class entries in the frida Classes array (static names + offsets for bool/int/String/List/Map/Closure/Object; key order = output order) |
 | `frida_int_typed_cids` | the 8 integer TypedData cids that carry lenOffset/dataOffset |
 | `class_id_names` | cid → predefined class name (sparse map, from the class_id.h enum + expanded TypedData names) |

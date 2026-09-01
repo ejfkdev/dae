@@ -255,7 +255,7 @@ fn run(
     println!("{} {}:", s.export_done, out);
     println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
     println!("  ida_script/addNames.py    {} {}", summary.ida_functions, s.sum_ida);
-    println!("  blutter_frida.js          {} {}", summary.frida_classes, s.sum_frida);
+    println!("  frida.js                  {} {}", summary.frida_classes, s.sum_frida);
     if summary.asm_enabled {
         println!("  asm/                      {} {}", summary.asm_functions, s.sum_asm);
     }
@@ -274,6 +274,13 @@ fn run(
         std::fs::write(&dump, csv).map_err(|e| format!("dump strings: {e}"))?;
         eprintln!("strings dumped to {dump}");
     }
+    println!(
+        "{} {} ({} {:.3}s)",
+        s.done_label,
+        out,
+        s.elapsed_label,
+        since.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -299,7 +306,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("输出:");
         println!("  ida_script/addNames.py  IDA 命名脚本（IDAPython + Dart 结构头）");
         println!("  r2_script/addNames.r2   radare2 命名脚本 + 结构头");
-        println!("  blutter_frida.js        Frida 运行时 Classes 数组模板");
+        println!("  frida.js                Frida 运行时 Classes 数组模板");
         println!("  asm/                    capstone 反汇编 + IL 注释（arm64）");
         println!("  pp.txt / objs.txt       对象池条目 / 用户类实例递归 dump");
         println!();
@@ -332,7 +339,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("outputs:");
         println!("  ida_script/addNames.py  IDA naming script (IDAPython + Dart struct header)");
         println!("  r2_script/addNames.r2   radare2 naming script + struct header");
-        println!("  blutter_frida.js        Frida runtime Classes array template");
+        println!("  frida.js                Frida runtime Classes array template");
         println!("  asm/                    capstone disassembly + IL comments (arm64)");
         println!("  pp.txt / objs.txt       object pool entries / recursive user class instance dump");
         println!();

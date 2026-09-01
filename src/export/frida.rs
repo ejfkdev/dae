@@ -1,4 +1,4 @@
-//! FridaWriter::Create —— blutter_frida.js：模板 + 常量 + Classes 数组。
+//! FridaWriter::Create —— frida.js：模板 + 常量 + Classes 数组。
 //! 与参考实现一致（对拍验证过 100% 逐条一致），外加按 Profile 重写模板顶部
 //! 三个运行时常量（参考实现漏写，见 export/mod.rs 头注）。
 
@@ -57,7 +57,7 @@ pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     }
     out.push_str("];\n");
 
-    let path = out_dir.join("blutter_frida.js");
-    std::fs::write(&path, out).map_err(|e| format!("写 blutter_frida.js 失败: {e}"))?;
+    let path = out_dir.join("frida.js");
+    std::fs::write(&path, out).map_err(|e| format!("写 frida.js 失败: {e}"))?;
     Ok((max_id.max(-1) + 1) as usize)
 }
