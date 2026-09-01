@@ -58,6 +58,7 @@ pub fn detect() -> Lang {
 /// main.rs / detect.rs 的用户可见文案（zh, en 成对，随启动时的语言探测定稿）
 pub struct Messages {
     pub lang: Lang,
+    pub target_label: &'static str,
     pub err_prefix: &'static str,
     pub warn_prefix: &'static str,
     pub err_sdk_arg: &'static str,
@@ -88,6 +89,7 @@ pub fn messages(lang: Lang) -> Messages {
     let p = |zh: &'static str, en: &'static str| lang.pick(zh, en);
     Messages {
         lang,
+        target_label: p("目标", "target"),
         err_prefix: p("错误", "error"),
         warn_prefix: p("警告", "warning"),
         err_sdk_arg: p("错误: --sdk-profile 缺少参数", "error: --sdk-profile requires an argument"),

@@ -206,6 +206,10 @@ fn run(
             s.warn_prefix, s.sdk_profile_label, sdk.abi, s.sdk_unverified
         );
     }
+    println!(
+        "{}: {} ({} {})",
+        s.target_label, bin_path, platform.container.kind, platform.arch
+    );
     let analyzer = Analyzer::new_located(&data, sdk, &platform, snap_offs, used_fallback)?;
     println!(
         "VM kinds={}  ISO kinds={} (kind={})",
@@ -276,83 +280,71 @@ fn run(
 fn print_help(s: &dae::locale::Messages) {
     if s.lang == dae::locale::Lang::Zh {
         // 中文语系
-        println!("dae — Dart AOT 快照调试信息静态导出工具");
+        println!("dae {} — Dart AOT 快照调试信息静态导出工具", env!("GIT_VERSION"));
+        println!("https://github.com/ejfkdev/dae");
         println!();
         println!("用法: dae <binary> <out_dir> [选项]");
         println!();
         println!("参数:");
-        println!("  <binary>              目标二进制文件（Mach-O/ELF/PE，含 Dart AOT 快照）");
-        println!("                         支持直接传入 .app 目录（自动查找 Flutter 二进制）");
+        println!("  <binary>              目标二进制（Mach-O/ELF/PE，含 Dart AOT 快照）");
+        println!("                         支持 .app / .framework 目录，自动定位内部二进制");
         println!("  <out_dir>             输出目录（自动创建）");
         println!();
         println!("选项:");
-        println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，自动识别 Dart 版本）");
-        println!("  --platform-profile PATH 平台 Profile JSON（默认: 按容器+架构自动选择）");
+        println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，按版本指纹自动识别）");
+        println!("  --platform-profile PATH 强制指定平台 Profile（默认: 按容器+架构自动选择）");
         println!("  -h, --help            显示此帮助");
         println!("  -V, --version         显示版本");
         println!();
-        println!("输出文件:");
-        println!("  r2_script/addNames.r2  radare2 函数命名脚本");
+        println!("输出:");
         println!("  ida_script/addNames.py  IDA 命名脚本（IDAPython + Dart 结构头）");
-        println!("  blutter_frida.js       Frida 运行时 Classes 数组");
-        println!("  asm/                   capstone 反汇编 + IL 注释（arm64）");
-        println!("  pp.txt                 对象池条目");
-        println!("  objs.txt               用户类实例递归 dump");
+        println!("  r2_script/addNames.r2   radare2 命名脚本 + 结构头");
+        println!("  blutter_frida.js        Frida 运行时 Classes 数组模板");
+        println!("  asm/                    capstone 反汇编 + IL 注释（arm64）");
+        println!("  pp.txt / objs.txt       对象池条目 / 用户类实例递归 dump");
         println!();
-        println!("智能路径解析:");
-        println!("  macOS Flutter:  xxx.app → App.framework/App");
-        println!("  iOS Flutter:    xxx.app → App（同结构）");
-        println!("  dart2native:    xxx.exe / xxx（直接使用）");
+        println!("路径解析: .app 目录自动定位内部二进制并打印实际路径");
+        println!("          （macOS/iOS Flutter: xxx.app → App.framework/App；dart2native: 直接使用）");
         println!();
-        println!("语言: 跟随系统语系自动选择（中文语系输出中文，其余英文）；可用 DAE_LANG=zh|en 强制");
-        println!("Profile 文档: docs/PROFILES.zh.md | profiles/");
-        println!("版本列表: 内置 26 个 Dart 版本（1.24–3.14β），自动识别版本");
-        println!("项目主页: https://github.com/ejfkdev/dae");
+        println!("内置 26 个 Dart 版本（1.24–3.14β），运行时自动识别；");
+        println!("配置规格见 docs/（PROFILES.md 英文 / PROFILES.zh.md 中文）。");
         println!();
         println!("示例:");
         println!("  dae App.app out/");
         println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
-        println!();
-        println!("使用产物: 见 README「使用导出产物」一节（IDA: File → Script file… 选择 ida_script/addNames.py）");
     } else {
-        println!("dae — static Dart AOT snapshot debug-info exporter");
+        println!("dae {} — static Dart AOT snapshot debug-info exporter", env!("GIT_VERSION"));
+        println!("https://github.com/ejfkdev/dae");
         println!();
         println!("usage: dae <binary> <out_dir> [options]");
         println!();
         println!("arguments:");
-        println!("  <binary>              target binary (Mach-O/ELF/PE with a Dart AOT snapshot)");
-        println!("                         accepts an .app directory directly (locates the Flutter binary)");
+        println!("  <binary>              target binary (Mach-O/ELF/PE with a Dart AOT snapshot);");
+        println!("                         accepts .app / .framework directories (locates the binary inside)");
         println!("  <out_dir>             output directory (created if missing)");
         println!();
         println!("options:");
-        println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected)");
-        println!("  --platform-profile PATH platform profile JSON (default: auto by container + arch)");
+        println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected by version fingerprint)");
+        println!("  --platform-profile PATH force a platform profile (default: auto by container + arch)");
         println!("  -h, --help            show this help");
         println!("  -V, --version         show version");
         println!();
         println!("outputs:");
-        println!("  r2_script/addNames.r2  radare2 naming script");
         println!("  ida_script/addNames.py  IDA naming script (IDAPython + Dart struct header)");
-        println!("  blutter_frida.js       Frida runtime Classes array");
-        println!("  asm/                   capstone disassembly + IL comments (arm64)");
-        println!("  pp.txt                 object pool entries");
-        println!("  objs.txt               recursive user class instance dump");
+        println!("  r2_script/addNames.r2   radare2 naming script + struct header");
+        println!("  blutter_frida.js        Frida runtime Classes array template");
+        println!("  asm/                    capstone disassembly + IL comments (arm64)");
+        println!("  pp.txt / objs.txt       object pool entries / recursive user class instance dump");
         println!();
-        println!("smart path resolution:");
-        println!("  macOS Flutter:  xxx.app -> App.framework/App");
-        println!("  iOS Flutter:    xxx.app -> App (same layout)");
-        println!("  dart2native:    xxx.exe / xxx (used directly)");
+        println!("path resolution: .app directories resolve to the inner binary, which is printed");
+        println!("                 (macOS/iOS Flutter: xxx.app -> App.framework/App; dart2native: used directly)");
         println!();
-        println!("language: follows the system locale (Chinese locales print Chinese, others English); override with DAE_LANG=zh|en");
-        println!("profile docs: docs/PROFILES.md | profiles/");
-        println!("versions: 26 embedded Dart versions (1.24-3.14beta), auto-detected");
-        println!("homepage: https://github.com/ejfkdev/dae");
+        println!("26 embedded Dart versions (1.24-3.14beta), detected at runtime;");
+        println!("config spec: docs/ (PROFILES.md English / PROFILES.zh.md Chinese).");
         println!();
         println!("examples:");
         println!("  dae App.app out/");
         println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
-        println!();
-        println!("using outputs: see README 'Using the outputs' (IDA: File -> Script file... then pick ida_script/addNames.py)");
     }
 }
 
