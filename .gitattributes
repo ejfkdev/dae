@@ -1,0 +1,2 @@
+# 派生自 blutter 的模板文件（vendored），不计入 GitHub 语言统计
+templates/ linguist-vendored
