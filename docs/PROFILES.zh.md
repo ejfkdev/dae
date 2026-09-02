@@ -3,6 +3,8 @@
 引擎（`src/engine/`）跨 Dart 版本/平台不变；一切随版本/平台变化的数据都在 `profiles/` 的 JSON 里。
 本文件是这两类配置的规范，也是「新增一个 Dart 版本/新平台时只改配置」的契约。
 
+结构布局是另一类、编译期嵌入的资产：`profiles/struct/*.h` 保存「版本 × 架构」的 `DartThread` 字段布局（编译 Dart VM 得到），经 `src/struct_tables.rs` 内嵌进二进制；`DartObjectPool` 结构则在导出时按目标动态生成。结构布局缺失时会优雅降级到通用 `DartThread`，不参与下面的 fill DSL 契约。
+
 ## 1. SDK Profile（`profiles/sdk/*.json`）
 
 标识为 `(Dart 版本, word_size, compressed_pointers)`。`profiles/sdk/` 内 26 个版本

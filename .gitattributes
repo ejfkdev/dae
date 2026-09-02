@@ -1,2 +1,4 @@
-# 派生自 blutter 的模板文件（vendored），不计入 GitHub 语言统计
+# blutter 派生模板 + Dart SDK 派生的配置表/结构头：内嵌数据，不计入 GitHub 语言统计
 templates/ linguist-vendored
+profiles/sdk/ linguist-vendored
+profiles/struct/ linguist-vendored

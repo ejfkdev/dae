@@ -80,7 +80,7 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     for part in parts.into_iter().flatten() {
         of.push_str(&part);
     }
-    let path = out_dir.join("pp.txt");
+    let path = out_dir.join("text").join("pp.txt");
     std::fs::write(&path, of).map_err(|e| format!("写 pp.txt 失败: {e}"))?;
     Ok(n)
 }
@@ -146,7 +146,7 @@ fn write_objs(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
         of.push_str(&part.0);
         count += part.1;
     }
-    let path = out_dir.join("objs.txt");
+    let path = out_dir.join("text").join("objs.txt");
     std::fs::write(&path, of).map_err(|e| format!("写 objs.txt 失败: {e}"))?;
     Ok(count)
 }

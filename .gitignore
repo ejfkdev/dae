@@ -12,3 +12,7 @@
 
 # macOS
 .DS_Store
+
+# 结构头生成器的参考字段表（含 clang 匿名 union 的本机绝对路径；仅本地参考，不入库，
+# 编译期内嵌只用到同目录下的 dart_struct-*.h）
+profiles/struct/*/dart_struct_fields-*.json

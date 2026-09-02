@@ -9,7 +9,6 @@
 
 use crate::analyzer::{Analyzer, LibGroups};
 use crate::engine::restore::scrub_name;
-use crate::export::R2_STRUCT_TEMPLATE;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -19,8 +18,9 @@ pub fn write(analyzer: &Analyzer, _libs: &LibGroups, out_dir: &Path) -> Result<u
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建 ida_script 目录失败: {e}"))?;
 
-    // 结构头：与 r2 同源（blutter 派生的 Dart 结构，MIT 归因见文件头部）
-    std::fs::write(dir.join("ida_dart_struct.h"), R2_STRUCT_TEMPLATE)
+    // 结构头：与 r2 同源（MIT 归因 + per-target DartThread/DartObjectPool）
+    let hdr = crate::export::struct_hdr::build(analyzer);
+    std::fs::write(dir.join("ida_dart_struct.h"), hdr)
         .map_err(|e| format!("写 ida_dart_struct.h 失败: {e}"))?;
 
     // 数据行：(offset, size, name)；与 addNames.r2 同口径，仅保留 code 表可达的函数

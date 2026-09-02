@@ -6,7 +6,6 @@
 //!   （旧版/新版通用，实测可写可读回）；
 //! - 结构头导入命令是 `to r2_dart_struct.h`（r2 6 实测）。
 
-use super::find_template;
 use crate::analyzer::{Analyzer, LibGroups};
 use crate::engine::restore::scrub_name;
 use std::path::Path;
@@ -109,17 +108,12 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
             }
         }
     }
-    // 复用 blutter 的静态 struct 头（Dart SDK 固定布局，非快照衍生）。
-    // 磁盘模板优先（开发时临时改版）；找不到时用内嵌副本兜底，
-    // 保证单文件发布二进制（Releases/brew）也能产出 r2_dart_struct.h。
-    match find_template("r2_dart_struct.h") {
-        Some(src) => {
-            let _ = std::fs::copy(src, dir.join("r2_dart_struct.h"));
-        }
-        None => {
-            let _ = std::fs::write(dir.join("r2_dart_struct.h"), crate::export::R2_STRUCT_TEMPLATE);
-        }
-    }
+    // 结构头：与 ida 同源（MIT 归因 + per-target DartThread/DartObjectPool），
+    // 单文件发布二进制（Releases/brew）也能产出 r2_dart_struct.h。
+    let _ = std::fs::write(
+        dir.join("r2_dart_struct.h"),
+        crate::export::struct_hdr::build(analyzer),
+    );
     std::fs::write(&path, of).map_err(|e| format!("写 addNames.r2 失败: {e}"))?;
     Ok(count)
 }

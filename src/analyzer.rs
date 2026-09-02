@@ -438,10 +438,13 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// library → class → function 分组（跳过 dart: 内部库，与 blutter 对齐）。
+    /// library → class → function 分组。
+    /// include_dart_libs=false 时跳过 dart: SDK 内部库（blutter 默认口径，用于 asm 等
+    /// 聚焦应用代码的产物）；true 时全量纳入（用于 r2/IDA 命名，避免 SDK 内部函数
+    /// 在反编译工具里只剩混淆名/默认名）。
     /// 保持 Python dict 插入序语义：lib 与 cls 按函数 ref 升序的首现顺序，
     /// 类内函数按 ref 升序。
-    pub fn build_functions(&self) -> LibGroups {
+    pub fn build_functions(&self, include_dart_libs: bool) -> LibGroups {
         struct Lib {
             classes: Vec<(String, Vec<FuncEntry>)>,
             index: std::collections::HashMap<String, usize>,
@@ -459,8 +462,8 @@ impl<'a> Analyzer<'a> {
                 .and_then(|o| self.lib_of(o.library_ref))
                 .and_then(|(_, url_ref)| self.sref_str(url_ref))
                 .unwrap_or("");
-            if raw_url.starts_with("dart:") {
-                continue; // blutter 默认跳过 SDK 内部库
+            if !include_dart_libs && raw_url.starts_with("dart:") {
+                continue; // 默认跳过 SDK 内部库（供 asm 等聚焦产物使用）
             }
             let lib = if raw_url.is_empty() {
                 String::new()

@@ -211,56 +211,70 @@ fn run(
         s.target_label, bin_path, platform.container.kind, platform.arch
     );
     let analyzer = Analyzer::new_located(&data, sdk, &platform, snap_offs, used_fallback)?;
-    println!(
-        "VM kinds={}  ISO kinds={} (kind={})",
-        analyzer.vm.kind,
-        analyzer.iso.kind,
-        if analyzer.iso.kind == sdk.full_aot_kind { "FullAOT" } else { "?" }
-    );
-    println!(
-        "VM: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
-        analyzer.vm.hdr.get("num_base_objects"),
-        analyzer.vm.hdr.get("num_objects"),
-        analyzer.vm.hdr.get("num_clusters"),
-        analyzer.vm.hdr.get("instructions_table_len"),
-        analyzer.vm.hdr.get("instructions_table_rodata_offset"),
-    );
-    println!(
-        "ISO: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
-        analyzer.iso.hdr.get("num_base_objects"),
-        analyzer.iso.hdr.get("num_objects"),
-        analyzer.iso.hdr.get("num_clusters"),
-        analyzer.iso.hdr.get("instructions_table_len"),
-        analyzer.iso.hdr.get("instructions_table_rodata_offset"),
-    );
-    println!(
-        "strings vm={} iso={} classes vm={} iso={} libs vm={} iso={} funcs vm={} iso={}",
-        analyzer.vm.strings.len(),
-        analyzer.iso.strings.len(),
-        analyzer.vm.classes.len(),
-        analyzer.iso.classes.len(),
-        analyzer.vm.libraries.len(),
-        analyzer.iso.libraries.len(),
-        analyzer.vm.functions.len(),
-        analyzer.iso.functions.len(),
-    );
-    println!(
-        "InstructionsTable: first_entry_with_code={} n_entries={} instr_base(file-offset)={:#x}",
-        analyzer.first_entry,
-        analyzer.pc_offsets.len(),
-        analyzer.instr_base
-    );
+    // 内部诊断（快照头/对象计数/指令表）：默认不刷屏，仅调试与回归时 DART_AOT_VERBOSE=1 展示
+    if std::env::var("DART_AOT_VERBOSE").is_ok() {
+        println!(
+            "VM kinds={}  ISO kinds={} (kind={})",
+            analyzer.vm.kind,
+            analyzer.iso.kind,
+            if analyzer.iso.kind == sdk.full_aot_kind { "FullAOT" } else { "?" }
+        );
+        println!(
+            "VM: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
+            analyzer.vm.hdr.get("num_base_objects"),
+            analyzer.vm.hdr.get("num_objects"),
+            analyzer.vm.hdr.get("num_clusters"),
+            analyzer.vm.hdr.get("instructions_table_len"),
+            analyzer.vm.hdr.get("instructions_table_rodata_offset"),
+        );
+        println!(
+            "ISO: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
+            analyzer.iso.hdr.get("num_base_objects"),
+            analyzer.iso.hdr.get("num_objects"),
+            analyzer.iso.hdr.get("num_clusters"),
+            analyzer.iso.hdr.get("instructions_table_len"),
+            analyzer.iso.hdr.get("instructions_table_rodata_offset"),
+        );
+        println!(
+            "strings vm={} iso={} classes vm={} iso={} libs vm={} iso={} funcs vm={} iso={}",
+            analyzer.vm.strings.len(),
+            analyzer.iso.strings.len(),
+            analyzer.vm.classes.len(),
+            analyzer.iso.classes.len(),
+            analyzer.vm.libraries.len(),
+            analyzer.iso.libraries.len(),
+            analyzer.vm.functions.len(),
+            analyzer.iso.functions.len(),
+        );
+        println!(
+            "InstructionsTable: first_entry_with_code={} n_entries={} instr_base(file-offset)={:#x}",
+            analyzer.first_entry,
+            analyzer.pc_offsets.len(),
+            analyzer.instr_base
+        );
+    }
 
-    let summary = export::run(&analyzer, std::path::Path::new(out))?;
-    println!("{} {}:", s.export_done, out);
+    // 输出目录的绝对路径（不解析软链、不要求已存在，仅把相对路径接到 cwd 上），
+    // 便于调用方/脚本直接复制取用最终产物位置。
+    let out_abs = std::path::absolute(out)
+        .map_err(|e| format!("解析输出目录绝对路径 {out}: {e}"))?;
+    let out_display = out_abs.display().to_string();
+    let summary = export::run(&analyzer, &out_abs)?;
+    println!("{} {}:", s.export_done, out_display);
     println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
     println!("  ida_script/addNames.py    {} {}", summary.ida_functions, s.sum_ida);
     println!("  frida.js                  {} {}", summary.frida_classes, s.sum_frida);
     if summary.asm_enabled {
         println!("  asm/                      {} {}", summary.asm_functions, s.sum_asm);
     }
-    println!("  pp.txt                    {} {}", summary.pp_entries, s.sum_pp);
-    println!("  objs.txt                  {} {}", summary.objs_instances, s.sum_objs);
+    println!("  text/pp.txt               {} {}", summary.pp_entries, s.sum_pp);
+    println!("  text/objs.txt             {} {}", summary.objs_instances, s.sum_objs);
+    println!("  text/strings.txt          {} {}", summary.textinfo.strings, s.sum_strings);
+    println!("  text/libs.txt             {} {}", summary.textinfo.libs, s.sum_libs);
+    println!("  text/classes.txt          {} {}", summary.textinfo.classes, s.sum_classes);
+    println!("  text/functions.txt        {} {}", summary.textinfo.functions, s.sum_funcs);
+    println!("  text/arrays.txt           {} {}", summary.textinfo.arrays, s.sum_arrays);
+    println!("  text/maps.txt             {} {}", summary.textinfo.maps, s.sum_maps);
 
     for w in &analyzer.warnings {
         eprintln!("{}: {w}", s.warn_prefix);
@@ -275,9 +289,8 @@ fn run(
         eprintln!("strings dumped to {dump}");
     }
     println!(
-        "{} {} ({} {:.3}s)",
+        "{} ({} {:.3}s)",
         s.done_label,
-        out,
         s.elapsed_label,
         since.elapsed().as_secs_f64()
     );
@@ -287,7 +300,7 @@ fn run(
 fn print_help(s: &dae::locale::Messages) {
     if s.lang == dae::locale::Lang::Zh {
         // 中文语系
-        println!("dae {} — Dart AOT 快照调试信息静态导出工具", env!("GIT_VERSION"));
+        println!("dae {} — Dart AOT 快照调试信息静态导出工具（支持 Dart 2.7–3.14β；Mach-O/ELF/PE，x64/arm64）", env!("GIT_VERSION"));
         println!("https://github.com/ejfkdev/dae");
         println!();
         println!("用法: dae <binary> <out_dir> [选项]");
@@ -304,23 +317,18 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  -V, --version         显示版本");
         println!();
         println!("输出:");
-        println!("  ida_script/addNames.py  IDA 命名脚本（IDAPython + Dart 结构头）");
-        println!("  r2_script/addNames.r2   radare2 命名脚本 + 结构头");
-        println!("  frida.js                Frida 运行时 Classes 数组模板");
-        println!("  asm/                    capstone 反汇编 + IL 注释（arm64）");
-        println!("  pp.txt / objs.txt       对象池条目 / 用户类实例递归 dump");
-        println!();
-        println!("路径解析: .app 目录自动定位内部二进制并打印实际路径");
-        println!("          （macOS/iOS Flutter: xxx.app → App.framework/App；dart2native: 直接使用）");
-        println!();
-        println!("内置 26 个 Dart 版本（1.24–3.14β），运行时自动识别；");
-        println!("配置规格见 docs/（PROFILES.md 英文 / PROFILES.zh.md 中文）。");
+        println!("  ida_script/    IDA 命名脚本 + 结构头（addNames.py / ida_dart_struct.h）");
+        println!("  r2_script/     radare2 命名脚本 + 结构头（addNames.r2 / r2_dart_struct.h）");
+        println!("  frida.js       Frida 运行时 Classes 数组模板");
+        println!("  asm/           capstone 反汇编 + IL 注释（arm64）");
+        println!("  text/          pp · objs · strings · libs · classes · functions ·");
+        println!("                 arrays · maps（各类文本 dump）");
         println!();
         println!("示例:");
         println!("  dae App.app out/");
         println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
     } else {
-        println!("dae {} — static Dart AOT snapshot debug-info exporter", env!("GIT_VERSION"));
+        println!("dae {} — static Dart AOT snapshot debug-info exporter (Dart 2.7–3.14β; Mach-O/ELF/PE, x64/arm64)", env!("GIT_VERSION"));
         println!("https://github.com/ejfkdev/dae");
         println!();
         println!("usage: dae <binary> <out_dir> [options]");
@@ -337,17 +345,12 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  -V, --version         show version");
         println!();
         println!("outputs:");
-        println!("  ida_script/addNames.py  IDA naming script (IDAPython + Dart struct header)");
-        println!("  r2_script/addNames.r2   radare2 naming script + struct header");
-        println!("  frida.js                Frida runtime Classes array template");
-        println!("  asm/                    capstone disassembly + IL comments (arm64)");
-        println!("  pp.txt / objs.txt       object pool entries / recursive user class instance dump");
-        println!();
-        println!("path resolution: .app directories resolve to the inner binary, which is printed");
-        println!("                 (macOS/iOS Flutter: xxx.app -> App.framework/App; dart2native: used directly)");
-        println!();
-        println!("26 embedded Dart versions (1.24-3.14beta), detected at runtime;");
-        println!("config spec: docs/ (PROFILES.md English / PROFILES.zh.md Chinese).");
+        println!("  ida_script/    IDA naming script + struct header (addNames.py / ida_dart_struct.h)");
+        println!("  r2_script/     radare2 naming script + struct header (addNames.r2 / r2_dart_struct.h)");
+        println!("  frida.js       Frida runtime Classes array template");
+        println!("  asm/           capstone disassembly + IL comments (arm64)");
+        println!("  text/          pp, objs, strings, libs, classes, functions,");
+        println!("                 arrays, maps (all text dumps)");
         println!();
         println!("examples:");
         println!("  dae App.app out/");

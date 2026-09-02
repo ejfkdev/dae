@@ -85,6 +85,12 @@ pub struct Messages {
     pub sum_asm: &'static str,
     pub sum_pp: &'static str,
     pub sum_objs: &'static str,
+    pub sum_strings: &'static str,
+    pub sum_libs: &'static str,
+    pub sum_classes: &'static str,
+    pub sum_funcs: &'static str,
+    pub sum_arrays: &'static str,
+    pub sum_maps: &'static str,
 }
 
 pub fn messages(lang: Lang) -> Messages {
@@ -92,7 +98,7 @@ pub fn messages(lang: Lang) -> Messages {
     Messages {
         lang,
         target_label: p("目标", "target"),
-        done_label: p("完成 →", "done ->"),
+        done_label: p("完成", "done"),
         elapsed_label: p("耗时", "elapsed"),
         err_prefix: p("错误", "error"),
         warn_prefix: p("警告", "warning"),
@@ -136,6 +142,12 @@ pub fn messages(lang: Lang) -> Messages {
         sum_asm: p("个函数反汇编 + IL", "disassembled functions + IL"),
         sum_pp: p("个对象池条目", "object pool entries"),
         sum_objs: p("个用户类实例", "user class instances"),
+        sum_strings: p("条字符串", "strings"),
+        sum_libs: p("个库", "libraries"),
+        sum_classes: p("个类", "classes"),
+        sum_funcs: p("个函数", "functions"),
+        sum_arrays: p("个数组", "arrays"),
+        sum_maps: p("个映射", "maps"),
     }
 }
 
