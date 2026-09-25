@@ -12,8 +12,13 @@ use dae::analyzer::Analyzer;
 use dae::profile::{parse_platform, parse_sdk, PlatformProfile, SdkProfile};
 use std::path::Path;
 
-/// 结构化率下限（当前 T4_blank 实测约 0.61，直线函数也算结构化）
-const STRUCTURED_FLOOR: f64 = 0.50;
+/// 结构化率下限（直线函数也算结构化）。
+///
+/// 这个数字随 lift 覆盖面变化，**不是越高越好**：lift 认不出的分支（曾经的 cbz/tbz/csel）
+/// 会退化成 `Other`，块里就没有分支，函数看起来"直线所以结构化"，但产物是**缺了分支的**。
+/// 目前 lift 已覆盖条件跳转的全部常见形态，所以这个比率是诚实的：x64 样本约 0.54、
+/// arm64 样本约 0.50（覆盖前虚高到 0.62，那是丢了分支换来的）。
+const STRUCTURED_FLOOR: f64 = 0.45;
 
 #[cfg(feature = "asm")]
 #[test]

@@ -61,6 +61,8 @@ enum Op {
     /// cond = None 表示无条件跳转
     Branch { cond: Option<String>, target: u64 },
     Return { value: Option<String> },
+    /// 写内存：`mem(target) = value`
+    Store { target: String, value: String },
     /// 认不出来的指令：原文保留
     Other(String),
 }
@@ -90,13 +92,14 @@ fn lift(cs: &Capstone, analyzer: &Analyzer, code: &[u8], base: u64, is_arm64: bo
         let ops = mask_regs(&rl, ins.op_str().unwrap_or(""));
         let addr = ins.address();
         let _ = writeln!(raw, "  {addr:#x}: {mnem} {ops}");
-        if mnem == "cmp" || mnem == "test" {
+        if matches!(mnem.as_str(), "cmp" | "cmn" | "tst" | "test") {
             let mut it = ops.split(',');
             let a = it.next().unwrap_or("").trim().to_string();
             let b = it.next().unwrap_or("").trim().to_string();
-            let b = if mnem == "test" && b == a { "0".to_string() } else { b };
+            // test/tst 的两个操作数相同 ⇒ 与 0 比较（x86 `test al,al`、arm64 `tst x,x`）
+            let b = if matches!(mnem.as_str(), "test" | "tst") && b == a { "0".to_string() } else { b };
             last_cmp = Some((a, b));
-            out.push(Stmt { addr, op: Op::Other(format!("{mnem} {ops}")) });
+            // 比较本身不单独出行：紧随的条件分支已经把它表达成 `if (a op b)`
             continue;
         }
         let s = match lift_one(&rl, is_arm64, &mnem, &ops, addr) {
@@ -333,6 +336,139 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         return Op::Assign {
             dst: reg_name(&first),
             src: Expr::Mem(rest.clone()),
+        };
+    }
+    // ---- 比较：喂给紧随的条件跳转（arm64 是 cmp/cmn/tst；x64 是 cmp/test）----
+    if matches!(mnem, "cmp" | "cmn" | "tst" | "test") {
+        return Op::Other(format!("{mnem} {ops}").trim().to_string());
+    }
+    // ---- 条件跳转：零比较与位测试自带条件，不必依赖上一条 ----
+    if mnem == "cbz" || mnem == "cbnz" {
+        let (a, target) = (first.clone(), ops.split_once(',').map(|x| x.1).unwrap_or(""));
+        let op = if mnem == "cbz" { "==" } else { "!=" };
+        return Op::Branch {
+            cond: Some(format!("{} {op} 0", a)),
+            target: parse_addr(target).unwrap_or(0),
+        };
+    }
+    if mnem == "tbz" || mnem == "tbnz" {
+        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 3 {
+            let op = if mnem == "tbz" { "==" } else { "!=" };
+            return Op::Branch {
+                cond: Some(format!("{} & (1 << {}) {op} 0", parts[0], parts[1])),
+                target: parse_addr(parts[2]).unwrap_or(0),
+            };
+        }
+    }
+    // ---- 算术/逻辑：渲染成二元表达式（可读性主要来自这里）----
+    let binop = match mnem {
+        "add" | "adds" => Some("+"),
+        "sub" | "subs" => Some("-"),
+        "and" | "ands" => Some("&"),
+        "orr" | "or" => Some("|"),
+        "eor" | "xor" => Some("^"),
+        "lsl" | "shl" => Some("<<"),
+        "lsr" | "shr" => Some(">>"),
+        "asr" | "sar" => Some(">>"),
+        "mul" | "imul" => Some("*"),
+        "sdiv" | "udiv" => Some("/"),
+        _ => None,
+    };
+    if let Some(op) = binop {
+        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 3 && is_reg(parts[0]) {
+            let idx = if is_reg(parts[1]) { 2 } else { 1 };
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("{} {op} {}", parts[idx - 1], parts[idx])),
+            };
+        }
+        if parts.len() == 2 && is_reg(parts[0]) && is_reg(parts[1]) {
+            // `add x0, x1` 这种两操作数形式：等于 x0 += x1
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("{} {op} {}", reg_name(parts[0]), parts[1])),
+            };
+        }
+    }
+    // ---- 位域提取 ubfx dst, src, lsb, width → (src >> lsb) & ((1<<width)-1) ----
+    if mnem == "ubfx" || mnem == "sbfx" {
+        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        if parts.len() == 4 && is_reg(parts[0]) {
+            if let (Some(lsb), Some(w)) = (parse_imm_i(parts[2]), parse_imm_i(parts[3])) {
+                let mask = (1i64 << w) - 1;
+                return Op::Assign {
+                    dst: reg_name(parts[0]),
+                    src: Expr::Text(format!("({} >> {lsb}) & {mask:#x}", parts[1])),
+                };
+            }
+        }
+    }
+    // ---- 条件选择 csel dst, a, b, cond → cond ? a : b ----
+    if mnem == "csel" || mnem == "csinc" {
+        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        if parts.len() == 4 && is_reg(parts[0]) {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("({}) ? {} : {}", parts[3], parts[1], parts[2])),
+            };
+        }
+    }
+    // ---- movk dst, #imm, lsl #16 → 拼接高位 ----
+    if mnem == "movk" {
+        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 2 && is_reg(parts[0]) {
+            if let Some(v) = parse_imm_i(parts[1]) {
+                return Op::Assign {
+                    dst: reg_name(parts[0]),
+                    src: Expr::Text(format!("({} & 0xffff) | {:#x}", reg_name(parts[0]), v << 16)),
+                };
+            }
+        }
+    }
+    // ---- 浮点：与整数同一套二元渲染 ----
+    let fbin = match mnem {
+        "fadd" => Some("+"),
+        "fsub" => Some("-"),
+        "fmul" => Some("*"),
+        "fdiv" => Some("/"),
+        _ => None,
+    };
+    if let Some(op) = fbin {
+        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 3 && is_reg(parts[0]) {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("{} {op} {} (float)", parts[1], parts[2])),
+            };
+        }
+    }
+    if mnem == "brk" {
+        let n = parse_imm_i(ops).unwrap_or(0);
+        return Op::Other(format!("abort({n})"));
+    }
+    // ---- 负号/取反 ----
+    if mnem == "neg" || mnem == "mvn" {
+        if is_reg(&first) && is_reg(&rest) {
+            return Op::Assign {
+                dst: reg_name(&first),
+                src: Expr::Text(format!("-{}", reg_name(&rest))),
+            };
+        }
+    }
+    // ---- 写内存：arm64 str*/stur*，x64 mov [..], reg ----
+    if (mnem.starts_with("str") || mnem.starts_with("stur")) && is_arm64 {
+        return Op::Store {
+            target: rest.clone(),
+            value: reg_name(&first),
+        };
+    }
+    if mnem.starts_with("mov") && !is_arm64 && first.contains('[') {
+        let v = rest.trim().to_string();
+        return Op::Store {
+            target: first.clone(),
+            value: v,
         };
     }
     let _ = addr;
@@ -1026,6 +1162,9 @@ fn render_op(op: &Op, addr: u64) -> Option<String> {
                 None => format!("{call}; // {addr:#x}"),
             })
         }
+        Op::Store { target, value } => {
+            Some(format!("mem({}) = {value}; // {addr:#x}", target.trim()))
+        }
         Op::Branch { .. } | Op::Return { .. } => None,
         Op::Other(t) => Some(format!("// unmapped: {t} // {addr:#x}")),
     }
@@ -1082,7 +1221,8 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                 let depth = pending.get(dst).map(|(_, d, _)| *d).unwrap_or(0) + 1;
                 pending.insert(dst.clone(), (text, depth, st.addr));
             }
-            Op::Call { .. } => {
+            Op::Call { .. } | Op::Store { .. } => {
+                // 调用会改寄存器、写内存会改内存：都先落地，折叠不跨越它们
                 flush(&mut pending, &mut out, st.addr);
                 out.push(st.clone());
             }
