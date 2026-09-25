@@ -340,6 +340,11 @@ fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
             .build()
     }
     .map_err(|e| format!("capstone 初始化失败: {e}"))
+    .and_then(|mut c| {
+        c.set_skipdata(true)
+            .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
+        Ok(c)
+    })
 }
 
 /// 从 stub 序言解出「被分配的类」→ 名字。

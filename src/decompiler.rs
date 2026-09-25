@@ -162,7 +162,16 @@ fn mask_regs(rl: &Roles, ops: &str) -> String {
     }
     pairs.clear();
     let _ = pairs;
-    for (k, v) in [("rbp", "FP"), ("rsp", "SP"), ("esp", "SP"), ("ebp", "FP")] {
+    for (k, v) in [
+        ("rbp", "FP"),
+        ("rsp", "SP"),
+        ("esp", "SP"),
+        ("ebp", "FP"),
+        // arm64 的小写助记名（capstone arm64 出 `sp`/`fp`/`lr`）
+        ("sp", "SP"),
+        ("fp", "FP"),
+        ("lr", "LR"),
+    ] {
         s = replace_word(&s, k, v);
     }
     s
@@ -247,7 +256,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // 调用
     if mnem == "bl" || mnem == "call" || mnem == "callq" {
-        let t = parse_imm(ops);
+        let t = parse_addr(ops);
         return Op::Call {
             dst: None,
             target: t,
@@ -263,7 +272,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // 条件/无条件跳转
     if mnem == "b" || mnem == "jmp" {
-        if let Some(t) = parse_imm(ops) {
+        if let Some(t) = parse_addr(ops) {
             return Op::Branch { cond: None, target: t };
         }
         return Op::Branch {
@@ -272,7 +281,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         };
     }
     if mnem.starts_with("b.") || (mnem.starts_with('j') && mnem != "jmp") {
-        let t = parse_imm(ops).unwrap_or(0);
+        let t = parse_addr(ops).unwrap_or(0);
         // 条件来源：arm64 看上一条 cmp；x86 看标志位——这里只如实记 mnemonic
         return Op::Branch {
             cond: Some(mnem.to_string()),
@@ -306,7 +315,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             };
         }
         if is_reg(&first) {
-            if let Some(v) = parse_imm(&rest) {
+            if let Some(v) = parse_imm_i(&rest) {
                 return Op::Assign {
                     dst: reg_name(&first),
                     src: Expr::Imm(v as i64),
@@ -330,7 +339,31 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     Op::Other(format!("{mnem} {ops}").trim().to_string())
 }
 
-fn parse_imm(ops: &str) -> Option<u64> {
+/// 立即数（`#1` / `#-0x10` / `0x20` / 十进制都认）。**只解析，不猜类型。**
+fn parse_imm_i(ops: &str) -> Option<i64> {
+    let s = ops.trim().trim_start_matches('#').trim();
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r.trim()),
+        None => (false, s),
+    };
+    let v: i64 = if let Some(h) = s.strip_prefix("0x") {
+        let h: String = h.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        if h.is_empty() {
+            return None;
+        }
+        u64::from_str_radix(&h, 16).ok()? as i64
+    } else {
+        let d: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if d.is_empty() {
+            return None;
+        }
+        d.parse::<i64>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// 分支/调用目标地址（无符号十六进制）
+fn parse_addr(ops: &str) -> Option<u64> {
     let s = ops.trim().trim_start_matches('#');
     let h = s.strip_prefix("0x")?;
     let h: String = h.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
@@ -462,18 +495,12 @@ fn emit_function(
     out.push_str("}\n");
 }
 
-// ---------------------------------------------------------------- entry
 
-pub fn write(
-    analyzer: &Analyzer,
-    libs: &LibGroups,
-    out_dir: &Path,
-) -> Result<DecompileStats, String> {
-    let dir = out_dir.join("dart");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 dart 目录失败: {e}"))?;
-    let is_arm64 = analyzer.platform.arch == "arm64";
-    let rl = roles(analyzer);
-    let cs = if is_arm64 {
+/// 建 capstone 实例。**开 skipdata**：遇到非指令字节（函数入口前的 0 填充、对齐
+/// padding）不中断整段反汇编，而是还原成 `.byte ..` 继续走——否则一个坏字节会让
+/// 整个函数从产物里消失（实测 `dart compile exe` 的部分函数入口前就带 16 字节 0）。
+fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
+    let c = if is_arm64 {
         Capstone::new()
             .arm64()
             .mode(arch::arm64::ArchMode::Arm)
@@ -488,6 +515,24 @@ pub fn write(
             .build()
     }
     .map_err(|e| format!("capstone 初始化失败: {e}"))?;
+    let mut c = c;
+    c.set_skipdata(true)
+        .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
+    Ok(c)
+}
+
+// ---------------------------------------------------------------- entry
+
+pub fn write(
+    analyzer: &Analyzer,
+    libs: &LibGroups,
+    out_dir: &Path,
+) -> Result<DecompileStats, String> {
+    let dir = out_dir.join("dart");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 dart 目录失败: {e}"))?;
+    let is_arm64 = analyzer.platform.arch == "arm64";
+    let rl = roles(analyzer);
+    let cs = build_cs(is_arm64)?;
 
     let mut stats = DecompileStats {
         funcs: 0,
@@ -527,7 +572,11 @@ pub fn write(
         let _ = writeln!(of, "// library: {lib_name}");
         let _ = writeln!(
             of,
-            "// block labels and `goto` stand in for control flow that this stage does not restructure yet."
+            "// control flow is structured (if/else + loops) where possible; functions that keep a"
+        );
+        let _ = writeln!(
+            of,
+            "// `goto` carry a NOTE header, since Dart has no goto."
         );
         let mut cnt = 0usize;
         for (_cls, funcs) in cls_map {
@@ -537,6 +586,12 @@ pub fn write(
                 }
                 let csize = analyzer.code_size(f.idx);
                 if csize == 0 || f.idx >= analyzer.pc_offsets.len() {
+                    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+                        eprintln!(
+                            "[dbg-dec] skip ep={:#x} cls={:?} m={} idx={} csize={}",
+                            f.ep, _cls, f.mangled, f.idx, csize
+                        );
+                    }
                     continue;
                 }
                 let payload = analyzer.instr_base + analyzer.pc_offsets[f.idx];
@@ -547,6 +602,9 @@ pub fn write(
                 let code = &analyzer.data[foff as usize..(foff + csize) as usize];
                 let (stmts, raw) = lift(&cs, analyzer, code, payload, is_arm64);
                 if stmts.is_empty() {
+                    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+                        eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} payload={payload:#x} csize={csize}", f.mangled, f.ep);
+                    }
                     continue;
                 }
                 let blocks = build_blocks(stmts);
@@ -555,6 +613,9 @@ pub fn write(
                 let name = format!("{}_{}", _cls.replace(['.', ':'], "_"), f.mangled)
                     .trim_start_matches('_')
                     .to_string();
+                if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+                    eprintln!("[dbg-dec] emit ep={:#x} name={name}", f.ep);
+                }
                 emit_function(
                     &name,
                     &blocks,
@@ -865,20 +926,16 @@ impl<'a> Structurer<'a> {
                             break;
                         }
                     }
+                    // 目标块没访问过就顺着走；已访问过（共享尾块/非头回边）或目标不在本函数
+                    // 块表里（越界跳转）就如实 goto——绝不索引不存在的块（曾因此 panic）
                     match t {
-                        Some(ti) if Some(ti) == self.succ(b, 0).or(Some(ti)) => {
-                            cur = t;
+                        Some(ti) if !self.done.contains(&ti) => {
+                            cur = Some(ti);
                         }
-                        other => {
-                            match other {
-                                Some(ti) if !self.done.contains(&ti) => {
-                                    cur = Some(ti);
-                                }
-                                _ => {
-                                    out.push(Node::Goto(self.blocks[b].succs[0].1));
-                                    break;
-                                }
-                            }
+                        _ => {
+                            self.unstructured = true;
+                            out.push(Node::Goto(target));
+                            break;
                         }
                     }
                 }

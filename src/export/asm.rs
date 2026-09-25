@@ -114,6 +114,13 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                     .detail(true)
                     .build()
                     .map_err(|e| format!("capstone 初始化失败: {e}"));
+                // 开 skipdata：函数入口前常带 0 填充/对齐字节，遇到非指令字节要还原成
+                // `.byte ..` 继续，否则整段代码会被判为反汇编失败而消失（实测踩过）。
+                let cs = cs.and_then(|mut c| {
+                    c.set_skipdata(true)
+                        .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
+                    Ok(c)
+                });
                 let cs = match cs {
                     Ok(c) => c,
                     Err(e) => {
