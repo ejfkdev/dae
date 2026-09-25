@@ -71,6 +71,7 @@ export done -> /absolute/path/to/out:
 | `arrays.txt` / `maps.txt` | every List / Map object with its contents (under `text/`) |
 | `text/call_edges.txt` | call edges: direct `bl`/`call` targets + indirect call sites; per-class allocation stubs are named from their prologue |
 | `callgraph.dot` | direct-call graph between named functions (Graphviz DOT) |
+| `dart/*.dart` | per-function pseudocode, with `--decompile` (experimental) |
 
 Struct headers are generated **per target**: `DartThread` from a version × architecture layout table, `DartObjectPool` from the target's own object pool.
 
@@ -106,6 +107,22 @@ Three layers; the engine is version-invariant, versions add configuration only:
 | Platform profile | `profiles/platform/*.json` | container parser, symbol names, register roles |
 
 Spec: [`docs/PROFILES.md`](docs/PROFILES.md)
+
+## Decompiler (experimental)
+
+`dae --decompile` adds `dart/<library>.dart`: one pseudocode function per named function,
+lifted from the disassembly through the same pipeline shape the sibling tools use
+(machine-specific lift → basic blocks → emission).
+
+What it does today: real comparison conditions folded from `cmp`/`test` + the branch
+(`if (rdx < 2)`), framework register names (`PP`/`THR`/`SP`/`FP`) including inside memory
+operands, named direct call targets, and the raw disassembly kept as a comment block above
+each function so the output stays checkable.
+
+What it does **not** do yet: control-flow structuring (block labels + `goto` stand in — Dart
+has no `goto`, so the files are pseudocode, not compilable Dart), expression nesting, and
+type recovery. Unrecognised instructions are emitted verbatim as `// unmapped:` rather than
+approximated.
 
 ## Known limitations
 

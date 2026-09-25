@@ -94,6 +94,7 @@ pub struct Messages {
     pub sum_cg_d: &'static str,
     pub sum_cg_i: &'static str,
     pub sum_cg_r: &'static str,
+    pub sum_dart: &'static str,
 }
 
 pub fn messages(lang: Lang) -> Messages {
@@ -154,6 +155,7 @@ pub fn messages(lang: Lang) -> Messages {
         sum_cg_d: p("条直接边", "direct edges"),
         sum_cg_i: p("个间接调用", "indirect calls"),
         sum_cg_r: p("条解析到名字", "resolved"),
+        sum_dart: p("个函数伪代码", "function pseudocode blocks"),
     }
 }
 

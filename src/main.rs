@@ -28,6 +28,7 @@ fn main() {
     let mut positional: Vec<String> = Vec::new();
     let mut sdk_override: Option<PathBuf> = None;
     let mut platform_override: Option<PathBuf> = None;
+    let mut decompile = false;
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -46,6 +47,10 @@ fn main() {
                 }
                 platform_override = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
+            }
+            "--decompile" => {
+                decompile = true;
+                i += 1;
             }
             "--help" | "-h" => {
                 print_help(&s);
@@ -68,7 +73,7 @@ fn main() {
     let bin = &positional[0];
     let out = &positional[1];
 
-    if let Err(e) = run(bin, out, sdk_override.as_deref(), platform_override.as_deref(), &s) {
+    if let Err(e) = run(bin, out, sdk_override.as_deref(), platform_override.as_deref(), decompile, &s) {
         eprintln!("{}: {e}", s.err_prefix);
         std::process::exit(1);
     }
@@ -79,6 +84,7 @@ fn run(
     out: &str,
     sdk_override: Option<&std::path::Path>,
     platform_override: Option<&std::path::Path>,
+    decompile: bool,
     s: &dae::locale::Messages,
 ) -> Result<(), String> {
     let since = std::time::Instant::now();
@@ -282,6 +288,15 @@ fn run(
         );
     }
 
+    if decompile {
+        let libs = analyzer.build_functions(true);
+        let st = dae::decompiler::write(&analyzer, &libs, &out_abs)?;
+        println!(
+            "  dart/                     {} {}（{} 基本块 / {} 语句；{} 直线函数，{} 需结构化）",
+            st.funcs, s.sum_dart, st.blocks, st.stmts, st.structured, st.fallback
+        );
+    }
+
     for w in &analyzer.warnings {
         eprintln!("{}: {w}", s.warn_prefix);
     }
@@ -319,6 +334,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("选项:");
         println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，按版本指纹自动识别）");
         println!("  --platform-profile PATH 强制指定平台 Profile（默认: 按容器+架构自动选择）");
+        println!("  --decompile            额外产出 dart/ 伪代码（实验性：块标签 + goto 形式）");
         println!("  -h, --help            显示此帮助");
         println!("  -V, --version         显示版本");
         println!();
@@ -330,6 +346,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  text/          pp · objs · strings · libs · classes · functions ·");
         println!("                 arrays · maps · call_edges（各类文本 dump）");
         println!("  callgraph.dot  已命名函数之间的直接调用图（Graphviz）");
+        println!("  dart/          --decompile 时的伪 Dart（实验性）");
         println!();
         println!("示例:");
         println!("  dae App.app out/");
@@ -348,6 +365,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("options:");
         println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected by version fingerprint)");
         println!("  --platform-profile PATH force a platform profile (default: auto by container + arch)");
+        println!("  --decompile            also emit dart/ pseudocode (experimental: block labels + goto)");
         println!("  -h, --help            show this help");
         println!("  -V, --version         show version");
         println!();
@@ -359,6 +377,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  text/          pp, objs, strings, libs, classes, functions,");
         println!("                 arrays, maps, call_edges (all text dumps)");
         println!("  callgraph.dot  direct-call graph between named functions (Graphviz)");
+        println!("  dart/          per-function pseudocode (with --decompile, experimental)");
         println!();
         println!("examples:");
         println!("  dae App.app out/");

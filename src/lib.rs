@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod decompiler;
 pub mod engine;
 pub mod export;
 pub mod locale;

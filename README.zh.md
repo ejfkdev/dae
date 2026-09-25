@@ -71,6 +71,7 @@ export done -> /绝对路径/to/out:
 | `arrays.txt` / `maps.txt` | 每个 List / Map 对象及其内容（在 `text/` 下） |
 | `text/call_edges.txt` | 调用边：直接 `bl`/`call` 目标 + 间接调用点；每类分配 stub 由序言解出名字 |
 | `callgraph.dot` | 已命名函数之间的直接调用图（Graphviz DOT） |
+| `dart/*.dart` | 每函数伪代码（加 `--decompile`，实验性） |
 
 结构头按目标生成：`DartThread` 取自「版本 × 架构」布局表，`DartObjectPool` 由目标自身对象池生成。
 
@@ -106,6 +107,18 @@ export done -> /绝对路径/to/out:
 | 平台 profile | `profiles/platform/*.json` | 容器解析、符号名、寄存器角色 |
 
 规范见 [`docs/PROFILES.md`](docs/PROFILES.md)。
+
+## 反编译器（实验性）
+
+`dae --decompile` 额外产出 `dart/<库>.dart`：每个已命名函数一段伪代码，流程与同类工具
+一致（机器相关 lift → 基本块 → 发射）。
+
+**目前做到的**：由 `cmp`/`test` + 跳转折出的真条件（`if (rdx < 2)`）、框架寄存器名
+（`PP`/`THR`/`SP`/`FP`，内存操作数内部也替换）、直接调用目标带名字、每个函数上方保留原始
+反汇编注释块（便于核对）。
+
+**还没做的**：控制流结构化（现在用块标签 + `goto` 顶着——Dart 没有 goto，所以产物是伪代码、
+不是可编译 Dart）、表达式嵌套、类型恢复。认不出的指令原样输出为 `// unmapped:`，不做近似。
 
 ## 已知限制
 
