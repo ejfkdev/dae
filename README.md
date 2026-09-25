@@ -119,10 +119,20 @@ What it does today: real comparison conditions folded from `cmp`/`test` + the br
 operands, named direct call targets, and the raw disassembly kept as a comment block above
 each function so the output stays checkable.
 
-What it does **not** do yet: control-flow structuring (block labels + `goto` stand in — Dart
-has no `goto`, so the files are pseudocode, not compilable Dart), expression nesting, and
-type recovery. Unrecognised instructions are emitted verbatim as `// unmapped:` rather than
-approximated.
+Control flow is **structured**: dominators give the natural loops (back edge = header
+dominates its tail), then each region is emitted recursively — a conditional branch whose
+two arms rejoin becomes `if/else`, a loop header becomes `while`, and an arm that leaves the
+loop becomes `break`/`continue`. Roughly 60% of functions come out fully structured; the
+rest keep a `goto` and are marked with a `NOTE` header so a reader knows which files are
+pseudocode rather than Dart.
+
+What it does **not** do yet: expression nesting (`mem(qword ptr [FP + 8])` stays flat rather
+than composing into field reads), and type recovery. Unrecognised instructions are emitted
+verbatim as `// unmapped:` rather than approximated.
+
+A shape gate runs on every change (`tests/decompiler_shape.rs`): braces must balance in every
+emitted file — an unbalanced file means a branch was silently dropped — every in-function
+statement must terminate, and the structured rate has a floor.
 
 ## Known limitations
 

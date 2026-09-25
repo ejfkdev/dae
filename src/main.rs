@@ -289,12 +289,17 @@ fn run(
     }
 
     if decompile {
-        let libs = analyzer.build_functions(true);
-        let st = dae::decompiler::write(&analyzer, &libs, &out_abs)?;
-        println!(
-            "  dart/                     {} {}（{} 基本块 / {} 语句；{} 直线函数，{} 需结构化）",
-            st.funcs, s.sum_dart, st.blocks, st.stmts, st.structured, st.fallback
-        );
+        #[cfg(feature = "asm")]
+        {
+            let libs = analyzer.build_functions(true);
+            let st = dae::decompiler::write(&analyzer, &libs, &out_abs)?;
+            println!(
+                "  dart/                     {} {}（{} 基本块 / {} 语句；{} 已结构化，{} 未结构化）",
+                st.funcs, s.sum_dart, st.blocks, st.stmts, st.structured, st.fallback
+            );
+        }
+        #[cfg(not(feature = "asm"))]
+        eprintln!("note: --decompile needs the `asm` feature (capstone); rebuild with default features");
     }
 
     for w in &analyzer.warnings {
@@ -334,7 +339,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("选项:");
         println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，按版本指纹自动识别）");
         println!("  --platform-profile PATH 强制指定平台 Profile（默认: 按容器+架构自动选择）");
-        println!("  --decompile            额外产出 dart/ 伪代码（实验性：块标签 + goto 形式）");
+        println!("  --decompile            额外产出 dart/ 伪 Dart（实验性：已做 if/else 与循环结构化）");
         println!("  -h, --help            显示此帮助");
         println!("  -V, --version         显示版本");
         println!();
@@ -346,7 +351,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  text/          pp · objs · strings · libs · classes · functions ·");
         println!("                 arrays · maps · call_edges（各类文本 dump）");
         println!("  callgraph.dot  已命名函数之间的直接调用图（Graphviz）");
-        println!("  dart/          --decompile 时的伪 Dart（实验性）");
+        println!("  dart/          --decompile 时的伪 Dart（已结构化 if/else 与循环，实验性）");
         println!();
         println!("示例:");
         println!("  dae App.app out/");
@@ -365,7 +370,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("options:");
         println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected by version fingerprint)");
         println!("  --platform-profile PATH force a platform profile (default: auto by container + arch)");
-        println!("  --decompile            also emit dart/ pseudocode (experimental: block labels + goto)");
+        println!("  --decompile            also emit dart/ pseudocode (experimental; if/else + loops structured)");
         println!("  -h, --help            show this help");
         println!("  -V, --version         show version");
         println!();

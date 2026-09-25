@@ -1,4 +1,5 @@
 pub mod analyzer;
+#[cfg(feature = "asm")]
 pub mod decompiler;
 pub mod engine;
 pub mod export;

@@ -414,84 +414,46 @@ fn emit_function(
     structured: &mut usize,
     fallback: &mut usize,
 ) {
-    let simple = blocks.len() == 1;
-    if simple {
-        *structured += 1;
-    } else {
+    let mut s = Structurer::new(blocks);
+    let nodes = s.seq(0, None);
+    let mut unstructured = s.unstructured;
+    let mut body = String::new();
+    render_nodes(&nodes, 0, &mut body, &mut unstructured);
+    if unstructured {
         *fallback += 1;
+    } else {
+        *structured += 1;
     }
+
     let _ = writeln!(out, "\n// {name}");
     let _ = writeln!(out, "// raw disassembly:");
     out.push_str("//");
     out.push_str(&raw.replace('\n', "\n//"));
     out.push('\n');
+    if unstructured {
+        let _ = writeln!(
+            out,
+            "// NOTE: control flow was not fully structured (goto kept) — pseudocode only."
+        );
+    }
     let _ = writeln!(out, "dynamic {name}() {{");
     let mut declared: BTreeSet<String> = BTreeSet::new();
-    for s in blocks.iter().flat_map(|b| b.stmts.iter()) {
-        if let Op::Assign { dst, .. } = &s.op {
-            if declared.insert(dst.clone()) {
-                let _ = writeln!(out, "  dynamic {dst};");
+    for st in blocks.iter().flat_map(|b| b.stmts.iter()) {
+        match &st.op {
+            Op::Assign { dst, .. } => {
+                if declared.insert(dst.clone()) {
+                    let _ = writeln!(out, "  dynamic {dst};");
+                }
             }
-        }
-        if let Op::Call {
-            dst: Some(d), ..
-        } = &s.op
-        {
-            if declared.insert(d.clone()) {
-                let _ = writeln!(out, "  dynamic {d};");
+            Op::Call { dst: Some(d), .. } => {
+                if declared.insert(d.clone()) {
+                    let _ = writeln!(out, "  dynamic {d};");
+                }
             }
+            _ => {}
         }
     }
-    for b in blocks {
-        if !simple {
-            let _ = writeln!(out, "  L{:x}:;", b.start);
-        }
-        for s in &b.stmts {
-            match &s.op {
-                Op::Assign { dst, src } => {
-                    let _ = writeln!(out, "  {dst} = {}; // {:#x}", src.text(), s.addr);
-                }
-                Op::Call {
-                    dst,
-                    target,
-                    callee,
-                    ..
-                } => {
-                    let call = match target {
-                        Some(t) => format!("call 0x{t:x}"),
-                        None => format!("callIndirect({callee})"),
-                    };
-                    match dst {
-                        Some(d) => {
-                            let _ = writeln!(out, "  {d} = {call}; // {:#x}", s.addr);
-                        }
-                        None => {
-                            let _ = writeln!(out, "  {call}; // {:#x}", s.addr);
-                        }
-                    }
-                }
-                Op::Branch { cond, target } => match cond {
-                    Some(c) => {
-                        let _ = writeln!(out, "  if ({c}) goto L{target:x}; // {:#x}", s.addr);
-                    }
-                    None => {
-                        let _ = writeln!(out, "  goto L{target:x}; // {:#x}", s.addr);
-                    }
-                },
-                Op::Return { value } => match value {
-                    Some(v) => {
-                        let _ = writeln!(out, "  return {v}; // {:#x}", s.addr);
-                    }
-                    None => {
-                        let _ = writeln!(out, "  return; // {:#x}", s.addr);
-                    }
-                },
-                Op::Other(t) => {
-                    let _ = writeln!(out, "  // unmapped: {t} // {:#x}", s.addr);
-                }
-            }
-        }
-    }
+    out.push_str(&body);
     out.push_str("}\n");
 }
 
@@ -602,4 +564,401 @@ pub fn write(
         std::fs::write(dir.join(fname), of).map_err(|e| format!("写 dart 文件失败: {e}"))?;
     }
     Ok(stats)
+}
+// ---------------------------------------------------------------- 控制流结构化
+//
+// 目标：把「块 + goto」变成 if/else 与循环。做法是教科书式的两件套：
+// 支配树找自然循环（回边：头支配尾），再按区域递归发射——两个分支汇合于同一结点
+// 就是菱形（if/else），汇合不了就退回 `goto`（Dart 没有 goto，所以退回即标记为
+// 未结构化，产物按伪代码对待，不假装是合法 Dart）。
+
+#[derive(Debug, Clone)]
+enum Node {
+    Line(String),
+    If { cond: String, then: Vec<Node>, els: Vec<Node> },
+    While { cond: Option<String>, body: Vec<Node> },
+    Break,
+    Continue,
+    Goto(u64),
+}
+
+struct Structurer<'a> {
+    blocks: &'a [Block],
+    idx: BTreeMap<u64, usize>,
+    loops: BTreeMap<usize, (usize, usize)>, // header idx → (body 入口, 出口)
+    in_loop: BTreeMap<usize, usize>,    // block idx → 所属循环头 idx
+    done: BTreeSet<usize>,
+    unstructured: bool,
+}
+
+/// Cooper–Harvey–Kennedy 支配集迭代
+fn dominators(blocks: &[Block], idx: &BTreeMap<u64, usize>) -> Vec<BTreeSet<usize>> {
+    let n = blocks.len();
+    let mut dom: Vec<BTreeSet<usize>> = vec![(0..n).collect(); n];
+    if n == 0 {
+        return dom;
+    }
+    dom[0].clear();
+    dom[0].insert(0);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 1..n {
+            let mut preds = Vec::new();
+            for (p, blk) in blocks.iter().enumerate() {
+                // 回边不参与支配计算（经典算法的标准处理）
+                if blk.succs.iter().any(|(_, t)| idx.get(t) == Some(&b)) && p != b {
+                    preds.push(p);
+                }
+            }
+            let mut newset: Option<BTreeSet<usize>> = None;
+            for p in &preds {
+                let s = &dom[*p];
+                newset = Some(match newset {
+                    None => s.clone(),
+                    Some(acc) => acc.intersection(s).copied().collect(),
+                });
+            }
+            let mut newset = newset.unwrap_or_default();
+            newset.insert(b);
+            if newset != dom[b] {
+                dom[b] = newset;
+                changed = true;
+            }
+        }
+    }
+    dom
+}
+
+impl<'a> Structurer<'a> {
+    fn new(blocks: &'a [Block]) -> Self {
+        let idx: BTreeMap<u64, usize> =
+            blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
+        let dom = dominators(blocks, &idx);
+        let mut loops = BTreeMap::new();
+        let mut in_loop = BTreeMap::new();
+        // 回边 u → h（h 支配 u）⇒ 自然循环体 = {h} ∪ 能不经 h 到达 u 的块
+        for (u, blk) in blocks.iter().enumerate() {
+            for (_, t) in &blk.succs {
+                let Some(&h) = idx.get(t) else { continue };
+                if !dom[u].contains(&h) {
+                    continue;
+                }
+                let mut body: BTreeSet<usize> = BTreeSet::new();
+                body.insert(h);
+                let mut stack = vec![u];
+                while let Some(x) = stack.pop() {
+                    if !body.insert(x) {
+                        continue;
+                    }
+                    for (p, pb) in blocks.iter().enumerate() {
+                        if pb.succs.iter().any(|(_, t)| idx.get(t) == Some(&x)) && p != x {
+                            stack.push(p);
+                        }
+                    }
+                }
+                // 出口：循环体内指向体外的边
+                let mut exit = h;
+                for &b in &body {
+                    for (_, t) in &blocks[b].succs {
+                        if let Some(&ti) = idx.get(t) {
+                            if !body.contains(&ti) {
+                                exit = ti;
+                            }
+                        }
+                    }
+                }
+                loops.entry(h).or_insert((h, exit));
+                for &b in &body {
+                    in_loop.entry(b).or_insert(h);
+                }
+            }
+        }
+        Structurer {
+            blocks,
+            idx,
+            loops,
+            in_loop,
+            done: BTreeSet::new(),
+            unstructured: false,
+        }
+    }
+
+    /// 一条边的目标块下标
+    fn succ(&self, b: usize, k: usize) -> Option<usize> {
+        self.blocks[b].succs.get(k).and_then(|(_, t)| self.idx.get(t).copied())
+    }
+
+    fn term(&self, b: usize) -> Option<Op> {
+        self.blocks[b].stmts.last().map(|s| s.op.clone())
+    }
+
+    /// 语句渲染（不含最后一条终结指令）
+    fn body_lines(&self, b: usize) -> Vec<Node> {
+        let mut v = Vec::new();
+        let n = self.blocks[b].stmts.len();
+        let cut = matches!(
+            self.term(b),
+            Some(Op::Branch { .. }) | Some(Op::Return { .. })
+        ) as usize;
+        for s in &self.blocks[b].stmts[..n.saturating_sub(cut)] {
+            if let Some(line) = render_op(&s.op, s.addr) {
+                v.push(Node::Line(line));
+            }
+        }
+        v
+    }
+
+    /// 两个分支的最近公共汇合点（BFS 交替推进，遇到同一结点即汇合）
+    fn find_join(&self, a: usize, b: usize) -> Option<usize> {
+        if a == b {
+            return Some(a);
+        }
+        let mut seen_a: BTreeSet<usize> = BTreeSet::new();
+        let mut seen_b: BTreeSet<usize> = BTreeSet::new();
+        let mut qa = vec![a];
+        let mut qb = vec![b];
+        for _ in 0..512 {
+            let mut na = Vec::new();
+            for x in qa {
+                if !seen_a.insert(x) {
+                    continue;
+                }
+                if seen_b.contains(&x) {
+                    return Some(x);
+                }
+                for k in 0..self.blocks[x].succs.len() {
+                    if let Some(s) = self.succ(x, k) {
+                        na.push(s);
+                    }
+                }
+            }
+            let mut nb = Vec::new();
+            for x in qb {
+                if !seen_b.insert(x) {
+                    continue;
+                }
+                if seen_a.contains(&x) {
+                    return Some(x);
+                }
+                for k in 0..self.blocks[x].succs.len() {
+                    if let Some(s) = self.succ(x, k) {
+                        nb.push(s);
+                    }
+                }
+            }
+            qa = na;
+            qb = nb;
+            if qa.is_empty() && qb.is_empty() {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// 递归结构化 [start, stop)
+    fn seq(&mut self, start: usize, stop: Option<usize>) -> Vec<Node> {
+        let mut out: Vec<Node> = Vec::new();
+        let mut cur = Some(start);
+        let mut guard = 0usize;
+        while let Some(b) = cur {
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+            if Some(b) == stop || !self.done.insert(b) {
+                break;
+            }
+            // 循环头：条件在循环体内求值，故头块语句进 body
+            if let Some(&(_, exit)) = self.loops.get(&b) {
+                let (cond, body_entry) = self.loop_shape(b);
+                let mut body = self.body_lines(b);
+                body.extend(self.seq(body_entry, Some(b)));
+                out.push(Node::While { cond, body });
+                cur = Some(exit);
+                continue;
+            }
+            out.extend(self.body_lines(b));
+            match self.term(b) {
+                Some(Op::Return { value }) => {
+                    out.push(Node::Line(match &value {
+                        Some(v) => format!("return {v};"),
+                        None => "return;".to_string(),
+                    }));
+                    break;
+                }
+                Some(Op::Branch { cond: Some(c), target }) => {
+                    let t = self.idx.get(&target).copied();
+                    let f = self.succ(b, 1);
+                    // 循环内：出口边 → break；回边 → continue
+                    let in_l = self.in_loop.get(&b).copied();
+                    if let Some(h) = in_l {
+                        let t_out = t.map(|x| self.in_loop.get(&x).copied() != Some(h)).unwrap_or(true);
+                        if t_out {
+                            out.push(Node::If {
+                                cond: c.clone(),
+                                then: vec![Node::Break],
+                                els: vec![],
+                            });
+                            cur = f;
+                            continue;
+                        }
+                        if self.loops.contains_key(&h) && t == Some(h) {
+                            out.push(Node::If {
+                                cond: c.clone(),
+                                then: vec![Node::Continue],
+                                els: vec![],
+                            });
+                            cur = f;
+                            continue;
+                        }
+                    }
+                    match (t, f) {
+                        (Some(ti), Some(fi)) => {
+                            if let Some(j) = self.find_join(ti, fi).filter(|j| Some(*j) != stop) {
+                                let then = self.seq(ti, Some(j));
+                                let els = self.seq(fi, Some(j));
+                                out.push(Node::If {
+                                    cond: c.clone(),
+                                    then,
+                                    els,
+                                });
+                                cur = Some(j);
+                            } else {
+                                // 汇合不了：只保留 true 支，其余退回 goto
+                                self.unstructured = true;
+                                out.push(Node::If {
+                                    cond: c.clone(),
+                                    then: self.seq(ti, stop),
+                                    els: vec![],
+                                });
+                                out.push(Node::Goto(self.blocks[fi].start));
+                                break;
+                            }
+                        }
+                        _ => {
+                            self.unstructured = true;
+                            out.push(Node::Line(format!("if ({c}) {{ /* 目标越界 */ }}")));
+                            break;
+                        }
+                    }
+                }
+                Some(Op::Branch { cond: None, target }) => {
+                    let t = self.idx.get(&target).copied();
+                    if t == stop {
+                        break;
+                    }
+                    if let Some(h) = self.in_loop.get(&b) {
+                        if self.loops.contains_key(&h) && t == Some(*h) {
+                            out.push(Node::Continue);
+                            break;
+                        }
+                    }
+                    match t {
+                        Some(ti) if Some(ti) == self.succ(b, 0).or(Some(ti)) => {
+                            cur = t;
+                        }
+                        other => {
+                            match other {
+                                Some(ti) if !self.done.contains(&ti) => {
+                                    cur = Some(ti);
+                                }
+                                _ => {
+                                    out.push(Node::Goto(self.blocks[b].succs[0].1));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    cur = self.succ(b, 0);
+                }
+            }
+        }
+        out
+    }
+
+    /// 循环形状：条件来自头块的终结分支（true 支在体内 ⇒ while(cond)；否则 while(true)）
+    fn loop_shape(&self, h: usize) -> (Option<String>, usize) {
+        match self.term(h) {
+            Some(Op::Branch { cond: Some(c), target }) => {
+                let ti = self.idx.get(&target).copied();
+                let fi = self.succ(h, 1);
+                let inside = ti.filter(|t| self.in_loop.get(t) == Some(&h));
+                let outside = fi.filter(|t| self.in_loop.get(t) != Some(&h));
+                if inside.is_some() && outside.is_some() {
+                    (Some(c), inside.unwrap())
+                } else {
+                    (None, self.succ(h, 0).unwrap_or(h))
+                }
+            }
+            _ => (None, self.succ(h, 0).unwrap_or(h)),
+        }
+    }
+}
+
+fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &mut bool) {
+    let pad = "  ".repeat(indent + 1);
+    for n in nodes {
+        match n {
+            Node::Line(l) => {
+                let _ = writeln!(out, "{pad}{l}");
+            }
+            Node::If { cond, then, els } => {
+                let _ = writeln!(out, "{pad}if ({cond}) {{");
+                render_nodes(then, indent + 1, out, unstructured);
+                if els.is_empty() {
+                    let _ = writeln!(out, "{pad}}}");
+                } else {
+                    let _ = writeln!(out, "{pad}}} else {{");
+                    render_nodes(els, indent + 1, out, unstructured);
+                    let _ = writeln!(out, "{pad}}}");
+                }
+            }
+            Node::While { cond, body: _ } => match cond {
+                Some(c) => {
+                    let _ = writeln!(out, "{pad}while ({c}) {{");
+                }
+                None => {
+                    let _ = writeln!(out, "{pad}while (true) {{");
+                }
+            },
+            Node::Break => {
+                let _ = writeln!(out, "{pad}break;");
+            }
+            Node::Continue => {
+                let _ = writeln!(out, "{pad}continue;");
+            }
+            Node::Goto(a) => {
+                *unstructured = true;
+                let _ = writeln!(out, "{pad}goto L{a:x};");
+            }
+        }
+        if let Node::While { body, .. } = n {
+            render_nodes(body, indent + 1, out, unstructured);
+            let _ = writeln!(out, "{pad}}}");
+        }
+    }
+}
+
+/// 单条 IR → 伪代码行（None = 不产出，如无跳转意义的指令）
+fn render_op(op: &Op, addr: u64) -> Option<String> {
+    match op {
+        Op::Assign { dst, src } => Some(format!("{dst} = {}; // {addr:#x}", src.text())),
+        Op::Call {
+            dst, target, callee, ..
+        } => {
+            let call = match target {
+                Some(t) => format!("call 0x{t:x}"),
+                None => format!("callIndirect({callee})"),
+            };
+            Some(match dst {
+                Some(d) => format!("{d} = {call}; // {addr:#x}"),
+                None => format!("{call}; // {addr:#x}"),
+            })
+        }
+        Op::Branch { .. } | Op::Return { .. } => None,
+        Op::Other(t) => Some(format!("// unmapped: {t} // {addr:#x}")),
+    }
 }
