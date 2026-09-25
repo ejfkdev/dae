@@ -275,6 +275,12 @@ fn run(
     println!("  text/functions.txt        {} {}", summary.textinfo.functions, s.sum_funcs);
     println!("  text/arrays.txt           {} {}", summary.textinfo.arrays, s.sum_arrays);
     println!("  text/maps.txt             {} {}", summary.textinfo.maps, s.sum_maps);
+    if let Some((_f, d, dr, i)) = summary.callgraph {
+        println!(
+            "  call_edges.txt            {} {} + {} {}（{} {}）",
+            d, s.sum_cg_d, i, s.sum_cg_i, dr, s.sum_cg_r
+        );
+    }
 
     for w in &analyzer.warnings {
         eprintln!("{}: {w}", s.warn_prefix);
@@ -322,7 +328,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  frida.js       Frida 运行时 Classes 数组模板");
         println!("  asm/           capstone 反汇编 + IL 注释（arm64）");
         println!("  text/          pp · objs · strings · libs · classes · functions ·");
-        println!("                 arrays · maps（各类文本 dump）");
+        println!("                 arrays · maps · call_edges（各类文本 dump）");
+        println!("  callgraph.dot  已命名函数之间的直接调用图（Graphviz）");
         println!();
         println!("示例:");
         println!("  dae App.app out/");
@@ -350,7 +357,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  frida.js       Frida runtime Classes array template");
         println!("  asm/           capstone disassembly + IL comments (arm64)");
         println!("  text/          pp, objs, strings, libs, classes, functions,");
-        println!("                 arrays, maps (all text dumps)");
+        println!("                 arrays, maps, call_edges (all text dumps)");
+        println!("  callgraph.dot  direct-call graph between named functions (Graphviz)");
         println!();
         println!("examples:");
         println!("  dae App.app out/");

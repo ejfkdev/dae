@@ -69,6 +69,8 @@ export done -> /absolute/path/to/out:
 | `classes.txt` | class inventory (ref, cid, library, name; under `text/`) |
 | `functions.txt` | flat `Library.Class.method → offset` index (under `text/`) |
 | `arrays.txt` / `maps.txt` | every List / Map object with its contents (under `text/`) |
+| `text/call_edges.txt` | call edges: direct `bl`/`call` targets + indirect call sites |
+| `callgraph.dot` | direct-call graph between named functions (Graphviz DOT) |
 
 Struct headers are generated **per target**: `DartThread` from a version × architecture layout table, `DartObjectPool` from the target's own object pool.
 
@@ -109,6 +111,9 @@ Spec: [`docs/PROFILES.md`](docs/PROFILES.md)
 
 - Addresses are file-offset space, not runtime VAs (matches the blutter reference)
 - `asm/` IL comments are arm64-only (x64 disassembly is emitted)
+- Call graph: indirect calls (`blr` / `call reg`) stay unresolved by design — their targets
+  are computed at runtime. Direct targets that land on an unnamed allocation stub are
+  emitted with their address and no name (no guessing).
 - PE stripped of COFF symbols needs a `.pdb` backfill first
 - Dart 1.24 / 2.0 are JIT snapshots and unsupported
 

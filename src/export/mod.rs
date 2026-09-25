@@ -15,6 +15,8 @@ pub mod struct_hdr;
 pub mod textinfo;
 #[cfg(feature = "asm")]
 pub mod asm;
+#[cfg(feature = "asm")]
+pub mod callgraph;
 
 use crate::analyzer::Analyzer;
 use std::path::Path;
@@ -32,6 +34,9 @@ pub struct ExportSummary {
     pub asm_functions: usize,
     pub asm_enabled: bool,
     pub textinfo: textinfo::TextInfoCounts,
+    /// (参与函数数, 直接边, 间接调用点)；未启用 asm 特性时为 None
+    /// (函数数, 直接边, 已解析直接边, 间接调用点)
+    pub callgraph: Option<(usize, usize, usize, usize)>,
 }
 
 /// DART_AOT_TIMINGS=1 时打印导出阶段耗时
@@ -54,8 +59,11 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     // r2 全量（含 dart: 内部库，保证反编译工具里 SDK 函数也有还原名）；
     // asm 聚焦应用代码（跳过 dart: 内部库，控制产物规模）。
     let libs_r2 = analyzer.build_functions(true);
+    // asm 聚焦应用代码（跳过 dart: 内部库）；无 asm 特性时不需要这份
+    #[cfg(feature = "asm")]
     let libs_asm = analyzer.build_functions(false);
     let libs_ref = &libs_r2;
+    #[cfg(feature = "asm")]
     let libs_asm_ref = &libs_asm;
     t("build_functions", &mut since);
 
@@ -67,9 +75,12 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
         R2(Result<usize, String>),
         Ida(Result<usize, String>),
         Frida(Result<usize, String>),
+        #[cfg(feature = "asm")]
         Asm(Result<usize, String>),
         PpObjs(Result<(usize, usize), String>),
         TextInfo(Result<textinfo::TextInfoCounts, String>),
+        #[cfg(feature = "asm")]
+        CallGraph(Result<callgraph::CallGraphCounts, String>),
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
@@ -115,6 +126,13 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
                 let _ = tx.send(TaskDone::TextInfo(textinfo::write(analyzer, libs_ref, out_dir)));
             });
         }
+        #[cfg(feature = "asm")]
+        {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let _ = tx.send(TaskDone::CallGraph(callgraph::write(analyzer, libs_ref, out_dir)));
+            });
+        }
         drop(tx);
     });
 
@@ -123,25 +141,32 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     let mut n_frida = 0usize;
     let mut n_pp = 0usize;
     let mut n_objs = 0usize;
+    #[allow(unused_mut)]
     let mut asm_functions = 0usize;
     let mut textinfo: Option<textinfo::TextInfoCounts> = None;
+    #[allow(unused_mut)]
+    let mut cg: Option<(usize, usize, usize, usize)> = None;
     for done in rx {
         match done {
             TaskDone::R2(Ok(n)) => n_r2 = n,
             TaskDone::Ida(Ok(n)) => n_ida = n,
             TaskDone::Frida(Ok(n)) => n_frida = n,
+            #[cfg(feature = "asm")]
             TaskDone::Asm(Ok(n)) => asm_functions = n,
             TaskDone::PpObjs(Ok((p, o))) => {
                 n_pp = p;
                 n_objs = o;
             }
             TaskDone::TextInfo(Ok(t)) => textinfo = Some(t),
+            #[cfg(feature = "asm")]
+            TaskDone::CallGraph(Ok(c)) => cg = Some((c.funcs, c.direct, c.edges_resolved, c.indirect)),
             TaskDone::R2(Err(e))
             | TaskDone::Ida(Err(e))
             | TaskDone::Frida(Err(e))
-            | TaskDone::Asm(Err(e))
             | TaskDone::PpObjs(Err(e))
             | TaskDone::TextInfo(Err(e)) => return Err(e),
+            #[cfg(feature = "asm")]
+            TaskDone::Asm(Err(e)) | TaskDone::CallGraph(Err(e)) => return Err(e),
         }
     }
     if asm_enabled && !do_asm {
@@ -168,6 +193,7 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
             arrays: 0,
             maps: 0,
         }),
+        callgraph: cg,
     })
 }
 

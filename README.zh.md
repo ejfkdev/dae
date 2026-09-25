@@ -69,6 +69,8 @@ export done -> /绝对路径/to/out:
 | `classes.txt` | 类清单（ref、cid、库、类名；在 `text/` 下） |
 | `functions.txt` | 平铺 `库.类.方法 → 偏移` 索引（在 `text/` 下） |
 | `arrays.txt` / `maps.txt` | 每个 List / Map 对象及其内容（在 `text/` 下） |
+| `text/call_edges.txt` | 调用边：直接 `bl`/`call` 目标 + 间接调用点 |
+| `callgraph.dot` | 已命名函数之间的直接调用图（Graphviz DOT） |
 
 结构头按目标生成：`DartThread` 取自「版本 × 架构」布局表，`DartObjectPool` 由目标自身对象池生成。
 
@@ -109,6 +111,8 @@ export done -> /绝对路径/to/out:
 
 - 地址是文件偏移空间，非运行时 VA（与 blutter 参考实现一致）
 - `asm/` 的 IL 注释仅 arm64（x64 仅反汇编）
+- 调用图：间接调用（`blr` / `call reg`）目标运行时才算得出，按设计如实留空；直接目标
+  若落在未命名的分配 stub 上，只输出地址不编名字
 - 剥离 COFF 符号表的 PE 需先从 `.pdb` 回填符号
 - Dart 1.24 / 2.0 是 JIT 快照，不支持
 
