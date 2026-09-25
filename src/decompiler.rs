@@ -37,6 +37,8 @@ enum Expr {
     Pool(u64),
     /// 内存读取（操作数原文，不解析语义）
     Mem(String),
+    /// 已渲染好的表达式文本，原样输出（嵌套落地用）
+    Text(String),
 }
 
 impl Expr {
@@ -46,6 +48,7 @@ impl Expr {
             Expr::Imm(v) => format!("{v}"),
             Expr::Pool(i) => format!("pp[0x{i:x}]"),
             Expr::Mem(m) => format!("mem({m})"),
+            Expr::Text(x) => x.clone(),
         }
     }
 }
@@ -188,6 +191,7 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
 }
 
 /// 寄存器角色（与 asm 导出同源；按平台 profile 取名）
+#[derive(Clone)]
 struct Roles {
     pp: String,
     thr: String,
@@ -409,12 +413,13 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
 fn emit_function(
     name: &str,
     blocks: &[Block],
+    rl: &Roles,
     out: &mut String,
     raw: &str,
     structured: &mut usize,
     fallback: &mut usize,
 ) {
-    let mut s = Structurer::new(blocks);
+    let mut s = Structurer::new(blocks, rl.clone());
     let nodes = s.seq(0, None);
     let mut unstructured = s.unstructured;
     let mut body = String::new();
@@ -467,6 +472,7 @@ pub fn write(
     let dir = out_dir.join("dart");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 dart 目录失败: {e}"))?;
     let is_arm64 = analyzer.platform.arch == "arm64";
+    let rl = roles(analyzer);
     let cs = if is_arm64 {
         Capstone::new()
             .arm64()
@@ -552,6 +558,7 @@ pub fn write(
                 emit_function(
                     &name,
                     &blocks,
+                    &rl,
                     &mut of,
                     &raw,
                     &mut stats.structured,
@@ -584,6 +591,7 @@ enum Node {
 
 struct Structurer<'a> {
     blocks: &'a [Block],
+    rl: Roles,
     idx: BTreeMap<u64, usize>,
     loops: BTreeMap<usize, (usize, usize)>, // header idx → (body 入口, 出口)
     in_loop: BTreeMap<usize, usize>,    // block idx → 所属循环头 idx
@@ -631,7 +639,7 @@ fn dominators(blocks: &[Block], idx: &BTreeMap<u64, usize>) -> Vec<BTreeSet<usiz
 }
 
 impl<'a> Structurer<'a> {
-    fn new(blocks: &'a [Block]) -> Self {
+    fn new(blocks: &'a [Block], rl: Roles) -> Self {
         let idx: BTreeMap<u64, usize> =
             blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
         let dom = dominators(blocks, &idx);
@@ -676,6 +684,7 @@ impl<'a> Structurer<'a> {
         }
         Structurer {
             blocks,
+            rl,
             idx,
             loops,
             in_loop,
@@ -693,15 +702,17 @@ impl<'a> Structurer<'a> {
         self.blocks[b].stmts.last().map(|s| s.op.clone())
     }
 
-    /// 语句渲染（不含最后一条终结指令）
+    /// 语句渲染（不含最后一条终结指令；先做块内表达式嵌套）
     fn body_lines(&self, b: usize) -> Vec<Node> {
         let mut v = Vec::new();
-        let n = self.blocks[b].stmts.len();
+        let blk = &self.blocks[b];
+        let n = blk.stmts.len();
         let cut = matches!(
             self.term(b),
             Some(Op::Branch { .. }) | Some(Op::Return { .. })
         ) as usize;
-        for s in &self.blocks[b].stmts[..n.saturating_sub(cut)] {
+        let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], &self.rl);
+        for s in &nested {
             if let Some(line) = render_op(&s.op, s.addr) {
                 v.push(Node::Line(line));
             }
@@ -961,4 +972,114 @@ fn render_op(op: &Op, addr: u64) -> Option<String> {
         Op::Branch { .. } | Op::Return { .. } => None,
         Op::Other(t) => Some(format!("// unmapped: {t} // {addr:#x}")),
     }
+}
+
+// ---------------------------------------------------------------- 表达式嵌套
+//
+// ddc 的寄存器值视图（Live/Pending）在 dae 这里的简化版：块内把「寄存器 ← 表达式」
+// 折成待定值，读到它时**内联**；块尾统一落地成局部变量。这样 `rax = [THR+0x80]` 再
+// `rax = [rax+0xa80]` 会折叠成一条可读表达式，而不是两行中间寄存器。
+//
+// 两条纪律：
+// - 折叠有深度上限（默认 3），免得产出没法读的长表达式；
+// - 调用是屏障：调用前先落地（调用可能改寄存器），折叠绝不跨越调用。
+
+const NEST_MAX_DEPTH: usize = 3;
+
+fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = Vec::new();
+    let mut pending: BTreeMap<String, (String, usize, u64)> = BTreeMap::new();
+    let flush = |pending: &mut BTreeMap<String, (String, usize, u64)>, out: &mut Vec<Stmt>, _addr: u64| {
+        for (r, (e, _, a)) in std::mem::take(pending) {
+            if e != r {
+                out.push(Stmt {
+                    addr: a,
+                    op: Op::Assign {
+                        dst: r,
+                        src: Expr::Text(e),
+                    },
+                });
+            }
+        }
+    };
+    for st in stmts {
+        match &st.op {
+            Op::Assign { dst, src } => {
+                let text = match src {
+                    Expr::Reg(r) => pending
+                        .get(r)
+                        .map(|(e, _, _)| e.clone())
+                        .unwrap_or_else(|| r.clone()),
+                    Expr::Imm(v) => format!("{v}"),
+                    Expr::Pool(i) => format!("pp[0x{i:x}]"),
+                    Expr::Mem(m) => {
+                        let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
+                        if d < NEST_MAX_DEPTH {
+                            format!("mem({})", subst_regs(m, &pending, rl))
+                        } else {
+                            format!("mem({m})")
+                        }
+                    }
+                    Expr::Text(x) => x.clone(),
+                };
+                let depth = pending.get(dst).map(|(_, d, _)| *d).unwrap_or(0) + 1;
+                pending.insert(dst.clone(), (text, depth, st.addr));
+            }
+            Op::Call { .. } => {
+                flush(&mut pending, &mut out, st.addr);
+                out.push(st.clone());
+            }
+            Op::Branch { cond, .. } => {
+                let c = cond.as_ref().map(|c| {
+                    let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
+                    if d < NEST_MAX_DEPTH {
+                        subst_regs(c, &pending, rl)
+                    } else {
+                        c.clone()
+                    }
+                });
+                flush(&mut pending, &mut out, st.addr);
+                out.push(Stmt {
+                    addr: st.addr,
+                    op: Op::Branch {
+                        cond: c,
+                        target: match &st.op {
+                            Op::Branch { target, .. } => *target,
+                            _ => 0,
+                        },
+                    },
+                });
+            }
+            Op::Return { .. } => {
+                flush(&mut pending, &mut out, st.addr);
+                out.push(st.clone());
+            }
+            Op::Other(_) => out.push(st.clone()),
+        }
+    }
+    flush(&mut pending, &mut out, stmts.last().map(|s| s.addr).unwrap_or(0));
+    out
+}
+
+/// 把操作数文本里的寄存器替换成待定表达式（词边界匹配，深度受 pending 自身限制）
+fn subst_regs(text: &str, pending: &BTreeMap<String, (String, usize, u64)>, rl: &Roles) -> String {
+    let mut s = text.to_string();
+    let mut names: Vec<&String> = pending.keys().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for n in names {
+        let (e, _, _) = &pending[n];
+        if e == n {
+            continue;
+        }
+        // 纯寄存器别名（如 FP = SP）不做替换：语义等价但可读性更差
+        if e.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).count() == 1
+            && !e.contains('[')
+            && !e.contains('+')
+        {
+            continue;
+        }
+        s = replace_word(&s, n, &format!("({e})"));
+    }
+    let _ = rl;
+    s
 }
