@@ -163,6 +163,81 @@ fn tokens_contain(hay: &[String], needle: &[String]) -> bool {
     })
 }
 
+/// 分配 stub 命名对拍：ELF 里 `Precompiled_AllocationStub_<Class>_<n>` 这一类符号，
+/// dae 应当能从 stub 序言解出同一个类名。
+///
+/// 硬门禁是**零编造**：命名出来的必须与真值一致，猜错一个就失败（这是"不知道就留空"
+/// 的底线）。覆盖率单独打印——某些版本（2.16.x）类表层本身还没解析出来，命名率会是 0，
+/// 那是另一处已知缺口，不该被这条门禁掩盖，也不该让它把"不猜"这条判据带偏。
+#[cfg(feature = "asm")]
+#[test]
+fn alloc_stub_naming() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut total, mut named, mut right) = (0usize, 0usize, 0usize);
+    for (label, so, sdk_name, plat_name) in corpus() {
+        if !so.exists() {
+            continue;
+        }
+        let data = std::fs::read(&so).expect("读样本");
+        let syms = elf_func_symbols(&data);
+        if syms.is_empty() {
+            continue;
+        }
+        let sdk_src = std::fs::read_to_string(root.join("profiles/sdk").join(sdk_name)).unwrap();
+        let plat_src = std::fs::read_to_string(root.join("profiles/platform").join(plat_name)).unwrap();
+        let sdk: SdkProfile = parse_sdk(&sdk_src).unwrap();
+        let plat: PlatformProfile = parse_platform(&plat_src).unwrap();
+        let (vm_off, iso_off, instr_off) = dae::platform::locate_snapshots(&data, &plat).unwrap().0;
+        let a = Analyzer::new_located(&data, &sdk, &plat, (vm_off, iso_off, instr_off), false).unwrap();
+
+        // 真值：所有 AllocationStub_<Class>_<n> 的地址 → 类名
+        let mut truth: Vec<(u64, String)> = Vec::new();
+        for (va, sym) in &syms {
+            let Some(rest) = sym.strip_prefix("Precompiled_AllocationStub_") else {
+                continue;
+            };
+            let mut cls = rest.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_');
+            if let Some(i) = cls.rfind('_') {
+                if cls[i + 1..].chars().all(|c| c.is_ascii_digit()) {
+                    cls = &cls[..i];
+                }
+            }
+            truth.push((*va, cls.to_string()));
+        }
+        if truth.is_empty() {
+            continue;
+        }
+        let addrs: Vec<u64> = truth.iter().map(|(a, _)| *a).collect();
+        let got = dae::export::callgraph::alloc_stubs_at(&a, &addrs);
+        let (mut n, mut nm, mut r) = (0usize, 0usize, 0usize);
+        for ((_, want), (_, have)) in truth.iter().zip(got.iter()) {
+            n += 1;
+            let Some(name) = have else { continue };
+            nm += 1;
+            let cls = name.strip_prefix("AllocationStub_").unwrap_or(name);
+            if cls.contains(want.as_str()) {
+                r += 1;
+            }
+        }
+        total += n;
+        named += nm;
+        right += r;
+        println!("{label:16} 分配 stub 真值 {n:4}  命名 {nm:4}  类名一致 {r:4}");
+    }
+    if total == 0 {
+        println!("alloc_stub_naming: 无语料——跳过");
+        return;
+    }
+    println!(
+        "== 分配 stub 命名: {right}/{named} 已命名的与 .symtab 一致（覆盖率 {named}/{total}）"
+    );
+    assert_eq!(
+        named, right,
+        "分配 stub 命名出现 {} 个与真值不符的名字——不许猜",
+        named - right
+    );
+}
+
 #[test]
 fn symtab_differential() {
     let mut total_cmp = 0usize;
