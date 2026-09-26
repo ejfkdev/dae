@@ -7,7 +7,7 @@
 
 ## 1. SDK Profile（`profiles/sdk/*.json`）
 
-标识为 `(Dart 版本, word_size, compressed_pointers)`。`profiles/sdk/` 内 26 个版本
+标识为 `(Dart 版本, word_size, compressed_pointers)`。`profiles/sdk/` 内 26 个版本（算上 21 份压缩指针变体共 **47 份文件**）
 （1.24.3 → 3.14β）**全部编译进二进制**：`dae` 运行时按快照版本指纹（32B hash，
 见 `version_hashes.json`）精确命中，未命中时对嵌入版本做结构探针 + fill 决胜
 （见 `src/profile/detect.rs`）。全量对拍基准版本为 `dart-3.3.4-w64-no-compressed.json`
@@ -69,6 +69,34 @@
 | `typed_data_first/count/stride` | TypedData 分类：slot=(cid-first)/stride，rem=(cid-first)%stride |
 | `typed_data_elem_widths/var_rem/view_rem` | 每槽元素宽度；rem ∈ var_rem → 变长，view_rem → view |
 | `string_cid`(92) / `one_byte_string_cid`(93) / `two_byte_string_cid`(94) | 字符串解码 |
+
+### 1.3 有无取决于版本的字段
+
+生成器以 3.3.4 为基线、对其它版本只做 class id 重映射。重映射**不会**删掉某个版本的序列化器
+根本没写过的字段，所以下面每一处都必须逐版读该版的 `app_snapshot.cc` 才能钉死。错一处，
+整份快照就从那个簇起全漂——而且是静默的，`warnings` 仍为 0。
+
+| 簇 | 字段 | 起始版本 | 对布局的影响 |
+|---|---|---|---|
+| `TypeParameter` | `base_`/`index_` 用 `uint8` 还是 `uint16` | ≤2.19 是 `int32 + 3×uint8`；3.0 是 `int32 + 2×uint16 + uint8`；≥3.2 是 `2×uint16 + uint8` | 1 svarint + 3 裸字节 / 3 svarint + 1 字节 / 2 svarint + 1 字节 |
+| `Function` | `packed_fields_` | ≤2.17 无条件写；**2.18** 起移进 `if (kind != kFullAOT)` | ≤2.17 尾部 2 个 svarint，2.18 起 1 个 |
+| `SubtypeTestCache` | `num_inputs`、`num_occupied` | **3.2.0** | 之前只有 `refs(1)` |
+| `FfiTrampolineData` | `ffi_function_kind_` | **3.2.0** | 之前没有尾字节 |
+| `Type` | 尾部 `combined` 字节 | 2.15–2.18 有，**2.19** 起没有 | `refs(3) + uvarint + byte` vs `refs(3) + uvarint` |
+
+`datastream.h` 里有两条编码规则极易搞反，代价以小时计：
+
+- `Serializer::Write<T>` 的注释写着「raw data」，但 `Raw<sizeof(T),T>` **只有 sizeof(T)==1 时**
+  才是真裸字节；`Raw<2>/Raw<4>/Raw<8>` 会转调 `BaseWriteStream::Write<T>`，那是 **varint**。
+  所以 `Write<uint8_t>` 是裸字节，而 `Write<uint16_t>`/`Write<int32_t>`/`Write<int64_t>`/
+  `Write<double>` 都是 varint；只有 `WriteFixed<T>` 是定宽。
+- `WriteUnsigned` 把高位标记打在**终止字节**上，不是续字节上
+  （`kEndUnsignedByteMarker = 255 − 127 = 0x80`）——与标准 ULEB128 **相反**。
+  按 ULEB128 编码去反查长度会搜到看似合理的假命中。
+
+`check_profiles.sh` 会从 SDK 源码重新生成全部 **47 份** profile（26 个版本 × 字宽，外加 21 份
+压缩指针变体；2.7/2.10/2.12 早于指针压缩故无变体）并与落盘文件对拍，手改或陈旧的 profile 会失败。
+它把压缩变体的应有时数写死：「文件不在就跳过」正是 analyze 门禁刚堵掉的那类假通过形态。
 
 ## 2. Platform Profile（`profiles/platform/*.json`）
 

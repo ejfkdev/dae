@@ -9,13 +9,20 @@
 [![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTE4IiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDI1NiAyMTgiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMzQuNCAwLjEzMDE1MkwxMTEuNDggMjUuNjAyMkMxMTEuNjY1IDI5LjU2OTkgMTA5LjA1NCAzMi4wMDE5IDEwNC4wNjQgMzIuMDAxOUg2LjM5OTlWMEM2LjM5OTkgMC4xMzAxNDkgMTM0LjQgMC4xMzAxNTIgMTM0LjQgMC4xMzAxNTJaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTI1NiAwLjEzMDEyN0wxMDIuNDAxIDIxNy43MzJIMDBMMTUzLjU5OSAwLjEzMDEyN0gyNTZaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEyMS42MDEgMjE3LjczMkwxMzkuNjUgMTkyLjEzNEMxNDIuNDY1IDE4OC4xNjYgMTQ3LjA3NiAxODUuNzM0IDE1Mi4wNjcgMTg1LjczNEgyNDkuNjA0VjIxNy43MzZIMTIxLjYwMVYyMTcuNzMyWiIvPjwvc3ZnPg==)](https://zcode.z.ai/)
 
-> Config-driven **Dart AOT snapshot** debug-info exporter. No Dart SDK, never runs the target: locates the embedded snapshot inside Mach-O / ELF / PE and exports the same symbols and structs as [blutter](https://github.com/worawit/blutter).
+> Config-driven **Dart AOT snapshot** analyzer and debug-info exporter. No Dart SDK, never runs the target: locates the embedded snapshot inside Mach-O / ELF / PE, exports the same symbols and structs as [blutter](https://github.com/worawit/blutter) for IDA / radare2 / Frida, and **decompiles functions into Dart that `dart analyze` accepts**. Covers desktop *and* real-device mobile (compressed-pointer) builds.
 
 Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `dart compile aot-snapshot` (Dart 2.7+ cluster snapshots).
 
 ## Features
 
 - **Self-contained & auto-detecting** — all 26 SDK profiles plus **21 compressed-pointer variants** are embedded; the Dart version is matched by snapshot hash and the variant (`compressed-pointers`, i.e. every mobile Flutter build) from the snapshot's own features string, with a structural-probe fallback for custom/Flutter-engine builds. Verified against real Flutter apps: Android arm64 (Reqable 3.3.4, Lark 3.6.1, ChatGLM 3.11.6, CHSI 3.7.2, Weibo 2.19.6) and macOS arm64 — for the five Android builds the instructions-table entry count matches aotopsy exactly (57 960 / 79 327 / 30 782 / 19 752 / 22 623), all at zero warnings, and Lark and Weibo decompile to `dart analyze`-clean Dart.
+- **Decompiles to valid Dart** — lift → CFG → structured emission, not a disassembly dump: loops,
+  `if/else`, `break`/`continue`, object-pool literals inlined at their load site, recovered field
+  names as attribution comments. Across 26 artifacts (291 files, 24 253 functions) the output
+  analyses with **0 `dart analyze` errors**, and on real apps it holds up too — Lark 3.6.1 at 95.9%
+  structured and Weibo 2.19.6 at 91.1% (19 053 functions, 1.53 M statements), both error-free.
+  Irreducible control flow keeps an explicit `gotoLabel` and a `NOTE` header rather than being
+  silently flattened. See [Decompiler](#decompiler-experimental).
 - **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference).
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
 - **Progressive mode** — `dae libs` / `classes` / `functions` / `strings` / `callers` to query the

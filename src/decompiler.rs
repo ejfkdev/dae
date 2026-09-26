@@ -3674,6 +3674,14 @@ fn subst_regs(text: &str, pending: &BTreeMap<String, (String, usize, u64)>, rl: 
         {
             continue;
         }
+        // 池里的**字符串字面量**不能替换进算术表达式。寄存器持有的是池槽的**地址**，
+        // 而字面量是「那个地址上存的内容」，两者不是同一个东西；替换进 `base + index*8 + disp`
+        // 之后 Dart 会读成 `String + int` → `argument_type_not_assignable`（实测 2.18.1 语料
+        // 命中）。字面量在它被载入的那一行照常显示（`rax = " fib(20)=" /* pp+0x1e08 */`），
+        // 那才是它该出现的地方；后续引用保持寄存器名。不含算术的引用（如 `call(x0)`）仍替换。
+        if e.starts_with('"') && s.contains(['+', '*', '-']) {
+            continue;
+        }
         s = replace_word(&s, n, &format!("({e})"));
     }
     let _ = rl;

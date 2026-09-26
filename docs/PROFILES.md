@@ -6,7 +6,8 @@ Struct layouts are a separate, compile-time tier: `profiles/struct/*.h` holds th
 
 ## 1. SDK profile (`profiles/sdk/*.json`)
 
-Keyed by `(Dart version, word_size, compressed_pointers)`. All 26 versions in `profiles/sdk/` (1.24.3 → 3.14β) are **compiled into the binary**: at runtime `dae` matches the exact version by snapshot version fingerprint (32-byte hash, see `version_hashes.json`); on a miss it runs structural probes against the embedded versions with fill scoring (see `src/profile/detect.rs`). The byte-comparison baseline is `dart-3.3.4-w64-no-compressed.json` (a macOS Flutter app / arm64 / 3.3.4 / no pointer compression / `--obfuscate` — full comparison passed).
+Keyed by `(Dart version, word_size, compressed_pointers)`. All 26 versions in `profiles/sdk/` (1.24.3 → 3.14β), as **47 files** once the 21 compressed-pointer
+variants are counted, are **compiled into the binary**: at runtime `dae` matches the exact version by snapshot version fingerprint (32-byte hash, see `version_hashes.json`); on a miss it runs structural probes against the embedded versions with fill scoring (see `src/profile/detect.rs`). The byte-comparison baseline is `dart-3.3.4-w64-no-compressed.json` (a macOS Flutter app / arm64 / 3.3.4 / no pointer compression / `--obfuscate` — full comparison passed).
 
 Top-level fields (`SdkProfile`; serde definition in `src/profile/mod.rs`):
 
@@ -64,6 +65,36 @@ Snapshot-format differences that used to be engine code branches; all serde-defa
 | `typed_data_first/count/stride` | TypedData classification: slot=(cid-first)/stride, rem=(cid-first)%stride |
 | `typed_data_elem_widths/var_rem/view_rem` | elem widths per slot; rem ∈ var_rem → variable-length, view_rem → view |
 | `string_cid`(92) / `one_byte_string_cid`(93) / `two_byte_string_cid`(94) | string decoding |
+
+### 1.3 Fields whose presence depends on the version
+
+The generator starts from the 3.3.4 baseline and remaps class ids for other versions. Remapping
+does **not** remove fields that a given version's serializer never wrote, so every one of these had
+to be pinned per version by reading that version's `app_snapshot.cc`. Get one wrong and the whole
+snapshot drifts from that cluster onward — silently, with `warnings 0`.
+
+| Cluster | Field | Present from | Layout consequence |
+|---|---|---|---|
+| `TypeParameter` | `base_`/`index_` as `uint8` vs `uint16` | `int32 + 3×uint8` ≤2.19; `int32 + 2×uint16 + uint8` 3.0; `2×uint16 + uint8` ≥3.2 | 1 svarint + 3 raw bytes / 3 svarints + 1 byte / 2 svarints + 1 byte |
+| `Function` | `packed_fields_` | written unconditionally ≤2.17; moved inside `if (kind != kFullAOT)` from **2.18** | 2 trailing svarints ≤2.17, 1 from 2.18 |
+| `SubtypeTestCache` | `num_inputs`, `num_occupied` | **3.2.0** | `refs(1)` only before that |
+| `FfiTrampolineData` | `ffi_function_kind_` | **3.2.0** | no trailing byte before that |
+| `Type` | trailing `combined` byte | present 2.15–2.18, gone from **2.19** | `refs(3) + uvarint + byte` vs `refs(3) + uvarint` |
+
+Two encoding rules from `datastream.h` are easy to get backwards and cost hours:
+
+- `Serializer::Write<T>` is documented as "raw data", but `Raw<sizeof(T),T>` only writes a genuine
+  raw byte when `sizeof(T) == 1`. `Raw<2>/Raw<4>/Raw<8>` forward to `BaseWriteStream::Write<T>`,
+  which is a **varint**. So `Write<uint8_t>` is raw; `Write<uint16_t>` / `Write<int32_t>` /
+  `Write<int64_t>` / `Write<double>` are varints. Only `WriteFixed<T>` is fixed-width.
+- `WriteUnsigned` sets the high bit on the **terminator**, not on continuation bytes
+  (`kEndUnsignedByteMarker = 255 − 127 = 0x80`) — the inverse of standard ULEB128. Encoding a
+  length as ULEB128 while searching for it yields plausible-looking false hits.
+
+`check_profiles.sh` regenerates all 47 files (26 versions × word size, plus 21 compressed-pointer
+variants; 2.7/2.10/2.12 predate pointer compression) from SDK source and diffs them, so a
+hand-edited or stale profile fails. It hard-codes the expected compressed-variant count: "the file
+isn't there, so skip it" is the same false-pass shape the analyze gates closed.
 
 ## 2. Platform profile (`profiles/platform/*.json`)
 

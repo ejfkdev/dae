@@ -9,13 +9,19 @@
 [![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTE4IiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDI1NiAyMTgiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMzQuNCAwLjEzMDE1MkwxMTEuNDggMjUuNjAyMkMxMTEuNjY1IDI5LjU2OTkgMTA5LjA1NCAzMi4wMDE5IDEwNC4wNjQgMzIuMDAxOUg2LjM5OTlWMEM2LjM5OTkgMC4xMzAxNDkgMTM0LjQgMC4xMzAxNTIgMTM0LjQgMC4xMzAxNTJaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTI1NiAwLjEzMDEyN0wxMDIuNDAxIDIxNy43MzJIMDBMMTUzLjU5OSAwLjEzMDEyN0gyNTZaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEyMS42MDEgMjE3LjczMkwxMzkuNjUgMTkyLjEzNEMxNDIuNDY1IDE4OC4xNjYgMTQ3LjA3NiAxODUuNzM0IDE1Mi4wNjcgMTg1LjczNEgyNDkuNjA0VjIxNy43MzZIMTIxLjYwMVYyMTcuNzMyWiIvPjwvc3ZnPg==)](https://zcode.z.ai/)
 
-> 配置驱动的 **Dart AOT 快照**调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位内嵌快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的符号与结构。
+> 配置驱动的 **Dart AOT 快照**分析与调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位内嵌快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的符号与结构供 IDA / radare2 / Frida 使用，并**把函数反编译成 `dart analyze` 认可的 Dart**。覆盖桌面**与**真机移动端（压缩指针）产物。
 
 适用于任意 Dart AOT 产物——Flutter release 构建、`dart compile exe`、`dart compile aot-snapshot`（Dart 2.7+ cluster 快照）。
 
 ## 特性
 
 - **开箱即用、自动识别**——26 份 SDK profile + **21 份压缩指针变体**内嵌进二进制；按快照哈希匹配版本，变体（`compressed-pointers`，即所有移动端 Flutter 构建）按快照自带的 features 串自动选中，自定义/Flutter 引擎构建走结构探针兜底。已在真机应用上实测：Android arm64（Reqable 3.3.4、飞书 3.6.1、ChatGLM 3.11.6、学信网 3.7.2、微博 2.19.6）与 macOS arm64——五个安卓产物的指令表表项数与 aotopsy **完全一致**（57 960 / 79 327 / 30 782 / 19 752 / 22 623），全部 0 警告；飞书与微博的反编译产物还能通过 `dart analyze`（0 错误）。
+- **反编译产出合法 Dart**——lift → CFG → 结构化发射，不是反汇编转储：循环、`if/else`、
+  `break`/`continue`、对象池字面量在其载入处内联、恢复出的字段名以归属注释形式标注。
+  26 份语料（291 个文件、24 253 个函数）的产物 **`dart analyze` 错误为 0**；真机应用同样站得住——
+  飞书 3.6.1 结构化 95.9%、微博 2.19.6 结构化 91.1%（19 053 个函数、153 万条语句），两者均 0 错误。
+  不可归约的控制流保留显式 `gotoLabel` 并在函数头打 `NOTE`，绝不静默压平。
+  见[反编译器](#反编译器实验性)。
 - **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
 - **渐进式模式**——`dae libs`/`classes`/`functions`/`strings`/`callers` 像查数据库一样查快照，

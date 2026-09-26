@@ -20,8 +20,11 @@ functions still carry a `goto`, how many object-pool literals got inlined, and w
   trailing `_<digits>` code indices, all-digit tokens and the dialect words
   `Precompiled_` / `init` / `new` are stripped from both sides; then every remaining token of the
   *ground truth* name must appear in the tool's name. Each tool additionally reports ~90% under
-  **its own** dialect-aware rule (dae's `tests/ground_truth.rs` gate: 90.6%; aotopsy's README:
-  90.2%) — the uniform rule here lands lower for both, which is expected and fair.
+  **its own** dialect-aware rule (dae's `tests/ground_truth.rs` gate: 89.4% over six corpora —
+  it was 90.6% over three before `hello_2.18.1`/`hello_2.19.6`/`hello_3.0.0` were added, and the
+  drop is the arithmetic of a wider, harder sample set, not a regression: `hello_2.19.6` alone went
+  from 558 to 1 081 agreeing names; aotopsy's README: 90.2%) — the uniform rule here lands lower
+  for both, which is expected and fair.
 - **Validity is `dart analyze`**, errors only, split into syntax-class and semantic-class codes.
   aotopsy's README claims "100% valid Dart" measured by "every emitted pseudocode function parses"
   (`TestDecompileQualityCorpus`) — that is a *parse* check, so the semantic column below is not
@@ -118,8 +121,14 @@ dae /tmp/android/libapp.so out/          # auto-detects dart/3.3.4 + w32-compres
 | Reqable (Android) | 3.3.4 | 57,960 table entries, 496 libs, 1,141 classes, **0 warnings** | 57,960 functions / 8,216 classes |
 | ChatGLM | 3.11.6 | 30,782 entries, 1,211 libs, 4,603 classes | 30,782 / 5,501 |
 | 学信网 (CHSI) | 3.7.2 | 19,752 entries, 875 libs, 3,256 classes | 19,752 / 3,819 |
-| 飞书 Lark | 3.6.1 | parses, still drifts before the object pool (open) | 79,327 / 12,929 |
-| 微博 Weibo | 2.19.6 | same class of residue (open) | 22,623 / 4,232 |
+| 飞书 Lark | 3.6.1 | **79,327 entries**, 1,418 libs, 2,868 classes, **0 warnings** | 79,327 / 12,929 |
+| 微博 Weibo | 2.19.6 | **22,623 entries**, 750 libs, 3,671 classes, **0 warnings** | 22,623 / 4,232 |
+
+Both were fixed in v0.1.4; every one of the five now matches aotopsy's entry count exactly. Lark
+and Weibo also decompile end to end — 3,517 and 19,053 function blocks, 95.9% and 91.1% structured,
+1 unmapped line each, `dart analyze` **error=0** (Weibo emits 1.53 M statements across 263 k blocks).
+Their remaining diagnostics are `unused_local_variable` / `dead_code` warnings, which trace to call
+sites not showing arguments — see the backlog below, not to parse quality.
 
 Reqable's Android build also decompiles: **1,707 functions, 95.5% fully structured, 0
 `dart analyze` errors**, and 227 field names recovered from accessor symbols — 144 of them agree

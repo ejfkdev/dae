@@ -78,32 +78,39 @@ Fix history, in the order the analyzer found them (counts are for one real Flutt
 | conditions and `Node::Line` sanitising | 4 | `qword ptr [..]` inside `if (…)` |
 | keyword/`print`/pair-store fixes | **0** | — |
 
-## Baseline (2026-09-26)
+## Baseline (2026-09-27)
 
-27 artifacts: every SDK sample in `dart/dart_samples/artifacts/` plus a real Flutter app
+26 artifacts: every SDK sample in `dart/dart_samples/artifacts/` plus a real Flutter app
 (`testing_app`, macOS arm64, 10,245 functions). `structured`/`unstructured` are function counts;
-`unmapped` counts instructions kept verbatim as `// unmapped:`.
+`unmapped` counts instructions kept verbatim as `// unmapped:`. Totals as measured by
+`cargo test --release --test dart_valid -- --ignored --nocapture`: **291 files, 24 253 functions,
+0 `dart analyze` errors**.
+
+`hello_2.18.1` is listed at 27 functions because that version **does not currently parse** — see
+Known limitations in the README. It is kept in the table rather than dropped so the collapse stays
+visible; `tests/ground_truth.rs` registers it in `KNOWN_COLLAPSED` and `FUNC_FLOOR` fails any new
+sample that drops below 400 functions.
 
 | sample | files | functions | structured | unmapped | analyze errors |
 |---|---|---|---|---|---|
 | hello_3.13.0 | 15 | 1174 | 1047 (89%) | 166 | 0 |
 | hello_3.12.2 | 15 | 1176 | 1049 (89%) | 166 | 0 |
 | hello_3.14b | 15 | 1161 | 1035 (89%) | 166 | 0 |
-| hello_3.11.6 | 15 | 1133 | 1015 (89%) | 149 | 0 |
+| hello_3.11.6 | 15 | 1133 | 1015 (90%) | 149 | 0 |
 | hello_3.10.9 | 14 | 1104 | 987 (89%) | 149 | 0 |
-| hello_3.9.4 | 14 | 1106 | 991 (89%) | 155 | 0 |
-| hello_3.8.3 | 14 | 1103 | 988 (89%) | 155 | 0 |
+| hello_3.9.4 | 14 | 1106 | 991 (90%) | 155 | 0 |
+| hello_3.8.3 | 14 | 1103 | 988 (90%) | 155 | 0 |
 | hello_3.7.2 | 14 | 1111 | 994 (89%) | 155 | 0 |
 | hello_3.6.1 | 14 | 1108 | 1002 (90%) | 1 | 0 |
 | hello_3.5.0 | 13 | 1111 | 1005 (90%) | 1 | 0 |
-| hello_3.4.0 | 13 | 1138 | 1034 (90%) | 1 | 0 |
-| hello_3.3.4 (appended ELF blob) | 14 | 1130 | 1026 (90%) | 1 | 0 |
-| hello_3.2.0 | 14 | 1143 | 1026 (89%) | 152 | 0 |
+| hello_3.4.0 | 13 | 1138 | 1034 (91%) | 1 | 0 |
+| hello_3.3.4 (appended ELF blob) | 14 | 1130 | 1026 (91%) | 1 | 0 |
+| hello_3.2.0 | 14 | 1143 | 1026 (90%) | 152 | 0 |
 | hello_3.0.0 | 15 | 1207 | 1088 (90%) | 33 | 0 |
-| hello_2.19.6 | 2 | 229 | 212 (92%) | 4 | 0 |
-| hello_2.18.1 | 2 | 254 | 233 (91%) | 1 | 0 |
+| hello_2.19.6 | 15 | 1240 | 1117 (90%) | 31 | 0 |
+| hello_2.18.1 | 1 | 27 | 26 (96%) | 0 | 0 |
 | hello_2.17.0 | 14 | 1231 | 1112 (90%) | 23 | 0 |
-| hello_2.16.2 | 1 | 1086 | 993 (91%) | 20 | 0 |
+| hello_2.16.2 | 1 | 1089 | 996 (91%) | 26 | 0 |
 | hello_2.15.0 | 13 | 1167 | 1051 (90%) | 25 | 0 |
 | hello_2.14.4 (appended ELF blob) | 14 | 1123 | 1011 (90%) | 25 | 0 |
 | hello_2.13.4 (appended ELF blob) | 17 | 1259 | 1125 (89%) | 40 | 0 |
@@ -149,6 +156,13 @@ Verified against source on both architectures: `"Testing Sample"` (from the app'
 `lib/main.dart`) appears three times in its output, `"Hello"` and `" fib(20)="` from
 `hello.dart` appear in the 2.15.0 one. Counts of inlined literals: app 1922, hello_3.13.0 556,
 hello_2.15.0 579, hello_2.13.4 448, hello_3.3.4 403.
+
+**A string literal is never folded into an arithmetic expression.** The register holds the *address*
+of the pool slot; the literal is what lives *at* that address — substituting one for the other is a
+category error, and Dart rejects the result: `mem((" fib(20)=") + rdx*8 + 0x17)` is `String + int`,
+i.e. `argument_type_not_assignable`. That is exactly how `hello_2.18.1` produced the corpus's only
+analyze error. The literal still appears on the line that loads it, which is where it belongs, and
+non-arithmetic uses (`call(x0)`) are still substituted.
 
 Three things this needed, each found by a wrong result first:
 
