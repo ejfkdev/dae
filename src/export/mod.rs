@@ -8,6 +8,8 @@
 //! 3. frida 模板的 PointerCompressedEnabled/CompressedWordSize/HeapAddressReg 按 Profile 重写。
 
 pub mod frida;
+/// 未具名条目（指令表里 idx < first_entry 的 stub 前缀）的索引产物
+pub mod stubs;
 pub mod ida;
 pub mod ppobjs;
 pub mod r2;
@@ -37,6 +39,8 @@ pub struct ExportSummary {
     /// (参与函数数, 直接边, 间接调用点)；未启用 asm 特性时为 None
     /// (函数数, 直接边, 已解析直接边, 间接调用点)
     pub callgraph: Option<(usize, usize, usize, usize)>,
+    /// (指令表里无 Code 对象的条目数, 其中解出名字的个数)
+    pub stubs: Option<(usize, usize)>,
 }
 
 /// DART_AOT_TIMINGS=1 时打印导出阶段耗时
@@ -90,12 +94,19 @@ pub fn run_with(
         #[cfg(feature = "asm")]
         Asm(Result<usize, String>),
         PpObjs(Result<(usize, usize), String>),
+        Stubs(Result<stubs::StubCounts, String>),
         TextInfo(Result<textinfo::TextInfoCounts, String>),
         #[cfg(feature = "asm")]
         CallGraph(Result<callgraph::CallGraphCounts, String>),
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
+        {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let _ = tx.send(TaskDone::Stubs(stubs::write(analyzer, out_dir)));
+            });
+        }
         {
             let tx = tx.clone();
             scope.spawn(move || {
@@ -153,6 +164,7 @@ pub fn run_with(
     let mut n_frida = 0usize;
     let mut n_pp = 0usize;
     let mut n_objs = 0usize;
+    let mut stub_counts: Option<stubs::StubCounts> = None;
     #[allow(unused_mut)]
     let mut asm_functions = 0usize;
     let mut textinfo: Option<textinfo::TextInfoCounts> = None;
@@ -165,6 +177,10 @@ pub fn run_with(
             TaskDone::Frida(Ok(n)) => n_frida = n,
             #[cfg(feature = "asm")]
             TaskDone::Asm(Ok(n)) => asm_functions = n,
+            TaskDone::Stubs(Ok(sc)) => {
+                stub_counts = Some(sc);
+            }
+            TaskDone::Stubs(Err(e)) => return Err(e),
             TaskDone::PpObjs(Ok((p, o))) => {
                 n_pp = p;
                 n_objs = o;
@@ -206,6 +222,7 @@ pub fn run_with(
             maps: 0,
         }),
         callgraph: cg,
+        stubs: stub_counts.map(|s| (s.total, s.named)),
     })
 }
 

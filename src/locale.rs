@@ -102,6 +102,8 @@ pub struct Messages {
     pub sum_structured: &'static str,
     pub sum_unstructured: &'static str,
     pub sum_lines: &'static str,
+    /// 指令表里无 Code 对象的条目（stub 前缀）
+    pub sum_stubs: &'static str,
     pub sum_calls: &'static str,
     pub sum_named: &'static str,
     /// 筛选（--lib/--class/--func）后一个都没命中
@@ -175,6 +177,7 @@ pub fn messages(lang: Lang) -> Messages {
         sum_structured: p("已结构化", "structured"),
         sum_unstructured: p("未结构化", "unstructured"),
         sum_lines: p("行", "lines"),
+        sum_stubs: p("个无 Code 对象的条目", "entries without a Code object"),
         sum_calls: p("个直接调用", "direct calls"),
         sum_named: p("已命名", "named"),
         err_no_match: p(

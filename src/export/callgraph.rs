@@ -404,6 +404,13 @@ fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
 /// 目标寄存器必须同一个，且必须带 `lsl #16`——否则第二次写是覆盖而非拼接）；
 /// x64 形如 `mov r8d, imm32` + `call ...`（tag 字直接用 32 位立即数装载）。
 /// 解出的 cid 只有命中已知类名才返回名字，否则 None（**不猜**）。
+/// stub 命名：解析 prologue 里物化的 class-id tag 字，得到它操作的**类**。
+///
+/// 两类 stub 的 prologue 是同一个形状（先物化 cid），区别在**之后**：
+/// * `mov r8d, <tag>; jmp <分配器>`（arm64 `mov/movk; b`）——**立刻转移**，是分配 stub；
+/// * `mov r8d, <tag>; je ..; cmp r8d, <运行期 cid>; jne <慢路径>`——**就地比较**，
+///   是类型测试 stub（实测 x64 语料里 176 个 stub 有 88 个是这类，名字即被测类）。
+/// 所以按「tag 物化之后是否立即无条件转移」分流，两条都只输出**解出来的**类名。
 fn alloc_stub_name(analyzer: &Analyzer, cs: &Capstone, addr: u64, is_arm64: bool) -> Option<String> {
     let foff = addr + analyzer.slice_off;
     let data = analyzer.data;
@@ -414,29 +421,58 @@ fn alloc_stub_name(analyzer: &Analyzer, cs: &Capstone, addr: u64, is_arm64: bool
     let code = &data[foff as usize..end as usize];
     let insns = cs.disasm_all(code, addr).ok()?;
     let v: Vec<_> = insns.iter().collect();
-    let (i0, i1) = (*v.first()?, *v.get(1)?);
-    let m0 = i0.mnemonic()?.to_ascii_lowercase();
-    if m0 != "mov" {
+    let mnem = |i: usize| -> String {
+        v.get(i)
+            .and_then(|x| x.mnemonic())
+            .map(|m| m.to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let ops = |i: usize| -> String {
+        v.get(i).and_then(|x| x.op_str()).unwrap_or("").to_string()
+    };
+    // tag 物化可能在 0 或 1 号指令：类型测试 stub 前面先有一条守卫
+    // （x64 `test al, 1`、arm64 `tbnz w0, #0, …`）——不跳过它就会整类漏掉。
+    let start = if mnem(0) == "mov" {
+        0
+    } else if mnem(1) == "mov" {
+        1
+    } else {
         return None;
-    }
-    let o0 = i0.op_str()?;
+    };
+    let (o0, o1) = (ops(start), ops(start + 1));
     let tag = if is_arm64 {
-        if i1.mnemonic()?.to_ascii_lowercase() != "movk" {
+        if mnem(start + 1) != "movk" {
             return None;
         }
-        let o1 = i1.op_str()?;
         let d0 = o0.split(',').next()?.trim();
         if o1.split(',').next()?.trim() != d0 || !o1.contains("lsl #16") {
             return None;
         }
-        first_imm(o0)? | (first_imm(o1)? << 16)
+        first_imm(&o0)? | (first_imm(&o1)? << 16)
     } else {
-        let m1 = i1.mnemonic()?.to_ascii_lowercase();
-        if m1 != "call" && m1 != "jmp" {
+        // x64：tag 之后可以是 `jmp/call <分配器>`（thunk）或直接比较（类型测试）
+        if !o0.contains("0x") && !o0.chars().any(|c| c.is_ascii_digit()) {
             return None;
         }
-        first_imm(o0)?
+        first_imm(&o0)?
     };
+    // 只认**分配 stub**：它的 prologue 把完整 tag 字物化出来（`mov r8d, 0x1e50204`），
+    // 右移 cid_tag_pos 即类 id，且紧接着无条件转移到分配器。
+    //
+    // 类型测试 stub 看起来像同一个形状（先物化一个 cid 再比较），但它物化/比较的是**裸 cid**，
+    // 而且前面的 `mov r8d, 0x31`（49 = `_Smi`）只是 Smi 分支的初值。按"第一个能对上类名的立即数"
+    // 去猜会**编造**：实测 12 个候选里 4 个是错的（把 iso 分配桩 `AllocateMintShared*Stub`
+    // 与 `AllocateContextStub` 命名成了类型测试，还有 1 个认成了 `_Smi`）。
+    // 真值对拍直接抓出来了——所以这里退回"只命名能证明的"，类型测试 stub 留空
+    // （正确做法是走对象池：Type 条目的 `type_test_stub_` 字段指向 stub，见 docs/COMPARISON）。
+    let transfer = if is_arm64 {
+        matches!(mnem(start + 2).as_str(), "b" | "br")
+    } else {
+        matches!(mnem(start + 1).as_str(), "jmp" | "call")
+    };
+    if !transfer {
+        return None;
+    }
     let tg = &analyzer.profile.tagging;
     let cid = (tag >> tg.cid_tag_pos) & tg.cid_tag_mask;
     let name = analyzer.cname_by_cid.get(&(cid as i64))?;

@@ -110,7 +110,7 @@ export done -> /绝对路径/to/out:
 | SDK profile | `profiles/sdk/*.json` | cid 枚举、字段布局（fill DSL）、tagging、偏移 |
 | 平台 profile | `profiles/platform/*.json` | 容器解析、符号名、寄存器角色 |
 
-规范见 [`docs/PROFILES.zh.md`](docs/PROFILES.zh.md) · 反编译基线见 [`docs/DECOMPILER.zh.md`](docs/DECOMPILER.zh.md)。
+规范见 [`docs/PROFILES.zh.md`](docs/PROFILES.zh.md) · 反编译基线见 [`docs/DECOMPILER.zh.md`](docs/DECOMPILER.zh.md) · 与 aotopsy 的实测对照见 [`docs/COMPARISON.zh.md`](docs/COMPARISON.zh.md)。
 
 ## 渐进式（先查清单，再定点反编译）
 

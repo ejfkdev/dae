@@ -244,6 +244,9 @@ fn run(
     println!("  text/functions.txt        {} {}", summary.textinfo.functions, s.sum_funcs);
     println!("  text/arrays.txt           {} {}", summary.textinfo.arrays, s.sum_arrays);
     println!("  text/maps.txt             {} {}", summary.textinfo.maps, s.sum_maps);
+    if let Some((total, named)) = summary.stubs {
+        println!("  text/stubs.txt            {total} {}（{named} {}）", s.sum_stubs, s.sum_named);
+    }
     if let Some((_f, d, dr, i)) = summary.callgraph {
         println!(
             "  call_edges.txt            {} {} + {} {}（{} {}）",

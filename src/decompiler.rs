@@ -2008,6 +2008,19 @@ pub fn render(
     // 指令表里所有入口都补一个名字：有 Code 对象但没解析出名字的（匿名闭包等）
     // 用 `sub_0x...` 占位——`call 0x171018` 这种裸地址读起来无从下手，
     // 而 `call sub_0x171018` 至少表明「这是一个函数入口，只是没有名字」。
+    // 「没有被 Code 对象认领」的表项 = stub（分配/类型测试/dispatch 桩）。分配 stub 的
+    // 类名可以直接从它的序言解出来（callgraph 里那套、有零编造门禁），解出来就用在调用点上：
+    // `call sub_0xfb68` → `call AllocationStub_UnsupportedError`。解不出的保持 `sub_0x..`。
+    let claimed: BTreeSet<usize> = analyzer.func_eps.values().map(|(_, idx)| *idx).collect();
+    let stub_eps: Vec<u64> = (0..analyzer.pc_offsets.len())
+        .filter(|i| !claimed.contains(i))
+        .filter_map(|i| analyzer.code_range(i).map(|(ep, _)| ep))
+        .collect();
+    for (ep, name) in crate::export::callgraph::alloc_stubs_at(analyzer, &stub_eps) {
+        if let Some(n) = name {
+            names.insert(ep, n);
+        }
+    }
     for idx in 0..analyzer.pc_offsets.len() {
         if let Some((ep, _)) = analyzer.code_range(idx) {
             names.entry(ep).or_insert_with(|| format!("sub_{ep:#x}"));

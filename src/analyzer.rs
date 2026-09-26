@@ -328,14 +328,20 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// 函数 code_index → entry（file-offset 空间）。stub（idx < first_entry）返回 None。
+    /// 函数 code_index → entry（file-offset 空间）。
+    ///
+    /// 返回 None = 这个 Code 对象不指向可反汇编的真实函数体：`ci <= code_base_ref` 的是
+    /// **stub 段**的 Code（分配 stub / 类型测试 stub / dispatch 桩，实测 167 个），
+    /// `idx < first_entry` 的是分发表桩。它们的**入口地址在指令表里是有的**，只是没有
+    /// 独立的函数体——所以 `export/stubs.rs` 会把这些「无人认领的表项」如实列出来，
+    /// 能解出类名的（分配 stub）就写上名字。
     pub fn entry_for(&self, ci: u64) -> Option<(u64, usize)> {
         if ci <= self.code_base_ref {
             return None;
         }
         let idx = (ci - self.code_base_ref - 1) as usize;
         if (idx as u64) < self.first_entry {
-            return None; // 分发表 stub（无真实代码，blutter 不命名）
+            return None;
         }
         if idx >= self.pc_offsets.len() {
             return None;
@@ -349,6 +355,39 @@ impl<'a> Analyzer<'a> {
     }
 
     fn build_name_by_ep(&mut self) {
+        // 诊断：Code 对象为什么没能映射到指令表条目（覆盖率缺口归因）
+        if std::env::var("DART_AOT_VERBOSE").is_ok() {
+            let (mut c_le_base, mut c_idx_lt_first, mut c_oob, mut c_floor, mut c_ok) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            for f in self.iso.functions.values() {
+                let ci = f.code_index;
+                if ci <= self.code_base_ref {
+                    c_le_base += 1;
+                    continue;
+                }
+                let idx = (ci - self.code_base_ref - 1) as usize;
+                if (idx as u64) < self.first_entry {
+                    c_idx_lt_first += 1;
+                    continue;
+                }
+                if idx >= self.pc_offsets.len() {
+                    c_oob += 1;
+                    continue;
+                }
+                let ep = self.instr_base + self.pc_offsets[idx] + self.entry_offset(idx);
+                if ep < self.platform.code_floor {
+                    c_floor += 1;
+                    continue;
+                }
+                c_ok += 1;
+            }
+            eprintln!(
+                "[dbg-map] code_obj: ok={c_ok} ci<=base={c_le_base} idx<first_entry={c_idx_lt_first} idx_oob={c_oob} below_floor={c_floor}; table={} first_entry={} base_ref={}",
+                self.pc_offsets.len(),
+                self.first_entry,
+                self.code_base_ref
+            );
+        }
         for (&ref_, f) in self.iso.functions.iter() {
             if let Some(ep_idx) = self.entry_for(f.code_index) {
                 self.func_eps.insert(ref_, ep_idx);

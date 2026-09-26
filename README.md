@@ -110,7 +110,7 @@ Three layers; the engine is version-invariant, versions add configuration only:
 | SDK profile | `profiles/sdk/*.json` | cid enums, field layouts (fill DSL), tagging, offsets |
 | Platform profile | `profiles/platform/*.json` | container parser, symbol names, register roles |
 
-Spec: [`docs/PROFILES.md`](docs/PROFILES.md) · Decompiler baseline: [`docs/DECOMPILER.md`](docs/DECOMPILER.md)
+Spec: [`docs/PROFILES.md`](docs/PROFILES.md) · Decompiler baseline: [`docs/DECOMPILER.md`](docs/DECOMPILER.md) · Measured against aotopsy: [`docs/COMPARISON.md`](docs/COMPARISON.md)
 
 ## Progressive mode (list first, decompile one thing)
 
