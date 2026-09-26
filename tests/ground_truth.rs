@@ -17,6 +17,24 @@ use std::path::{Path, PathBuf};
 
 const NAME_FLOOR: f64 = 0.80;
 
+/// 健康度下限：解析**塌陷**（`libraries=1 / classes=1` 那种）会让恢复出的函数数掉一个
+/// 数量级，而 dae 自己 `warnings=0`——静默劣化，正是本仓库反复吃亏的形态。
+/// hello 系列健康样本是 1282–1447 个函数，塌陷时是 63 个，400 这个下限把两者干净分开。
+const FUNC_FLOOR: usize = 400;
+
+/// 已知塌陷且原因未定位的样本。登记在这里是为了**不让它掩盖新的塌陷**，
+/// 而不是承认它正常。
+///
+/// - `hello_2.18.1`：Function 的 fill 尾部按源码判定应与 2.19.6 逐字相同
+///   （`WriteFill` 两版 diff 为空、`UntaggedFunction` 字段范围相同、都是 product 构建），
+///   即 refs(4) + code_index + kind_tag = **1 个 svarint**；2.15–2.17 才是 2 个
+///   （那三版的 `packed_fields_` 写在 `kind != kFullAOT` 条件块**之外**）。
+///   1-svarint 让 2.19.6 从 630 → 1318 个函数、并让真机微博 2.19.6 解析出与 aotopsy
+///   完全相同的 22 623 个表项；但同一布局下 2.18.1 会塌陷。旧布局（2 svarint）下
+///   2.18.1 也只有 `classes=2`（健康值约 320），**本来就是坏的**——多出的那个 svarint
+///   只是在补偿另一处尚未定位的布局错误。
+const KNOWN_COLLAPSED: &[&str] = &["hello_2.18.1"];
+
 /// 语料：路径 + SDK/平台 profile（与 scripts/regress_all.sh 的样本表一致）
 /// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
 ///
@@ -37,9 +55,11 @@ fn corpus() -> Vec<(&'static str, PathBuf, &'static str, &'static str)> {
         ("T4_blank", root.join("testing/variants/T4_blank/libapp.so"), "dart-2.12.4-w64-no-compressed.json", "elf-x64.json"),
         ("hello_2.15.0", root.join("dart/dart_samples/artifacts/hello_2.15.0.aot"), "dart-2.15.0-w64-no-compressed.json", "elf-x64.json"),
         ("hello_2.16.2", root.join("dart/dart_samples/artifacts/hello_2.16.2.aot"), "dart-2.16.2-w64-no-compressed.json", "elf-x64.json"),
-        // 2.19.6 自带 .symtab（1 619 个符号），是 TypeParameter fill 布局按版本分段
-        // 这条改动的独立真值——regress 存档是 dae 自己产的，无法裁决自身对错。
+        // 以下四个样本都自带 .symtab，是「2.15–3.0 的 fill 布局逐版核源码」这批改动的
+        // 独立真值——regress 存档由 dae 自己产出，无法裁决自身对错；符号表可以。
+        ("hello_2.18.1", root.join("dart/dart_samples/artifacts/hello_2.18.1.aot"), "dart-2.18.1-w64-no-compressed.json", "elf-x64.json"),
         ("hello_2.19.6", root.join("dart/dart_samples/artifacts/hello_2.19.6.aot"), "dart-2.19.6-w64-no-compressed.json", "elf-x64.json"),
+        ("hello_3.0.0", root.join("dart/dart_samples/artifacts/hello_3.0.0.aot"), "dart-3.0.0-w64-no-compressed.json", "elf-x64.json"),
     ]
 }
 
@@ -317,6 +337,16 @@ fn symtab_differential() {
             syms.len(),
             rate * 100.0
         );
+        if !KNOWN_COLLAPSED.contains(&label) {
+            assert!(
+                funcs >= FUNC_FLOOR,
+                "{label}: 只恢复出 {funcs} 个函数（下限 {FUNC_FLOOR}）——解析很可能已塌陷\
+                 （libraries/classes 会同时塌成 1）而 dae 不报警；\
+                 若这是新的已知塌陷，必须写进 KNOWN_COLLAPSED 并附源码级原因"
+            );
+        } else {
+            println!("{label:16} ⚠ 已登记为塌陷样本（funcs={funcs} < {FUNC_FLOOR}），原因见 KNOWN_COLLAPSED 注释");
+        }
         total_cmp += cmp;
         total_agree += agree;
         total_addr_hit += hit;

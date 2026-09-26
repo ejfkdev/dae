@@ -534,7 +534,7 @@
       ]
     },
     "35": {
-      "_doc": "SubtypeTestCache: cache ref + num_inputs + num_occupied",
+      "_doc": "SubtypeTestCache(<3.2): 仅 cache ref（num_inputs/num_occupied 是 3.2.0 才加的）",
       "steps": [
         {
           "op": "refs",
@@ -868,6 +868,18 @@
     },
     "77": {
       "steps": [
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "10": {
+      "_doc": "FfiTrampolineData(<3.2): refs + callback_id，无 ffi_function_kind 字节",
+      "steps": [
+        {
+          "op": "refs",
+          "n": 4
+        },
         {
           "op": "svarint"
         }

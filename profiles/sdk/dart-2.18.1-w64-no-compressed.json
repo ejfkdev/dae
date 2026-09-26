@@ -274,6 +274,7 @@
       ]
     },
     "7": {
+      "_doc": "Function: name, owner, signature, data refs + code_index(ReadUnsigned) + kind_tag(uint32 有符号变长)",
       "steps": [
         {
           "op": "refs",
@@ -288,9 +289,6 @@
         {
           "op": "uvarint",
           "alias": "code_index"
-        },
-        {
-          "op": "svarint"
         },
         {
           "op": "svarint",
@@ -330,7 +328,7 @@
       ]
     },
     "10": {
-      "_doc": "FfiTrampolineData: 4 refs + callback_id int32 + ffi_function_kind uint8",
+      "_doc": "FfiTrampolineData(<3.2): refs + callback_id，无 ffi_function_kind 字节",
       "steps": [
         {
           "op": "refs",
@@ -338,9 +336,6 @@
         },
         {
           "op": "svarint"
-        },
-        {
-          "op": "byte"
         }
       ]
     },
@@ -530,17 +525,11 @@
       ]
     },
     "36": {
-      "_doc": "SubtypeTestCache: cache ref + num_inputs + num_occupied",
+      "_doc": "SubtypeTestCache(<3.2): 仅 cache ref（num_inputs/num_occupied 是 3.2.0 才加的）",
       "steps": [
         {
           "op": "refs",
           "n": 1
-        },
-        {
-          "op": "svarint"
-        },
-        {
-          "op": "svarint"
         }
       ]
     },
