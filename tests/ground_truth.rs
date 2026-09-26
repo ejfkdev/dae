@@ -18,6 +18,19 @@ use std::path::{Path, PathBuf};
 const NAME_FLOOR: f64 = 0.80;
 
 /// 语料：路径 + SDK/平台 profile（与 scripts/regress_all.sh 的样本表一致）
+/// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
+///
+/// 理由：`cargo test` 默认吞掉 println，而本仓库 6 个测试文件里有 5 个依赖被 gitignore 的语料
+/// （`testing/`、`dart/dart_samples/`），缺语料就静默跳过——新克隆里跑 `cargo test` 会得到
+/// 「全绿但几乎什么都没量」。维护者在自己的检出里设这个变量，任何本该执行却跳过的门禁都会炸出来。
+/// 注意：显式 opt-in（如未设 `DAE_TRUTH_ANDROID`）不属于「缺依赖」，不走这里。
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("DAE_REQUIRE_GATES").is_some() {
+        panic!("DAE_REQUIRE_GATES=1，但门禁跳过了：{msg}");
+    }
+    println!("{msg}");
+}
+
 fn corpus() -> Vec<(&'static str, PathBuf, &'static str, &'static str)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     vec![
@@ -225,7 +238,7 @@ fn alloc_stub_naming() {
         println!("{label:16} 分配 stub 真值 {n:4}  命名 {nm:4}  类名一致 {r:4}");
     }
     if total == 0 {
-        println!("alloc_stub_naming: 无语料——跳过");
+        skip_or_fail("alloc_stub_naming: 无语料——跳过");
         return;
     }
     println!(
@@ -309,7 +322,7 @@ fn symtab_differential() {
     }
 
     if ran.is_empty() {
-        println!("ground_truth: 无语料（dart/dart_samples 与 testing/variants 均缺失）——跳过");
+        skip_or_fail("ground_truth: 无语料（dart/dart_samples 与 testing/variants 均缺失）——跳过");
         return;
     }
     let rate = total_agree as f64 / total_cmp as f64;

@@ -14,6 +14,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
+///
+/// 理由：`cargo test` 默认吞掉 println，而本仓库 6 个测试文件里有 5 个依赖被 gitignore 的语料
+/// （`testing/`、`dart/dart_samples/`），缺语料就静默跳过——新克隆里跑 `cargo test` 会得到
+/// 「全绿但几乎什么都没量」。维护者在自己的检出里设这个变量，任何本该执行却跳过的门禁都会炸出来。
+/// 注意：显式 opt-in（如未设 `DAE_TRUTH_ANDROID`）不属于「缺依赖」，不走这里。
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("DAE_REQUIRE_GATES").is_some() {
+        panic!("DAE_REQUIRE_GATES=1，但门禁跳过了：{msg}");
+    }
+    println!("{msg}");
+}
+
 fn corpus(root: &Path) -> Option<PathBuf> {
     let p = root.join("testing/decompiler_corpus/sample_arm64");
     p.exists().then_some(p)
@@ -47,7 +60,7 @@ fn fn_names(text: &str) -> BTreeSet<String> {
 fn progressive_cli() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let Some(sample) = corpus(root) else {
-        println!("progressive_cli: 无语料（先跑 testing/decompiler_corpus/build.sh）——跳过");
+        skip_or_fail("progressive_cli: 无语料（先跑 testing/decompiler_corpus/build.sh）——跳过");
         return;
     };
     let bin = env!("CARGO_BIN_EXE_dae");

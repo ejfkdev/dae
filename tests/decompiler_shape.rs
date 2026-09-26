@@ -14,6 +14,19 @@ use std::path::Path;
 
 /// 把 `"..."`（含 `\` 转义）替换成 `""`，只留结构
 /// 去掉 `/* ... */` 块注释（产物里只出现在单行内；跨行块注释 dae 不产出）
+/// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
+///
+/// 理由：`cargo test` 默认吞掉 println，而本仓库 6 个测试文件里有 5 个依赖被 gitignore 的语料
+/// （`testing/`、`dart/dart_samples/`），缺语料就静默跳过——新克隆里跑 `cargo test` 会得到
+/// 「全绿但几乎什么都没量」。维护者在自己的检出里设这个变量，任何本该执行却跳过的门禁都会炸出来。
+/// 注意：显式 opt-in（如未设 `DAE_TRUTH_ANDROID`）不属于「缺依赖」，不走这里。
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("DAE_REQUIRE_GATES").is_some() {
+        panic!("DAE_REQUIRE_GATES=1，但门禁跳过了：{msg}");
+    }
+    println!("{msg}");
+}
+
 fn strip_block_comments(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -307,7 +320,7 @@ fn decompiler_shape() {
         );
     }
     if ran == 0 {
-        println!("decompiler_shape: 无语料——跳过");
+        skip_or_fail("decompiler_shape: 无语料——跳过");
     }
 }
 /// 源码对照门禁：拿 `testing/decompiler_corpus/` 里自己编的样本，
@@ -323,7 +336,7 @@ fn source_anchors() {
     let exe = dir.join("sample_arm64");
     let src = dir.join("sample.dart");
     if !exe.exists() || !src.exists() {
-        println!("source_anchors: 无语料（先跑 testing/decompiler_corpus/build.sh）——跳过");
+        skip_or_fail("source_anchors: 无语料（先跑 testing/decompiler_corpus/build.sh）——跳过");
         return;
     }
     let text = std::fs::read_to_string(&src).unwrap();
@@ -373,7 +386,7 @@ fn source_anchors() {
         });
     }
     if want.is_empty() {
-        println!("source_anchors: 源码里没提出声明——跳过");
+        skip_or_fail("source_anchors: 源码里没提出声明——跳过");
         return;
     }
 

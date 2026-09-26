@@ -214,11 +214,51 @@ compressed-pointer arm64 build under `DAE_TRUTH_ANDROID=1`), `tests/dart_valid.r
 `dart analyze`, zero errors),
 `tests/decompiler_shape.rs` (braces must balance in every emitted file — an unbalanced file means
 a branch was silently dropped — every in-function statement must terminate, a structured-rate
-floor, and **address self-consistency**: function ends look like terminators and direct calls land
-on function entries) and `tests/field_names.rs` (the two field-name routes must agree, zero
-conflicts, and every annotation in the output must exist in the recovered table — that is the
-no-fabrication check). The address gate exists because an address-location bug on appended Mach-O
-snapshots once made the decompiler read the wrong bytes while every name-based metric stayed green.
+floor, and **address self-consistency**: at least 80% of function entries must look like prologues
+and direct calls must land on function entries) and `tests/field_names.rs` (the two field-name
+routes must agree, zero conflicts, and every annotation in the output must exist in the recovered
+table — that is the no-fabrication check). The address gate exists because an address-location bug
+on appended Mach-O snapshots once made the decompiler read the wrong bytes while every name-based
+metric stayed green. Its criterion is the *prologue rate*, not "the last instruction is a
+terminator": that older check was itself fake — it was counting x64 `int3` padding and still scored
+95.7% with every address wrong. Mislocated snapshots score 51–58% on prologue rate, correct ones
+91–100%.
+
+Both `dart analyze` gates also verify their own parsing: they cross-check the error count against
+the tool's exit code (0/1/2 ⇒ none, 3 ⇒ at least one) and require its summary line to be present,
+because `dart analyze` on a missing directory exits 64 with usage text that contains no `error - `
+lines — which a naive parser reads as "0 errors" and passes. Each carries a
+`*_rejects_directory_it_never_analyzed` test so that hole cannot silently return, and `dart_valid`
+asserts every corpus actually produced files and functions, so empty output cannot masquerade as
+clean output.
+
+Two further gates exist but are **maintainer-local: they are not in this repository and not in CI**.
+`scripts/` and `tools/` are gitignored together with the corpora they consume (`testing/`,
+`dart/dart_samples/`, `dart/dart_profiles/` — large binaries and SDK checkouts), so the paths below
+will not resolve in a fresh clone. They are listed so the verification behind a release is visible:
+
+- `scripts/regress_all.sh` — 25-version matrix; the object layer must stay byte-identical to the
+  archived reference output.
+- `scripts/check_profiles.sh` — profile freshness; regenerates all 47 committed profiles (26 w64 +
+  21 compressed-pointer variants) from SDK source with `tools/sdk2profile.py` and diffs them, and
+  also fails on an orphan variant or an unexpected variant count. It hard-codes that expected count
+  on purpose: "the file is not there, so skip it" is the same false-pass shape the `dart analyze`
+  gates above just closed.
+
+**What a fresh clone actually verifies.** Everything runnable lives in `tests/`, but five of the
+six gate files consume the gitignored corpora above and *skip themselves* when those are absent,
+and `cargo test` swallows the skip notices by default — so a clean checkout reports a green suite
+having measured almost nothing. Only `tests/source_truth.rs` is self-contained: it compiles its own
+`tests/fixtures/truth.dart` and needs nothing but a `dart` on `PATH`. For that reason every
+skip-because-a-dependency-is-missing path goes through one helper, and
+
+```bash
+DAE_REQUIRE_GATES=1 cargo test --release
+```
+
+turns any such skip into a hard failure. Maintainers run it in a checkout that has the corpora; it
+is the only way to tell "the gates passed" from "the gates never ran". Deliberate opt-outs (the
+Android source-truth chain, which needs `DAE_TRUTH_ANDROID=1`) are not affected.
 
 ## Known limitations
 

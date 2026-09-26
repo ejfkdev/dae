@@ -21,6 +21,19 @@
 use dae::analyzer::Analyzer;
 use dae::profile::{parse_platform, parse_sdk};
 
+/// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
+///
+/// 理由：`cargo test` 默认吞掉 println，而本仓库 6 个测试文件里有 5 个依赖被 gitignore 的语料
+/// （`testing/`、`dart/dart_samples/`），缺语料就静默跳过——新克隆里跑 `cargo test` 会得到
+/// 「全绿但几乎什么都没量」。维护者在自己的检出里设这个变量，任何本该执行却跳过的门禁都会炸出来。
+/// 注意：显式 opt-in（如未设 `DAE_TRUTH_ANDROID`）不属于「缺依赖」，不走这里。
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("DAE_REQUIRE_GATES").is_some() {
+        panic!("DAE_REQUIRE_GATES=1，但门禁跳过了：{msg}");
+    }
+    println!("{msg}");
+}
+
 fn load(root: &std::path::Path, bin: &str, sdk_name: &str, plat_name: &str) -> Option<Analyzer<'static>> {
     let p = root.join(bin);
     if !p.exists() {
@@ -89,7 +102,7 @@ fn field_names_are_provable() {
     let mut ran = 0usize;
     for (label, bin, sdk_name, plat_name, min_rec, min_agree, probes) in cases {
         let Some(a) = load(root, bin, sdk_name, plat_name) else {
-            println!("{label}: 语料缺失，跳过");
+            skip_or_fail("{label}: 语料缺失，跳过");
             continue;
         };
         let rec = dae::decompiler::recover_fields(&a).expect("字段恢复失败");

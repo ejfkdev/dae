@@ -22,6 +22,15 @@
 use dae::analyzer::Analyzer;
 use std::path::Path;
 
+/// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
+/// 显式 opt-in（未设 `DAE_TRUTH_ANDROID`）不属于「缺依赖」，不走这里。
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("DAE_REQUIRE_GATES").is_some() {
+        panic!("DAE_REQUIRE_GATES=1，但门禁跳过了：{msg}");
+    }
+    println!("{msg}");
+}
+
 fn which(cmd: &str) -> Option<String> {
     std::process::Command::new("which")
         .arg(cmd)
@@ -189,7 +198,7 @@ fn check(bin: &Path, out: &Path, label: &str, plat_name: &str) {
 #[test]
 fn source_truth_desktop() {
     let Some(dart) = which("dart") else {
-        println!("source_truth_desktop: 没有 dart，跳过");
+        skip_or_fail("source_truth_desktop: 没有 dart，跳过");
         return;
     };
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -238,7 +247,7 @@ fn source_truth_android_optin() {
         return;
     }
     let Some(flutter) = which("flutter") else {
-        println!("source_truth_android: 没有 flutter，跳过");
+        skip_or_fail("source_truth_android: 没有 flutter，跳过");
         return;
     };
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -299,7 +308,7 @@ fn source_truth_android_optin() {
 #[test]
 fn analyze_rejects_directory_it_never_analyzed() {
     if which("dart").is_none() {
-        println!("analyze_rejects_directory_it_never_analyzed: 没有 dart，跳过");
+        skip_or_fail("analyze_rejects_directory_it_never_analyzed: 没有 dart，跳过");
         return;
     }
     let bogus = Path::new("/tmp/dae_gate_selfcheck_definitely_not_here");

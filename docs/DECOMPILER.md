@@ -17,7 +17,14 @@ cargo test --release --test decompiler_shape       # shape + address self-consis
 cargo test --release --test field_names            # field-name recovery: cross-source agreement, zero conflicts
 cargo test --release --test source_truth           # build tests/fixtures/truth.dart, decompile it, check against the source
 DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # same gate on a compressed-pointer arm64 build
+DAE_REQUIRE_GATES=1 cargo test --release           # turn every "dependency missing, skipping" into a failure
 ```
+
+The last one matters more than it looks. Five of the six gate files consume corpora that are
+gitignored (`testing/`, `dart/dart_samples/`), and they skip themselves when those are absent while
+`cargo test` swallows the notice — a fresh clone therefore reports a green suite having measured
+almost nothing. `DAE_REQUIRE_GATES=1` makes any such skip fail, which is the only way to
+distinguish "the gates passed" from "the gates never ran".
 
 `tests/source_truth.rs` is the only gate whose **input is source code**: it compiles
 `tests/fixtures/truth.dart` with the local `dart`, decompiles the result, and asserts what the

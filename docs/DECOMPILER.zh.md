@@ -16,7 +16,13 @@ cargo test --release --test decompiler_shape       # 形态门禁 + 地址自洽
 cargo test --release --test field_names            # 字段名恢复：两源一致 + 零冲突
 cargo test --release --test source_truth           # 现编 tests/fixtures/truth.dart，反编译后对源码判
 DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # 同一套判据跑压缩指针 arm64 产物
+DAE_REQUIRE_GATES=1 cargo test --release           # 把所有「缺依赖，跳过」变成失败
 ```
+
+最后这条比看上去要紧。6 个门禁文件里有 5 个要吃被 gitignore 的语料（`testing/`、
+`dart/dart_samples/`），缺了就自行跳过，而 `cargo test` 默认把提示吞掉——于是新克隆会报告
+「套件全绿」而实际几乎什么都没量。`DAE_REQUIRE_GATES=1` 让这类跳过直接失败，
+这是区分「门禁通过了」与「门禁根本没跑」的唯一办法。
 
 `tests/source_truth.rs` 是唯一**输入是源码**的门禁：用本机 `dart` 编 `tests/fixtures/truth.dart`，
 反编译后断言源码说必须留下来的东西——快照里归属该库的每个函数都渲染出来、`main` 会走到的字符串常量

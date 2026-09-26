@@ -19,6 +19,19 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// 门禁跳过点统一走这里：默认打印并跳过，但 `DAE_REQUIRE_GATES=1` 时**直接失败**。
+///
+/// 理由：`cargo test` 默认吞掉 println，而本仓库 6 个测试文件里有 5 个依赖被 gitignore 的语料
+/// （`testing/`、`dart/dart_samples/`），缺语料就静默跳过——新克隆里跑 `cargo test` 会得到
+/// 「全绿但几乎什么都没量」。维护者在自己的检出里设这个变量，任何本该执行却跳过的门禁都会炸出来。
+/// 注意：显式 opt-in（如未设 `DAE_TRUTH_ANDROID`）不属于「缺依赖」，不走这里。
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("DAE_REQUIRE_GATES").is_some() {
+        panic!("DAE_REQUIRE_GATES=1，但门禁跳过了：{msg}");
+    }
+    println!("{msg}");
+}
+
 fn dart_bin() -> Option<String> {
     let out = Command::new("dart").arg("--version").output().ok()?;
     out.status.success().then(|| "dart".to_string())
@@ -199,14 +212,14 @@ fn parse_dart_summary(stdout: &str) -> (usize, usize, usize) {
 #[test]
 fn emitted_dart_is_valid() {
     if dart_bin().is_none() {
-        println!("emitted_dart_is_valid: 没有 dart（Dart SDK 不在 PATH）——跳过");
+        skip_or_fail("emitted_dart_is_valid: 没有 dart（Dart SDK 不在 PATH）——跳过");
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let bin = env!("CARGO_BIN_EXE_dae");
     let set = corpora(root);
     if set.is_empty() {
-        println!("emitted_dart_is_valid: 无语料——跳过");
+        skip_or_fail("emitted_dart_is_valid: 无语料——跳过");
         return;
     }
     let mut bad = Vec::new();
@@ -251,7 +264,7 @@ fn emitted_dart_is_valid() {
 #[ignore]
 fn full_scorecard() {
     if dart_bin().is_none() {
-        println!("full_scorecard: 没有 dart——跳过");
+        skip_or_fail("full_scorecard: 没有 dart——跳过");
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -324,7 +337,7 @@ fn full_scorecard() {
 #[test]
 fn analyze_errors_rejects_directory_it_never_analyzed() {
     if dart_bin().is_none() {
-        println!("analyze_errors_rejects_directory_it_never_analyzed: 没有 dart，跳过");
+        skip_or_fail("analyze_errors_rejects_directory_it_never_analyzed: 没有 dart，跳过");
         return;
     }
     let r = analyze_errors(Path::new("/tmp/dae_gate_selfcheck_definitely_not_here"));
