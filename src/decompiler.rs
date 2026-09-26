@@ -10,6 +10,7 @@
 //! 明确不做的事：不编造类型、不编造间接调用目标、不省略认不出的指令（`Other` 原样带出）。
 
 use crate::analyzer::{Analyzer, FieldRow, LibGroups};
+use crate::engine::snapshot::PoolKind;
 use crate::engine::restore::scrub_name;
 use capstone::arch;
 use capstone::prelude::*;
@@ -410,12 +411,12 @@ fn pool_map(analyzer: &Analyzer) -> BTreeMap<u64, String> {
     };
     for (i, ent) in entries.iter().enumerate() {
         let off = 0x10 + i as u64 * 8;
-        match ent.typ.as_str() {
-            "imm" => {
+        match ent.typ {
+            PoolKind::Imm => {
                 let v = ent.value.unwrap_or(0);
                 m.insert(off, v.to_string());
             }
-            "obj" => {
+            PoolKind::Obj => {
                 let vref = ent.value.unwrap_or(0) as u64;
                 // 先按**字符串对象**直接取值：`sref_str` 只认"这个 ref 是字符串"，
                 // 不依赖 cid 编号表（`describe_into` 走的是 cid==93/94 的判断，
@@ -2776,43 +2777,118 @@ impl Structurer<'_> {
     }
 }
 
-/// Cooper–Harvey–Kennedy 支配集迭代
-fn dominators(blocks: &[Block], idx: &BTreeMap<u64, usize>) -> Vec<BTreeSet<usize>> {
+/// Cooper–Harvey–Kennedy **立即支配者**算法，返回 `idom`（`usize::MAX` = 不可达/未定）。
+///
+/// 旧实现给每个块存一整份支配集（`Vec<BTreeSet<usize>>`，初值 `vec![(0..n).collect(); n]`），
+/// 那是 **O(n²) 内存**：实测有 1608 块的函数，即 258 万个集合节点、上百 MB；而且每轮迭代都
+/// 重新扫描全部块重建前驱表（CFG 在迭代中根本不变），配合 BTreeSet 的 clone+intersect，
+/// 整体接近 O(n³)。而唯一的调用点只问一件事——「h 是否支配 u」（用来认回边/自然循环），
+/// 所以换成 O(n) 的 idom 数组 + 沿支配树上溯。
+///
+/// 语义与旧实现逐点对齐：入口 `dom[0] == {0}` ↔ `idom[0] = 0`（上溯立即停）；
+/// 不可达块旧实现给 `dom[b] = {b}`（无前驱 → 空集 ∪ {b}）↔ 这里保持 `idom[b] = MAX`，
+/// `dominates` 先比自身再停，同样只在 `h == b` 时为真。
+fn dominators(blocks: &[Block], idx: &BTreeMap<u64, usize>) -> Vec<usize> {
     let n = blocks.len();
-    let mut dom: Vec<BTreeSet<usize>> = vec![(0..n).collect(); n];
+    let mut idom: Vec<usize> = vec![usize::MAX; n];
     if n == 0 {
-        return dom;
+        return idom;
     }
-    dom[0].clear();
-    dom[0].insert(0);
+
+    // 前驱表只建一次；与旧实现一致地排除自环（`p != b`）
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (p, blk) in blocks.iter().enumerate() {
+        for (_, t) in &blk.succs {
+            if let Some(&b) = idx.get(t) {
+                if b != p {
+                    preds[b].push(p);
+                }
+            }
+        }
+    }
+
+    // 逆后序：从入口做迭代式 DFS（不用递归，函数 CFG 可能上千块深）
+    let mut post: Vec<usize> = Vec::with_capacity(n);
+    let mut visited = vec![false; n];
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    visited[0] = true;
+    while let Some(top) = stack.last_mut() {
+        let (b, i) = *top;
+        match blocks[b].succs.get(i) {
+            Some((_, t)) => {
+                stack.last_mut().unwrap().1 += 1;
+                if let Some(&nb) = idx.get(t) {
+                    if !visited[nb] {
+                        visited[nb] = true;
+                        stack.push((nb, 0));
+                    }
+                }
+            }
+            None => {
+                stack.pop();
+                post.push(b);
+            }
+        }
+    }
+    post.reverse(); // 后序 → 逆后序
+    let mut rpo = vec![usize::MAX; n];
+    for (k, &b) in post.iter().enumerate() {
+        rpo[b] = k;
+    }
+
+    idom[0] = 0;
     let mut changed = true;
     while changed {
         changed = false;
-        for b in 1..n {
-            let mut preds = Vec::new();
-            for (p, blk) in blocks.iter().enumerate() {
-                // 回边不参与支配计算（经典算法的标准处理）
-                if blk.succs.iter().any(|(_, t)| idx.get(t) == Some(&b)) && p != b {
-                    preds.push(p);
+        for &b in &post {
+            if b == 0 {
+                continue;
+            }
+            let mut new_idom = usize::MAX;
+            for &p in &preds[b] {
+                if idom[p] == usize::MAX {
+                    continue; // 本轮尚未确定的前驱跳过（CHK 的标准做法）
                 }
+                new_idom = if new_idom == usize::MAX {
+                    p
+                } else {
+                    intersect_dom(p, new_idom, &idom, &rpo)
+                };
             }
-            let mut newset: Option<BTreeSet<usize>> = None;
-            for p in &preds {
-                let s = &dom[*p];
-                newset = Some(match newset {
-                    None => s.clone(),
-                    Some(acc) => acc.intersection(s).copied().collect(),
-                });
-            }
-            let mut newset = newset.unwrap_or_default();
-            newset.insert(b);
-            if newset != dom[b] {
-                dom[b] = newset;
+            if new_idom != usize::MAX && idom[b] != new_idom {
+                idom[b] = new_idom;
                 changed = true;
             }
         }
     }
-    dom
+    idom
+}
+
+/// CHK 的 intersect：沿支配树把较深的一方往上抬，直到相遇。
+fn intersect_dom(mut b1: usize, mut b2: usize, idom: &[usize], rpo: &[usize]) -> usize {
+    while b1 != b2 {
+        while rpo[b1] > rpo[b2] {
+            b1 = idom[b1];
+        }
+        while rpo[b2] > rpo[b1] {
+            b2 = idom[b2];
+        }
+    }
+    b1
+}
+
+/// 「h 是否支配 u」——沿 idom 上溯。不可达块只匹配自身（对齐旧的 `dom[u] = {u}`）。
+fn dominates(idom: &[usize], h: usize, mut u: usize) -> bool {
+    loop {
+        if u == h {
+            return true;
+        }
+        let next = idom[u];
+        if next == usize::MAX || next == u {
+            return false;
+        }
+        u = next;
+    }
 }
 
 impl<'a> Structurer<'a> {
@@ -2826,7 +2902,7 @@ impl<'a> Structurer<'a> {
         for (u, blk) in blocks.iter().enumerate() {
             for (_, t) in &blk.succs {
                 let Some(&h) = idx.get(t) else { continue };
-                if !dom[u].contains(&h) {
+                if !dominates(&dom, h, u) {
                     continue;
                 }
                 let mut body: BTreeSet<usize> = BTreeSet::new();

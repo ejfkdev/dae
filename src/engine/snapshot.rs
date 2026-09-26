@@ -171,8 +171,19 @@ pub struct FieldRec {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolEntry {
     pub bits: u64,
-    pub typ: String, // "stub" | "obj" | "imm" | "native"
+    pub typ: PoolKind,
     pub value: Option<i64>,
+}
+
+/// 对象池条目类别。曾是 `String`（每条一次堆分配）：飞书 3.6.1 有 105 214 条、
+/// 微博 30 071 条，而取值只有四种——换成 enum 后每条从 48 字节 + 堆块降到 32 字节、
+/// 零堆分配，比较也从字符串比变成整数比。纯表示层改动，产物逐字节不变。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PoolKind {
+    Stub,
+    Obj,
+    Imm,
+    Native,
 }
 
 impl<'a> Snapshot<'a> {

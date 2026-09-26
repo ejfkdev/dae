@@ -3,6 +3,7 @@
 //! 输出全部直接写入预分配缓冲（sink 式），field 递归不克隆字符串、不建临时 Vec。
 
 use crate::analyzer::Analyzer;
+use crate::engine::snapshot::PoolKind;
 use crate::engine::snapshot::FieldVal;
 use crate::export::hex_py;
 use std::fmt::Write as _;
@@ -55,11 +56,11 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
                 for (k, ent) in entries[b..e].iter().enumerate() {
                     let i = b + k;
                     let off = 0x10 + i * 8;
-                    if ent.typ == "obj" {
+                    if ent.typ == PoolKind::Obj {
                         let _ = write!(of, "[pp+{off:#x}] ");
                         describe_into(analyzer, &mut of, ent.value.unwrap_or(0) as u64, 0);
                         of.push('\n');
-                    } else if ent.typ == "imm" {
+                    } else if ent.typ == PoolKind::Imm {
                         let _ = writeln!(of, "[pp+{off:#x}] {}", hex_py(ent.value.unwrap_or(0)));
                     } else {
                         let _ = writeln!(of, "[pp+{off:#x}] Stub");

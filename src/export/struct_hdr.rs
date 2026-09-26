@@ -11,6 +11,7 @@
 //! 一个 SDK。现改为 per-target 生成，结构体尺寸与偏移才与被分析二进制真实对齐。
 
 use crate::analyzer::Analyzer;
+use crate::engine::snapshot::PoolKind;
 use crate::export::R2_STRUCT_TEMPLATE;
 use std::fmt::Write as _;
 
@@ -38,11 +39,11 @@ fn build_object_pool(analyzer: &Analyzer) -> String {
     if let Some(entries) = analyzer.iso.objectpool_entries.as_ref() {
         for (i, ent) in entries.iter().enumerate() {
             let off = 0x10 + i * 8;
-            let name = match ent.typ.as_str() {
-                "obj" => format!("Obj_0x{off:x}"),
-                "imm" => format!("IMM_0x{off:x}"),
-                "native" => format!("NativeFn_0x{off:x}"),
-                _ => format!("Stub_0x{off:x}"),
+            let name = match ent.typ {
+                PoolKind::Obj => format!("Obj_0x{off:x}"),
+                PoolKind::Imm => format!("IMM_0x{off:x}"),
+                PoolKind::Native => format!("NativeFn_0x{off:x}"),
+                PoolKind::Stub => format!("Stub_0x{off:x}"),
             };
             let _ = writeln!(s, "\t__int64 {name};");
         }

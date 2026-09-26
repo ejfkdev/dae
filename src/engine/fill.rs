@@ -10,7 +10,7 @@
 //! 逐对象执行时 ctx 为 Vec<Option<i64>>（无哈希、无字符串克隆）。
 
 use crate::engine::snapshot::{
-    ClassRec, ClusterMeta, FieldRec, FieldVal, FunctionRec, LibraryRec, PoolEntry, Snapshot,
+    ClassRec, ClusterMeta, FieldRec, FieldVal, FunctionRec, LibraryRec, PoolEntry, PoolKind, Snapshot,
 };
 use crate::engine::varint::Reader;
 use crate::profile::{LoopTimes, SdkProfile, Step};
@@ -1014,14 +1014,14 @@ fn exec_compiled<'a>(
                         match bits & 0x7F {
                             0 => {
                                 let v = read_signed(r)?;
-                                entries.push(PoolEntry { bits: bits as u64, typ: "imm".into(), value: Some(v) });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Imm, value: Some(v) });
                             }
                             1 => {
                                 let v = read_ref_codec(codec, r)?;
-                                entries.push(PoolEntry { bits: bits as u64, typ: "obj".into(), value: Some(v as i64) });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Obj, value: Some(v as i64) });
                             }
                             _ => {
-                                entries.push(PoolEntry { bits: bits as u64, typ: "native".into(), value: None });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Native, value: None });
                             }
                         }
                         continue;
@@ -1032,14 +1032,14 @@ fn exec_compiled<'a>(
                         match bits & 0x7F {
                             0 => {
                                 let v = read_ref_codec(codec, r)?;
-                                entries.push(PoolEntry { bits: bits as u64, typ: "obj".into(), value: Some(v as i64) });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Obj, value: Some(v as i64) });
                             }
                             1 => {
                                 let v = read_signed(r)?;
-                                entries.push(PoolEntry { bits: bits as u64, typ: "imm".into(), value: Some(v) });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Imm, value: Some(v) });
                             }
                             _ => {
-                                entries.push(PoolEntry { bits: bits as u64, typ: "native".into(), value: None });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Native, value: None });
                             }
                         }
                         continue;
@@ -1049,14 +1049,14 @@ fn exec_compiled<'a>(
                         match bits & 0x7F {
                             0 | 4 => {
                                 let v = read_ref_codec(codec, r)?;
-                                entries.push(PoolEntry { bits: bits as u64, typ: "obj".into(), value: Some(v as i64) });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Obj, value: Some(v as i64) });
                             }
                             1 => {
                                 let v = read_signed(r)?;
-                                entries.push(PoolEntry { bits: bits as u64, typ: "imm".into(), value: Some(v) });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Imm, value: Some(v) });
                             }
                             _ => {
-                                entries.push(PoolEntry { bits: bits as u64, typ: "native".into(), value: None });
+                                entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Native, value: None });
                             }
                         }
                         continue;
@@ -1064,26 +1064,31 @@ fn exec_compiled<'a>(
                     // 2.10+：behavior=(bits>>5)&7 ∈ 2..=4 → stub（无值）
                     let behavior = (bits >> 5) & 0x7;
                     if (2..=4).contains(&behavior) {
-                        entries.push(PoolEntry { bits: bits as u64, typ: "stub".into(), value: None });
+                        entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Stub, value: None });
                         continue;
                     }
                     let typ = bits & 0xF;
                     if typ == 1 {
                         let v = read_ref_codec(codec, r)?;
-                        entries.push(PoolEntry { bits: bits as u64, typ: "obj".into(), value: Some(v as i64) });
+                        entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Obj, value: Some(v as i64) });
                     } else if typ == 0 {
                         let v = read_signed(r)?;
-                        entries.push(PoolEntry { bits: bits as u64, typ: "imm".into(), value: Some(v) });
+                        entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Imm, value: Some(v) });
                     } else {
-                        entries.push(PoolEntry { bits: bits as u64, typ: "native".into(), value: None });
+                        entries.push(PoolEntry { bits: bits as u64, typ: PoolKind::Native, value: None });
                     }
                 }
                 if hist_dbg {
-                    let c = |t: &str| entries[entries0..].iter().filter(|e| e.typ == t).count();
-                    let (n_obj, n_imm, n_stub, n_nat) =
-                        (c("obj"), c("imm"), c("stub"), c("native"));
+                    let c = |t: PoolKind| entries[entries0..].iter().filter(|e| e.typ == t).count();
+                    let (n_obj, n_imm, n_stub, n_nat) = (
+                        c(PoolKind::Obj),
+                        c(PoolKind::Imm),
+                        c(PoolKind::Stub),
+                        c(PoolKind::Native),
+                    );
                     eprintln!(
-                        "[dbg-poolhist] cid={} 对象#{} 声明条目={ln} 实解={} obj={n_obj} imm={n_imm}                          stub={n_stub} native={n_nat} 消费字节={}",
+                        "[dbg-poolhist] cid={} 对象#{} 声明条目={ln} 实解={} obj={n_obj} imm={n_imm} \
+                         stub={n_stub} native={n_nat} 消费字节={}",
                         meta.cid,
                         k,
                         entries.len() - entries0,
