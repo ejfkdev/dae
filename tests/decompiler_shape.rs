@@ -101,6 +101,15 @@ fn decompiler_shape() {
             "dart-3.13.0-w64-no-compressed.json",
             "macho-arm64.json",
         ),
+        // arm64 **ELF**（Linux 产物）：条件分支落在最后一个块时没有落空后继——
+        // 表给的函数尺寸在分支处就截断了，旧实现一律 bail，结构化率因此只有 34%
+        // （713 个分支退化）。修好后 89%。这条语料盯着那个形状。
+        (
+            "h212keep (elf arm64)",
+            root.join("testing/variants/h212keep_linux_arm64.exe"),
+            "dart-2.12.4-w64-no-compressed.json",
+            "elf-arm64.json",
+        ),
         // 尾部 trailer + 内嵌 ELF 容器（2.12–2.14 这批 `dart compile exe`）：指令段基准
         // 只能从内层符号表读——漏了这条路径时 instr_off=0，反汇编读到别的字节，
         // 与地址无关的名字类指标却全绿。这条语料就是那次教训的回归护栏。
@@ -155,8 +164,11 @@ fn decompiler_shape() {
                 if t.starts_with("dynamic ") && t.ends_with('{') {
                     in_fn = true;
                 }
-                depth += t.matches('{').count() as i64;
-                depth -= t.matches('}').count() as i64;
+                // 花括号也要先屏蔽字符串字面量：池里内联出来的字面量可能是 `"}"` /
+                // `"{"`（实测 arm64 ELF 语料里就有），按裸字符数会把配平判错。
+                let t_shape = strip_literals(t);
+                depth += t_shape.matches('{').count() as i64;
+                depth -= t_shape.matches('}').count() as i64;
                 assert!(depth >= 0, "{}:{} 花括号提前闭合", p.display(), ln + 1);
                 // 判形态前先把**字符串字面量**换成占位符，再剥行尾注释：
                 // 池里内联出来的字面量可能本身就是 `"//"` 或带 `;`（实测踩过），

@@ -1535,7 +1535,7 @@ fn emit_function(
     fallback: &mut usize,
 ) {
     let mut s = Structurer::new(blocks, rl.clone());
-    let nodes = s.seq(0, None);
+    let nodes = s.seq(0, None, 0);
     let reason = s.reason.clone();
     let mut unstructured = s.unstructured;
     let mut body = String::new();
@@ -1835,6 +1835,8 @@ fn dart_preamble(body: &str, defined: &BTreeSet<String>) -> String {
 /// 纪律：只纳入「不是已知函数入口」的目标，每函数限块数/总字节数，遇到终止符
 /// （ret/ud2/hlt）或跳回本函数主范围就收尾——**绝不因此把别的函数吞进来**。
 const CHUNK_MAX_CHUNKS: usize = 8;
+/// 控制流嵌套层数上限（见 `Structurer::seq` 的说明：钻太深会让产物过不了 Dart 解析）
+const MAX_STRUCT_DEPTH: usize = 10;
 const CHUNK_MAX_BYTES: usize = 256;
 
 fn lift_chunks(
@@ -2456,13 +2458,24 @@ impl<'a> Structurer<'a> {
     }
 
     /// 递归结构化 [start, stop)
-    fn seq(&mut self, start: usize, stop: Option<usize>) -> Vec<Node> {
+    /// 递归结构化：`depth` 是**嵌套层数**，超过 `MAX_STRUCT_DEPTH` 就不再往里钻，
+    /// 只把当前块的语句发出来并把跳转如实写成 gotoLabel。
+    ///
+    /// 为什么必须有这个上限：`seq` 每遇到一个菱形就往里递归一层，块多的时候能钻到
+    /// **几十层**（实测 arm64 ELF 的 `h212keep_linux_arm64` 钻到约 50 层）——产物变成
+    /// 一片阶梯状的 `}`，`dart analyze` 直接报 `stack_overflow`（嵌套过深）。
+    /// 好代码本来也不会嵌那么深，所以这是"拒绝生成不可读产物"而不是能力损失。
+    fn seq(&mut self, start: usize, stop: Option<usize>, depth: usize) -> Vec<Node> {
         let mut out: Vec<Node> = Vec::new();
         let mut cur = Some(start);
         let mut guard = 0usize;
         while let Some(b) = cur {
             guard += 1;
-            if guard > 4096 {
+            if guard > 4096 || depth > MAX_STRUCT_DEPTH {
+                if depth > MAX_STRUCT_DEPTH {
+                    self.bail("depth-limit");
+                    out.push(Node::Goto(self.blocks[b].start));
+                }
                 break;
             }
             if Some(b) == stop || !self.done.insert(b) {
@@ -2473,7 +2486,7 @@ impl<'a> Structurer<'a> {
                 let (cond, body_entry) = self.loop_shape(b);
                 let mut body = self.body_lines(b);
                 self.loop_stack.push(b);
-                body.extend(self.seq(body_entry, Some(b)));
+                body.extend(self.seq(body_entry, Some(b), depth + 1));
                 self.loop_stack.pop();
                 out.push(Node::While { cond, body });
                 cur = Some(exit);
@@ -2522,14 +2535,30 @@ impl<'a> Structurer<'a> {
                             continue;
                         }
                     }
+                    // 条件分支落在**最后一个块**时没有落空后继（`f` 为 None）：
+                    // 真实原因是函数字节范围在分支处就结束了（表给的尺寸截断），
+                    // 不是"目标越界"。此时把目标支结构成 `if (...) { ... }` 并收尾——
+                    // 以前这里一律 bail，白白让 713 个分支退化成不可结构化
+                    // （arm64 ELF 语料实测：结构化率因此从 ~88% 掉到 34%）。
+                    if f.is_none() {
+                        if let Some(ti) = t {
+                            let then = self.seq(ti, stop, depth + 1);
+                            out.push(Node::If {
+                                cond: c.clone(),
+                                then,
+                                els: vec![],
+                            });
+                            break;
+                        }
+                    }
                     match (t, f) {
                         (Some(ti), Some(fi)) => {
                             // 汇合点 == 区域终点也算合法菱形：两支各自走到区域末尾，
                             // 只是不再有「汇合之后」的语句（历史实现把它排除掉，
                             // 白白让 1/4 的 if/else 退回 goto）。
                             if let Some(j) = self.find_join(ti, fi) {
-                                let then = self.seq(ti, Some(j));
-                                let els = self.seq(fi, Some(j));
+                                let then = self.seq(ti, Some(j), depth + 1);
+                                let els = self.seq(fi, Some(j), depth + 1);
                                 out.push(Node::If {
                                     cond: c.clone(),
                                     then,
@@ -2542,7 +2571,7 @@ impl<'a> Structurer<'a> {
                             } else if self.terminates(ti) {
                                 // if-return 形状：true 支自身终止（return/brk/跳出区域），
                                 // 另一支继续——直接发射 `if (c) { 支 }` 并顺着 else 支走。
-                                let then = self.seq(ti, stop);
+                                let then = self.seq(ti, stop, depth + 1);
                                 out.push(Node::If {
                                     cond: c.clone(),
                                     then,
@@ -2551,7 +2580,7 @@ impl<'a> Structurer<'a> {
                                 cur = Some(fi);
                             } else if self.terminates(fi) {
                                 // 镜像形状：else 支终止 → 取反后作为 then 发射
-                                let els = self.seq(fi, stop);
+                                let els = self.seq(fi, stop, depth + 1);
                                 out.push(Node::If {
                                     cond: negate_cond(&c),
                                     then: els,
@@ -2563,7 +2592,7 @@ impl<'a> Structurer<'a> {
                                 self.bail("no-join:irreducible");
                                 out.push(Node::If {
                                     cond: c.clone(),
-                                    then: self.seq(ti, stop),
+                                    then: self.seq(ti, stop, depth + 1),
                                     els: vec![],
                                 });
                                 out.push(Node::Goto(self.blocks[fi].start));
