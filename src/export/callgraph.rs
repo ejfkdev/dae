@@ -167,7 +167,12 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
                 let mut out: Vec<Edge> = Vec::new();
                 for &(ep, payload, csize, ref fname) in &plan_ref[b..e] {
                     let foff = payload + slice_off;
-                    if foff as usize + csize as usize > data.len() {
+                    // 用 u64 判，且避免任何加法回绕（`foff + csize` 回绕会绕过检查）
+                    let end = match foff.checked_add(csize) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    if end > data.len() as u64 {
                         continue;
                     }
                     let code = &data[foff as usize..(foff + csize) as usize];

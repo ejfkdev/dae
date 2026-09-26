@@ -1647,8 +1647,15 @@ pub fn render(
                 if foff as usize + csize as usize > analyzer.data.len() {
                     continue;
                 }
-                let code = &analyzer.data[foff as usize..(foff + csize) as usize];
+                // **带前瞻地反汇编**：code size 常常把函数截在最后一条指令中间
+                // （x64 的多字节 NOP `66 2e 0f 1f 84 00 ..` 只进来前 4 字节时，
+                // capstone 只能吐 `.byte`）。多给 16 字节，再只保留起点在范围内的语句。
+                let look = 16usize;
+                let end = ((foff as usize + csize as usize) + look).min(analyzer.data.len());
+                let code = &analyzer.data[foff as usize..end];
                 let (mut stmts, raw) = lift(&cs, analyzer, code, entry, is_arm64, &names);
+                let limit = entry + csize;
+                stmts.retain(|s| s.addr < limit);
                 if stmts.is_empty() {
                     if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
                         eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} entry={entry:#x} csize={csize}", f.mangled, f.ep);

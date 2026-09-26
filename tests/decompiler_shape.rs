@@ -44,8 +44,12 @@ const STRUCTURED_FLOOR: f64 = 0.70;
 /// * 函数**末尾**应是终止符（`ret`/`b`/`jmp`/`brk`）或填充（x64 `int3` 对齐填充）；
 /// * 直接调用的目标应落在函数入口上（Dart AOT 的 `bl` 目标 = Code 入口）。
 ///
-/// 修复前：末指令为终止符 1%、调用命中入口 1%。修复后：82–96% / 29–34%。
-const TERMINATOR_FLOOR: f64 = 0.60;
+/// 判据取**函数入口像不像序言**与**直接调用命中入口率**，不取"末指令是终止符"——
+/// 后者当初看着能过（95.7%）其实是在数 x64 的 `int3` 填充，对真正错位的 x64 语料毫无
+/// 分辨力（错位时它仍报 95.7%）。首指令判据才是真信号：
+/// 错位时 51–58%（随机指令当开头），定位正确时 91–99%。
+/// 修复前后：arm64 样本次指令像序言 5% → 99%，x64 2.13.4 58% → 91%，真实 app 96%。
+const PROLOGUE_FLOOR: f64 = 0.80;
 const CALL_HIT_FLOOR: f64 = 0.20;
 
 #[cfg(feature = "asm")]
@@ -71,6 +75,15 @@ fn decompiler_shape() {
             root.join("testing/decompiler_corpus/sample_arm64"),
             "dart-3.13.0-w64-no-compressed.json",
             "macho-arm64.json",
+        ),
+        // 尾部 trailer + 内嵌 ELF 容器（2.12–2.14 这批 `dart compile exe`）：指令段基准
+        // 只能从内层符号表读——漏了这条路径时 instr_off=0，反汇编读到别的字节，
+        // 与地址无关的名字类指标却全绿。这条语料就是那次教训的回归护栏。
+        (
+            "hello_2.13.4 (appended ELF blob)",
+            root.join("dart/dart_samples/artifacts/hello_2.13.4.exe"),
+            "dart-2.13.4-w64-no-compressed.json",
+            "macho-x64.json",
         ),
     ];
     let mut ran = 0usize;
@@ -163,7 +176,7 @@ fn decompiler_shape() {
                 entries.insert(ep);
             }
         }
-        let (mut n_fn, mut n_term, mut n_call, mut n_hit) = (0usize, 0usize, 0usize, 0usize);
+        let (mut n_fn, mut n_prol, mut n_call, mut n_hit) = (0usize, 0usize, 0usize, 0usize);
         for ent in std::fs::read_dir(out.join("dart")).unwrap() {
             let p = ent.unwrap().path();
             if p.extension().and_then(|s| s.to_str()) != Some("dart") {
@@ -190,12 +203,15 @@ fn decompiler_shape() {
                     continue;
                 }
                 n_fn += 1;
-                // x64 的 int3 是函数末尾的对齐填充（0xCC），与终止符等价
+                // 入口像不像序言：arm64 的 `stp`/`bti`/`pacibsp`，x64 的 `push`/`sub`/`lea`，
+                // 以及编成 `jmp` 的尾调用桩、以 `mov`/`ldr` 开头的叶子函数。
                 if matches!(
-                    ins[ins.len() - 1].0,
-                    "ret" | "retq" | "b" | "jmp" | "brk" | "ud2" | "int3"
+                    ins[0].0,
+                    "stp" | "bti" | "pacibsp" | "push" | "sub" | "lea" | "endbr64" | "mov"
+                        | "ldr" | "add" | "cmp" | "xor" | "pop" | "ret" | "int3" | "nop"
+                        | "str" | "movk" | "jmp"
                 ) {
-                    n_term += 1;
+                    n_prol += 1;
                 }
                 for (mn, ops) in &ins {
                     if !matches!(*mn, "bl" | "call" | "callq") {
@@ -210,19 +226,20 @@ fn decompiler_shape() {
                 }
             }
         }
-        let term_rate = n_term as f64 / n_fn.max(1) as f64;
+        let prol_rate = n_prol as f64 / n_fn.max(1) as f64;
         let hit_rate = n_hit as f64 / n_call.max(1) as f64;
         println!(
-            "{label:20} 末指令终止符 {:.1}%  调用命中入口 {:.1}%（{n_hit}/{n_call}）",
-            term_rate * 100.0,
+            "{label:20} 入口像序言 {:.1}%  调用命中入口 {:.1}%（{n_hit}/{n_call}）",
+            prol_rate * 100.0,
             hit_rate * 100.0
         );
         assert!(
-            term_rate >= TERMINATOR_FLOOR,
-            "{label}: 只有 {:.1}% 的函数以终止符/填充结束（门禁 {:.0}%）——\
-             代码范围很可能整体错位（历史故障：Mach-O appended 快照的 instr_off 缺失）",
-            term_rate * 100.0,
-            TERMINATOR_FLOOR * 100.0
+            prol_rate >= PROLOGUE_FLOOR,
+            "{label}: 只有 {:.1}% 的函数入口像序言（门禁 {:.0}%）——\
+             代码范围很可能整体错位（历史故障：内嵌快照容器未解析导致 instr_off=0；\
+             错位时这个数字会掉到 51–58%）",
+            prol_rate * 100.0,
+            PROLOGUE_FLOOR * 100.0
         );
         assert!(
             hit_rate >= CALL_HIT_FLOOR,

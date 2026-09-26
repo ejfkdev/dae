@@ -55,49 +55,63 @@ Fix history, in the order the analyzer found them (counts are for one real Flutt
 
 | sample | files | functions | structured | unmapped | analyze errors |
 |---|---|---|---|---|---|
-| hello_3.13.0 | 15 | 1174 | 1047 | 317 | 0 |
-| hello_3.12.2 | 15 | 1176 | 1049 | 311 | 0 |
-| hello_3.14b | 15 | 1161 | 1035 | 314 | 0 |
-| hello_3.11.6 | 15 | 1133 | 1015 | 275 | 0 |
-| hello_3.10.9 | 14 | 1104 | 987 | 274 | 0 |
-| hello_3.9.4 | 14 | 1106 | 991 | 286 | 0 |
-| hello_3.8.3 | 14 | 1103 | 989 | 286 | 0 |
-| hello_3.7.2 | 14 | 1111 | 996 | 287 | 0 |
-| hello_3.6.1 | 14 | 1108 | 1005 | 11 | 0 |
-| hello_3.5.0 | 13 | 1111 | 1007 | 11 | 0 |
-| hello_3.4.0 | 13 | 1138 | 1036 | 15 | 0 |
-| hello_3.3.4 (x64 exe) | 14 | 1114 | 741 | 521 | 0 |
-| hello_3.2.0 | 14 | 1143 | 1029 | 290 | 0 |
-| hello_3.0.0 | 15 | 1207 | 1090 | 167 | 0 |
-| hello_2.19.6 | 2 | 229 | 212 | 22 | 0 |
-| hello_2.18.1 | 2 | 254 | 232 | 16 | 0 |
-| hello_2.17.0 | 14 | 1231 | 1114 | 159 | 0 |
-| hello_2.16.2 | 1 | 1086 | 995 | 142 | 0 |
-| hello_2.15.0 | 13 | 1167 | 1052 | 162 | 0 |
-| hello_2.14.4 (x64 exe) | 14 | 1094 | 698 | 4543 | 0 |
-| hello_2.13.4 (x64 exe) | 17 | 1234 | 784 | 4705 | 0 |
-| hello_2.12.4 (x64 exe) | 17 | 1187 | 815 | 4454 | 0 |
-| hello_2.10.4 | 2 | 0 | 0 | 0 | 0 |
-| **testing_app (real Flutter app, arm64)** | 412 | 10245 | 9436 | 60 | 0 |
-Totals: 693 files, 33,616 functions, **0 analyze errors**.
+| hello_3.13.0 | 15 | 1174 | 1047 (89%) | 317 | 0 |
+| hello_3.12.2 | 15 | 1176 | 1049 (89%) | 311 | 0 |
+| hello_3.14b | 15 | 1161 | 1035 (89%) | 314 | 0 |
+| hello_3.11.6 | 15 | 1133 | 1015 (89%) | 275 | 0 |
+| hello_3.10.9 | 14 | 1104 | 987 (89%) | 274 | 0 |
+| hello_3.9.4 | 14 | 1106 | 991 (89%) | 286 | 0 |
+| hello_3.8.3 | 14 | 1103 | 989 (89%) | 286 | 0 |
+| hello_3.7.2 | 14 | 1111 | 996 (89%) | 287 | 0 |
+| hello_3.6.1 | 14 | 1108 | 1005 (90%) | 11 | 0 |
+| hello_3.5.0 | 13 | 1111 | 1007 (90%) | 11 | 0 |
+| hello_3.4.0 | 13 | 1138 | 1036 (91%) | 15 | 0 |
+| hello_3.3.4 (appended ELF blob) | 14 | 1130 | 1029 (91%) | 21 | 0 |
+| hello_3.2.0 | 14 | 1143 | 1029 (90%) | 290 | 0 |
+| hello_3.0.0 | 15 | 1207 | 1090 (90%) | 167 | 0 |
+| hello_2.19.6 | 2 | 229 | 212 (92%) | 22 | 0 |
+| hello_2.18.1 | 2 | 254 | 232 (91%) | 16 | 0 |
+| hello_2.17.0 | 14 | 1231 | 1114 (90%) | 159 | 0 |
+| hello_2.16.2 | 1 | 1086 | 995 (91%) | 142 | 0 |
+| hello_2.15.0 | 13 | 1167 | 1052 (90%) | 162 | 0 |
+| hello_2.14.4 (appended ELF blob) | 14 | 1123 | 1012 (90%) | 163 | 0 |
+| hello_2.13.4 (appended ELF blob) | 17 | 1259 | 1126 (89%) | 231 | 0 |
+| hello_2.12.4 (appended ELF blob) | 17 | 1212 | 1057 (87%) | 202 | 0 |
+| **testing_app (real Flutter app, arm64)** | 412 | 10245 | 9436 (92%) | 60 | 0 |
+Totals: 691 files, 33,711 functions, **0 analyze errors**.
 
-Re-measured after the two changes below (shared-code chunks + an honest `unmapped` count):
-old x64 executables went 52–58% → **64–69% structured**, and the `unmapped` column no longer
-counts blocks that are never emitted.
+The `unmapped` column counts instructions actually written out (it used to include blocks that
+are never emitted, which made it read several times too high).
 
 Other gates hold on the same corpora: structured-rate floor 0.70 (measured 0.87–0.92 on the x64
 corpora and 0.92 on the app), and address self-consistency (function ends look like terminators
 82–96%, direct calls land on function entries 70–96%).
 
+## The trap this table keeps springing
+
+Three times now the same failure mode has appeared, and it is worth stating plainly because the
+metrics cannot see it: **the instructions image was located wrongly, so the decompiler read
+different bytes.** Names, structure and validity all stay plausible — function names come from
+Code objects, and valid-Dart-ness is about syntax, not semantics. Only *address self-consistency*
+(test: entry looks like a prologue, direct calls land on entries) exposes it.
+
+- arm64 `dart compile exe` (appended Mach-O, no symbols) — `instr_off = 0`
+- x64 2.12–2.14 / 3.3.4 `dart compile exe` — the snapshot is appended as a **separate ELF**
+  container addressed by a file trailer (`[offset][kAppJITMagicNumber]`); looking only at the
+  executable's own symbols missed it. `hello_2.13.4`'s 1394 shared functions all shifted by
+  exactly one constant (`0x462000`) once fixed — a single missing base, nothing else.
+- The gate now covers both shapes: `hello_2.13.4` (appended ELF blob) is in the corpus list, and
+  the prologue-rate floor (0.80; broken states measure 51–58%, correct ones 91–100%) would fail
+  on either. The earlier "terminator rate" metric was retired after it turned out to be counting
+  x64 `int3` padding — it reported 95.7% while the addresses were wrong.
+
 ## Known weak spots (the backlog)
 
-1. **Old x64 executables (2.12–2.14, 3.3.4): 64–69% structured, 4.4–4.7k unmapped lines.** Fixed
-   so far: shared-code chunks (Dart AOT merges identical tails, so a branch target lands inside
-   *another* function's byte range — `lift_chunks` adopts those as function chunks, bounded to 8
-   chunks / 256 bytes and never a known entry) and the x64 lift for `push`/`pop`/`movzx`/`movups`
-   and two-operand immediate binary ops. What is left is mostly `add`/`or`/`sub`/`inc`/`dec` with
-   a memory destination (`add byte ptr [rax], 8`) and `.byte` runs where the table's code size
-   cuts a function short of its last branch target.
+1. **Old x64 executables (2.12–2.14, 3.3.4) were never weak** — 64–69% structured was the wrong
+   bytes talking. With the addresses fixed they sit at **87–91% structured, 21–231 unmapped
+   lines**, the same league as the rest. What genuinely remains for them: `add`/`or`/`sub`/`inc`/
+   `dec` with a memory destination (`add byte ptr [rax], 8`) and `.byte` runs where the table's
+   code size cuts a function short of its last branch target.
 2. `branch-to-done-block` (shared tail blocks) and `no-join:irreducible` — 809 of 10,245 app
    functions stay unstructured and keep a `gotoLabel`; the shape is a jump to an already-emitted
    block.

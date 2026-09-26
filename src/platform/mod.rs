@@ -130,7 +130,76 @@ pub fn required_symbols(
     ))
 }
 
-/// 定位 VM/ISO/指令段文件偏移，三层依次尝试：
+/// 可执行文件尾部 trailer 里的快照偏移。
+///
+/// 老版本 `dart compile exe`（2.12–2.14 / 3.3.4 这批 macOS x64 `hello_*.exe`）把快照
+/// 作为**独立容器**（实测是 ELF）贴在可执行文件尾部，并在最后 16 字节写下
+/// `[snapshot_offset][kAppJITMagicNumber]`（SDK runtime/bin/snapshot_utils.cc
+/// TryReadAppendedAppSnapshotElf）。内层容器自带符号表——只按可执行文件自身的符号找不到
+/// 快照，就会退化成"地址不可得"，反汇编的是错的字节。
+fn appended_blob_offset(data: &[u8]) -> Option<usize> {
+    if data.len() < 16 {
+        return None;
+    }
+    let tail = &data[data.len() - 16..];
+    let off = u64::from_le_bytes(tail[..8].try_into().ok()?) as usize;
+    let magic = u32::from_le_bytes(tail[8..12].try_into().ok()?);
+    // kAppJITMagicNumber 的小端字节序（dc dc f6 f6）
+    if magic != 0xf6_f6_dc_dc || off == 0 || off >= data.len() {
+        return None;
+    }
+    Some(off)
+}
+
+/// 内嵌 blob（`base` 起）里按符号名取 (vm, iso, instr) 的**绝对文件偏移**。
+/// blob 可能是 ELF、Mach-O 或 PE——生成器的 `snapshot.aot` 在不同平台/年代不同
+/// （实测 arm64 的 3.3.4 内嵌的是 ELF，x64 的 2.13.4 也是 ELF，新 macOS 是 Mach-O dylib）。
+pub fn blob_symbols_at(
+    data: &[u8],
+    base: usize,
+    pp: &PlatformProfile,
+) -> Option<(u64, u64, u64)> {
+    if base >= data.len() {
+        return None;
+    }
+    let sub = &data[base..];
+    let info = if sub.starts_with(&[0x7f, b'E', b'L', b'F']) {
+        crate::platform::elf::parse_elf(sub).ok()?
+    } else if sub.len() >= 4 && sub[..4] == [0xcf, 0xfa, 0xed, 0xfe] {
+        crate::platform::macho::parse_macho(sub).ok()?
+    } else if sub.len() >= 2 && sub[..2] == [0x4d, 0x5a] {
+        crate::platform::pe::parse_pe(sub).ok()?
+    } else {
+        return None;
+    };
+    let get = |sn: &crate::profile::SymbolNames| -> Option<(u64, u64, u64)> {
+        Some((
+            // 内层容器的符号偏移是相对容器起点的，加回 base 才是文件偏移
+            *info.symbols.get(&sn.vm_data)? + base as u64,
+            *info.symbols.get(&sn.isolate_data)? + base as u64,
+            *info.symbols.get(&sn.isolate_instructions)? + base as u64,
+        ))
+    };
+    if let Some(v) = get(&pp.symbols) {
+        return Some(v);
+    }
+    if let Some(alt) = &pp.symbols_alt {
+        if let Some(v) = get(alt) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 尾部 trailer 指向的内嵌容器里的快照符号
+pub fn appended_blob_symbols(
+    data: &[u8],
+    pp: &PlatformProfile,
+) -> Option<(u64, u64, u64)> {
+    blob_symbols_at(data, appended_blob_offset(data)?, pp)
+}
+
+/// 定位 VM/ISO/指令段文件偏移，四层依次尝试：
 /// 1. **符号表**（`symbols` → `symbols_alt`）：最精确，指令段基准直接来自符号值；
 /// 2. **内嵌快照**（Mach-O `LC_NOTE __dart_app_snap`）：`dart compile exe` 把 AOT 快照
 ///    贴在可执行文件尾部且不留符号，此时数据段在 blob 内魔数扫描、指令段取内嵌
@@ -154,9 +223,21 @@ pub fn locate_snapshots(
     } else {
         (0, data.len())
     };
+    // 尾部内嵌容器（老版本 `dart compile exe`）：内层自带符号表，指令段基准直接可读
+    if let Some(v) = appended_blob_symbols(data, pp) {
+        return Ok((v, false));
+    }
+    // LC_NOTE `__dart_app_snap` 指向的内嵌 blob：可能是 ELF（带符号，直接用）
+    // 也可能是 Mach-O dylib（不带符号，退化为"数据段魔数扫描 + 内嵌 __text 段起始"）
     if let Some(app) = crate::platform::macho::appended_dart_snapshot(data) {
-        if let Some((vm, iso)) = fallback_snapshot_offsets_in(data, app.blob_off, app.blob_end) {
-            return Ok(((vm, iso, app.text_off), false));
+        if let Some(v) = blob_symbols_at(data, app.blob_off, pp) {
+            return Ok((v, false));
+        }
+        if let (Some(text_off), Some((vm, iso))) = (
+            app.text_off,
+            fallback_snapshot_offsets_in(data, app.blob_off, app.blob_end),
+        ) {
+            return Ok(((vm, iso, text_off), false));
         }
     }
     if let Some((vm, iso)) = fallback_snapshot_offsets_in(data, lo, hi) {

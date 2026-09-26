@@ -239,8 +239,9 @@ pub struct AppendedSnap {
     pub blob_off: usize,
     /// blob 终点（魔数扫描上界）
     pub blob_end: usize,
-    /// 指令镜像起始的**文件偏移**（可直接当 instr_off 用：pc_offset 以 __text 段起始为基准）
-    pub text_off: u64,
+    /// 指令镜像起始的**文件偏移**（可直接当 instr_off 用：pc_offset 以 __text 段起始为基准）。
+    /// None = blob 不是 Mach-O（实测有内嵌 ELF 的场合），此时只能靠符号表定位。
+    pub text_off: Option<u64>,
 }
 
 /// 找内嵌快照；无 LC_NOTE / 无内嵌 Mach-O / 无 __text 时返回 None。
@@ -276,7 +277,9 @@ pub fn appended_dart_snapshot(data: &[u8]) -> Option<AppendedSnap> {
     if blob_off >= data.len() {
         return None;
     }
-    // blob 本体是 Mach-O dylib；__text 段起始即指令镜像基准
+    // blob 本体通常是 Mach-O dylib；__text 段起始即指令镜像基准。
+    // 也可能是 ELF（不同年代/平台的内嵌物不同），那就没有 __text 段可找——
+    // 此时仍返回 blob 范围，让调用方去解析它的符号表。
     let mut text_off: Option<u64> = None;
     each_section(data, blob_off, |name, _seg_fo, _addr, _size, fo| {
         if text_off.is_none() && name == "__text" {
@@ -286,7 +289,7 @@ pub fn appended_dart_snapshot(data: &[u8]) -> Option<AppendedSnap> {
     Some(AppendedSnap {
         blob_off,
         blob_end,
-        text_off: text_off?,
+        text_off,
     })
 }
 

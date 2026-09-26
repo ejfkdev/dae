@@ -114,10 +114,23 @@ impl<'a> Analyzer<'a> {
         if first_entry == 0 && pc_offsets.is_empty() {
             if profile.format.instructions_table_source == "code_text_offsets" {
                 if let Some(tos) = iso.text_offsets.clone() {
-                    pc_offsets = tos;
-                    // entry_for 的 idx = ci - code_base_ref - 1，故此处取
-                    // code_start_ref - 1 使首个 code 对象（ci=code_start_ref）→ idx 0
-                    code_base_ref = iso.code_start_ref.unwrap_or(1).saturating_sub(1);
+                    // 该路径的 text-offset 是**增量累加**出来的，个别版本（2.10）的累加
+                    // 口径不同，会得到负值（u64 里表现为巨大值）。这种表不能用：
+                    // 配上指令段基址会算出"看起来在文件内"的假地址，产物是垃圾而不是报错
+                    // （实测 2.10.4：399 843 条语句、38 161 行未映射）。宁可退回对象层。
+                    if tos.iter().any(|v| *v > i64::MAX as u64) {
+                        warnings.push(
+                            "code_text_offsets: the text-offset sequence contains negative values \
+                             (this version accumulates differently); function addresses are not \
+                             exportable (object layer only: frida/pp/objs)"
+                                .to_string(),
+                        );
+                    } else {
+                        pc_offsets = tos;
+                        // entry_for 的 idx = ci - code_base_ref - 1，故此处取
+                        // code_start_ref - 1 使首个 code 对象（ci=code_start_ref）→ idx 0
+                        code_base_ref = iso.code_start_ref.unwrap_or(1).saturating_sub(1);
+                    }
                 } else {
                     warnings.push("code_text_offsets: the Code cluster produced no text-offset sequence; function addresses unavailable".to_string());
                 }
@@ -554,7 +567,18 @@ impl<'a> Analyzer<'a> {
         if size <= eo {
             return None;
         }
-        Some((self.instr_base + self.pc_offsets[idx] + eo, size - eo))
+        let size = size - eo;
+        // 长度上界：函数不可能比文件还大。某些版本（2.10）的 text-offset 序列会给出
+        // 荒谬的差值，不拦住的话下游 `foff + csize` 会**回绕**并绕过边界检查，
+        // 直接崩在切片索引上（实测 2.10.4 rc=101）。
+        if size > self.data.len() as u64 {
+            return None;
+        }
+        let start = self.instr_base + self.pc_offsets[idx] + eo;
+        if start.checked_add(size)? > self.data.len() as u64 + self.slice_off {
+            return None;
+        }
+        Some((start, size))
     }
 
     /// ref → 所属 cluster 的 cid（含 VM base，参考 cid_of_obj）。二分索引 O(log n)。
