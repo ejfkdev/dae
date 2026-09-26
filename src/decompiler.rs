@@ -1117,12 +1117,14 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
 
 // ---------------------------------------------------------------- emit
 
+#[allow(clippy::too_many_arguments)]
 fn emit_function(
     name: &str,
     blocks: &[Block],
     rl: &Roles,
     out: &mut String,
     raw: &str,
+    chunks: &[u64],
     structured: &mut usize,
     fallback: &mut usize,
 ) {
@@ -1146,6 +1148,18 @@ fn emit_function(
     }
 
     let _ = writeln!(out, "\n// {name}");
+    if !chunks.is_empty() {
+        // 共享尾块：这些语句在地址上不属于本函数的主范围，但控制流属于本函数
+        let _ = writeln!(
+            out,
+            "// external chunks (shared code, addresses outside this function's range): {}",
+            chunks
+                .iter()
+                .map(|c| format!("{c:#x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let _ = writeln!(out, "// raw disassembly:");
     out.push_str("//");
     out.push_str(&raw.replace('\n', "\n//"));
@@ -1394,6 +1408,99 @@ fn dart_preamble(body: &str, defined: &BTreeSet<String>) -> String {
     out
 }
 
+/// 外部代码块（function chunk）：Dart AOT 会合并相同代码，于是某函数的分支目标会落在
+/// **别的函数的字节范围里**（实测 2.13.4：`Iterable.get_isNotEmpty` 跳到 `map` 范围内的
+/// 共享尾块，再跳回自己）。IDA/LLVM 把这种块当成本函数的一部分。
+///
+/// 纪律：只纳入「不是已知函数入口」的目标，每函数限块数/总字节数，遇到终止符
+/// （ret/ud2/hlt）或跳回本函数主范围就收尾——**绝不因此把别的函数吞进来**。
+const CHUNK_MAX_CHUNKS: usize = 8;
+const CHUNK_MAX_BYTES: usize = 256;
+
+fn lift_chunks(
+    cs: &Capstone,
+    analyzer: &Analyzer,
+    stmts: &[Stmt],
+    is_arm64: bool,
+    names: &BTreeMap<u64, String>,
+) -> (Vec<Stmt>, Vec<u64>) {
+    let Some(first) = stmts.first().map(|s| s.addr) else {
+        return (Vec::new(), Vec::new());
+    };
+    let last = stmts.last().map(|s| s.addr).unwrap_or(first);
+    let known: BTreeSet<u64> = stmts.iter().map(|s| s.addr).collect();
+    let mut targets: Vec<u64> = Vec::new();
+    for st in stmts {
+        if let Op::Branch { target, .. } = &st.op {
+            if *target != 0 && (*target < first || *target > last) {
+                targets.push(*target);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    let mut extra: Vec<Stmt> = Vec::new();
+    let mut chunk_addrs: Vec<u64> = Vec::new();
+    for t in targets {
+        if chunk_addrs.len() >= CHUNK_MAX_CHUNKS {
+            break;
+        }
+        // 目标是真函数入口 → 那是调用/尾调用，不该内联
+        if names.contains_key(&t) {
+            continue;
+        }
+        let foff = t + analyzer.slice_off;
+        if foff as usize >= analyzer.data.len() {
+            continue;
+        }
+        let want = CHUNK_MAX_BYTES.min(analyzer.data.len() - foff as usize);
+        let code = &analyzer.data[foff as usize..foff as usize + want];
+        let Ok(insns) = cs.disasm_all(code, t) else { continue };
+        let mut keep: Vec<u8> = Vec::new();
+        let mut end = t;
+        for ins in insns.iter() {
+            let mnem = ins.mnemonic().unwrap_or("").to_string();
+            let addr = ins.address();
+            // 收尾：终止符，或跳回主范围/已收录的地址（共享尾块通常是跳回自己）
+            // 收尾：终止符，或**任何**跳转回到主范围/已收录地址（共享尾块的典型结尾
+            // 是 `je <函数内的地址>`，只认无条件跳转会把下一个函数的代码也吞进来）
+            let is_branch = matches!(
+                mnem.as_str(),
+                "b" | "jmp" | "ret" | "retq" | "ud2" | "hlt" | "int3"
+            ) || mnem.starts_with("j")
+                || mnem.starts_with("b.");
+            let stops = matches!(mnem.as_str(), "ret" | "retq" | "ud2" | "hlt" | "int3")
+                || (is_branch
+                    && ins
+                        .op_str()
+                        .and_then(|o| parse_addr(o))
+                        .map(|x| (first..=last).contains(&x) || known.contains(&x))
+                        .unwrap_or(false));
+            let len = ins.bytes().len();
+            if addr + len as u64 > t + want as u64 {
+                break;
+            }
+            keep.extend_from_slice(ins.bytes());
+            end = addr + len as u64;
+            if stops {
+                break;
+            }
+        }
+        if end <= t {
+            continue;
+        }
+        let (mut cs_stmts, _raw) = lift(cs, analyzer, &keep, t, is_arm64, names);
+        // 块内不能出现与主范围重复的地址
+        cs_stmts.retain(|s| !known.contains(&s.addr));
+        if cs_stmts.is_empty() {
+            continue;
+        }
+        chunk_addrs.push(t);
+        extra.append(&mut cs_stmts);
+    }
+    (extra, chunk_addrs)
+}
+
 /// 建 capstone 实例。**开 skipdata**：遇到非指令字节（函数入口前的 0 填充、对齐
 /// padding）不中断整段反汇编，而是还原成 `.byte ..` 继续走——否则一个坏字节会让
 /// 整个函数从产物里消失（实测 `dart compile exe` 的部分函数入口前就带 16 字节 0）。
@@ -1541,12 +1648,18 @@ pub fn render(
                     continue;
                 }
                 let code = &analyzer.data[foff as usize..(foff + csize) as usize];
-                let (stmts, raw) = lift(&cs, analyzer, code, entry, is_arm64, &names);
+                let (mut stmts, raw) = lift(&cs, analyzer, code, entry, is_arm64, &names);
                 if stmts.is_empty() {
                     if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
                         eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} entry={entry:#x} csize={csize}", f.mangled, f.ep);
                     }
                     continue;
+                }
+                // 共享尾块（跳进别的函数范围又跳回来）也算本函数的一部分
+                let (extra, chunks) = lift_chunks(&cs, analyzer, &stmts, is_arm64, &names);
+                if !extra.is_empty() {
+                    stmts.extend(extra);
+                    stmts.sort_by_key(|s| s.addr);
                 }
                 let blocks = build_blocks(stmts);
                 stats.stmts += blocks.iter().map(|b| b.stmts.len()).sum::<usize>();
@@ -1554,7 +1667,6 @@ pub fn render(
                 for b in &blocks {
                     for st in &b.stmts {
                         match &st.op {
-                            Op::Other(_) => stats.unmapped += 1,
                             Op::Call { target: Some(_), resolved, .. } => {
                                 stats.calls += 1;
                                 if resolved.is_some() {
@@ -1583,15 +1695,20 @@ pub fn render(
                 if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
                     eprintln!("[dbg-dec] emit ep={:#x} entry={entry:#x} csize={csize} name={name}", f.ep);
                 }
+                let before = of.len();
                 emit_function(
                     &name,
                     &blocks,
                     &rl,
                     &mut of,
                     &raw,
+                    &chunks,
                     &mut stats.structured,
                     &mut stats.fallback,
                 );
+                // 未映射行只数**发射出去的**：原来的口径统计所有基本块，
+                // 把永远走不到的块也算进去，产物一变就虚高（chunk 之后尤其明显）
+                stats.unmapped += of[before..].matches("// unmapped:").count();
                 cnt += 1;
             }
         }
