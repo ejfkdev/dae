@@ -64,10 +64,18 @@ pub fn load_container(
 /// 符号表被剥离（dart2native exe）或裸快照（app-jit）时，按位置定位 VM/ISO 段
 /// （文件内偏移小者=VM 快照、大者=ISO 快照——生成器布局下成立）。
 pub fn fallback_snapshot_offsets(data: &[u8]) -> Option<(u64, u64)> {
+    fallback_snapshot_offsets_in(data, 0, data.len())
+}
+
+/// 同上，但只在 [lo, hi) 内扫描。fat Mach-O 必须限定在被分析切片内——否则
+/// 另一架构切片的快照会先命中（实测 universal 的 App.framework：x64 切片里
+/// 的数据段偏移更小，会被误当成 arm64 的 VM/ISO 偏移）。
+pub fn fallback_snapshot_offsets_in(data: &[u8], lo: usize, hi: usize) -> Option<(u64, u64)> {
     let magic: [u8; 4] = [0xf5, 0xf5, 0xdc, 0xdc];
+    let hi = hi.min(data.len());
     let mut poses = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= data.len() {
+    let mut i = lo;
+    while i + 4 <= hi {
         if data[i..i + 4] == magic {
             // 快照外层：magic + length(i64) + kind(i64)，kind 应在 1..8
             if i + 20 <= data.len() {
@@ -122,9 +130,16 @@ pub fn required_symbols(
     ))
 }
 
-/// 定位 VM/ISO/指令段文件偏移（symbols → 魔数扫描回退）。
-/// 返回 ((vm, iso, instr), 是否回退)。提取自 Analyzer::new，
-/// 供自动识别（detect）与解析共用同一份定位逻辑。
+/// 定位 VM/ISO/指令段文件偏移，三层依次尝试：
+/// 1. **符号表**（`symbols` → `symbols_alt`）：最精确，指令段基准直接来自符号值；
+/// 2. **内嵌快照**（Mach-O `LC_NOTE __dart_app_snap`）：`dart compile exe` 把 AOT 快照
+///    贴在可执行文件尾部且不留符号，此时数据段在 blob 内魔数扫描、指令段取内嵌
+///    dylib 的 `__text` 段起始。**跳过这一层会让所有函数地址落到错误位置**
+///    （instr=0 时 pc_offset 被当成文件偏移，反汇编到别的代码上）；
+/// 3. **切片内魔数扫描**：只拿到 VM/ISO，指令段不可得（返回 used_fallback=true，
+///    上层据此禁用地址相关产物）。
+///
+/// 返回 ((vm, iso, instr), 是否回退)。
 pub fn locate_snapshots(
     data: &[u8],
     pp: &PlatformProfile,
@@ -133,7 +148,18 @@ pub fn locate_snapshots(
     if let Ok(v) = required_symbols(&info, pp) {
         return Ok((v, false));
     }
-    if let Some((vm, iso)) = fallback_snapshot_offsets(data) {
+    // 魔数扫描限定在被分析切片内（fat 二进制里另一个架构的切片不能被扫到）
+    let (lo, hi) = if pp.container.kind == "macho" {
+        crate::platform::macho::fat_slice_range(data)
+    } else {
+        (0, data.len())
+    };
+    if let Some(app) = crate::platform::macho::appended_dart_snapshot(data) {
+        if let Some((vm, iso)) = fallback_snapshot_offsets_in(data, app.blob_off, app.blob_end) {
+            return Ok(((vm, iso, app.text_off), false));
+        }
+    }
+    if let Some((vm, iso)) = fallback_snapshot_offsets_in(data, lo, hi) {
         return Ok(((vm, iso, 0), true));
     }
     Err("平台符号缺失且快照魔数扫描回退失败".to_string())

@@ -133,6 +133,14 @@ impl<'a> Analyzer<'a> {
         }
         t("指令表", &mut since);
         let instr_base = instr_off.saturating_sub(slice_off);
+        if std::env::var("DART_AOT_VERBOSE").is_ok() {
+            eprintln!(
+                "[dbg] vm_off={vm_off:#x} iso_off={iso_off:#x} instr_off={instr_off:#x} slice_off={slice_off:#x} instr_base={instr_base:#x} pc_len={} pc_first={:#x} pc_last={:#x} first_entry={first_entry}",
+                pc_offsets.len(),
+                pc_offsets.first().copied().unwrap_or(0),
+                pc_offsets.last().copied().unwrap_or(0),
+            );
+        }
         let num_base = iso.hdr.get("num_base_objects");
 
         // cname_by_cid：iso 先（setdefault → 首见生效），vm 补缺。
@@ -319,17 +327,7 @@ impl<'a> Analyzer<'a> {
         if idx >= self.pc_offsets.len() {
             return None;
         }
-        let cluster_index = idx - self.first_entry as usize;
-        let eo = if self
-            .payload_infos
-            .get(cluster_index)
-            .map(|p| p & 1 != 0)
-            .unwrap_or(false)
-        {
-            self.platform.polymorphic_entry_offset_aot as u64
-        } else {
-            0
-        };
+        let eo = self.entry_offset(idx);
         let ep = self.instr_base + self.pc_offsets[idx] + eo;
         if ep < self.platform.code_floor {
             return None; // 容器头区域的假条目（去符号回退场景），见 PlatformProfile.code_floor
@@ -512,7 +510,8 @@ impl<'a> Analyzer<'a> {
     }
 
     /// 函数精确大小 = pc_offsets[idx+1] - pc_offsets[idx]；末条退化为 0x200
-    /// （对应参考实现 _code_size）。
+    /// （对应参考实现 _code_size）。注意这是**从 payload 边界**量的长度；
+    /// 多态入口（entry_for 的 eo）要从头部扣掉，故地址相关消费方应改用 code_range。
     pub fn code_size(&self, idx: usize) -> u64 {
         let n = self.pc_offsets.len();
         if (idx as u64) < self.first_entry || idx >= n {
@@ -522,6 +521,40 @@ impl<'a> Analyzer<'a> {
             return self.pc_offsets[idx + 1].saturating_sub(self.pc_offsets[idx]);
         }
         0x200
+    }
+
+    /// 多态入口偏移 eo（payload 内、真实入口之前的那几个字节的桩）。非多态为 0。
+    pub fn entry_offset(&self, idx: usize) -> u64 {
+        if idx < self.first_entry as usize {
+            return 0;
+        }
+        let cluster_index = idx - self.first_entry as usize;
+        if self
+            .payload_infos
+            .get(cluster_index)
+            .map(|p| p & 1 != 0)
+            .unwrap_or(false)
+        {
+            self.platform.polymorphic_entry_offset_aot as u64
+        } else {
+            0
+        }
+    }
+
+    /// 函数 (入口地址, 可反汇编字节数)。
+    ///
+    /// 入口 = payload + eo：arm64 的多态入口会在 payload 前面放一段桩，**真实代码在
+    /// payload+24**；从 payload 起反汇编会把桩当成函数体，且长度也会多算 eo 字节。
+    pub fn code_range(&self, idx: usize) -> Option<(u64, u64)> {
+        let size = self.code_size(idx);
+        if idx >= self.pc_offsets.len() {
+            return None;
+        }
+        let eo = self.entry_offset(idx);
+        if size <= eo {
+            return None;
+        }
+        Some((self.instr_base + self.pc_offsets[idx] + eo, size - eo))
     }
 
     /// ref → 所属 cluster 的 cid（含 VM base，参考 cid_of_obj）。二分索引 O(log n)。

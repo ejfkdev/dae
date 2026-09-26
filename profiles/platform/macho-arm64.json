@@ -11,6 +11,11 @@
     "isolate_data": "_kDartIsolateSnapshotData",
     "isolate_instructions": "_kDartIsolateSnapshotInstructions"
   },
+  "symbols_alt": {
+    "vm_data": "_kDartSnapshotData",
+    "isolate_data": "_kDartSnapshotData",
+    "isolate_instructions": "_kDartSnapshotText"
+  },
   "registers": {
     "thr": "x26",
     "pp": "x27",
