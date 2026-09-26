@@ -15,7 +15,7 @@
 
 ## 特性
 
-- **开箱即用、自动识别**——26 份 SDK profile + **21 份压缩指针变体**内嵌进二进制；按快照哈希匹配版本，变体（`compressed-pointers`，即所有移动端 Flutter 构建）按快照自带的 features 串自动选中，自定义/Flutter 引擎构建走结构探针兜底。已在真机应用上实测：Android arm64（Reqable 3.3.4、ChatGLM 3.11.6、学信网 3.7.2）与 macOS arm64。
+- **开箱即用、自动识别**——26 份 SDK profile + **21 份压缩指针变体**内嵌进二进制；按快照哈希匹配版本，变体（`compressed-pointers`，即所有移动端 Flutter 构建）按快照自带的 features 串自动选中，自定义/Flutter 引擎构建走结构探针兜底。已在真机应用上实测：Android arm64（Reqable 3.3.4、飞书 3.6.1、ChatGLM 3.11.6、学信网 3.7.2、微博 2.19.6）与 macOS arm64——五个安卓产物的指令表表项数与 aotopsy **完全一致**（57 960 / 79 327 / 30 782 / 19 752 / 22 623），全部 0 警告；飞书与微博的反编译产物还能通过 `dart analyze`（0 错误）。
 - **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
 - **渐进式模式**——`dae libs`/`classes`/`functions`/`strings`/`callers` 像查数据库一样查快照，
@@ -237,6 +237,12 @@ DAE_REQUIRE_GATES=1 cargo test --release
 
 ## 已知限制
 
+- **Dart 2.18.1 不可用。** 它的 fill 布局还有第二处**尚未定位**的错误：按源码判定的正确
+  `Function` 形状（2.19.6 样本与真机 2.19.6 产物双重印证）解析会塌陷成 `libraries=1 / classes=1`。
+  旧布局在 `hello_2.18.1.aot` 上分数更好，只是因为多读的那个 varint 在**补偿**另一处错——它同样
+  只解出 `classes=2`（健康值约 320）。该样本已连同原因登记进 `tests/ground_truth.rs` 的
+  `KNOWN_COLLAPSED`，而 `FUNC_FLOOR` 会让任何**新**的塌陷直接失败。在找到第二处错误之前，
+  2.18.1 应视为不支持；2.15/2.16/2.17 与 2.19+ 正常。
 - 地址是文件偏移空间，非运行时 VA（与 blutter 参考实现一致）
 - 快照/指令段定位分三层：符号表（`kDartVm*` / 单快照的 `kDartSnapshot*`）→ Mach-O 的
   `LC_NOTE __dart_app_snap` 内嵌 blob（`dart compile exe` 与部分 Flutter 产物）→ 被分析切片内

@@ -15,7 +15,7 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
 
 ## Features
 
-- **Self-contained & auto-detecting** — all 26 SDK profiles plus **21 compressed-pointer variants** are embedded; the Dart version is matched by snapshot hash and the variant (`compressed-pointers`, i.e. every mobile Flutter build) from the snapshot's own features string, with a structural-probe fallback for custom/Flutter-engine builds. Verified against real Flutter apps: Android arm64 (Reqable 3.3.4, ChatGLM 3.11.6, CHSI 3.7.2) and macOS arm64.
+- **Self-contained & auto-detecting** — all 26 SDK profiles plus **21 compressed-pointer variants** are embedded; the Dart version is matched by snapshot hash and the variant (`compressed-pointers`, i.e. every mobile Flutter build) from the snapshot's own features string, with a structural-probe fallback for custom/Flutter-engine builds. Verified against real Flutter apps: Android arm64 (Reqable 3.3.4, Lark 3.6.1, ChatGLM 3.11.6, CHSI 3.7.2, Weibo 2.19.6) and macOS arm64 — for the five Android builds the instructions-table entry count matches aotopsy exactly (57 960 / 79 327 / 30 782 / 19 752 / 22 623), all at zero warnings, and Lark and Weibo decompile to `dart analyze`-clean Dart.
 - **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference).
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
 - **Progressive mode** — `dae libs` / `classes` / `functions` / `strings` / `callers` to query the
@@ -262,6 +262,13 @@ Android source-truth chain, which needs `DAE_TRUTH_ANDROID=1`) are not affected.
 
 ## Known limitations
 
+- **Dart 2.18.1 is not usable.** Its fill layout has a second, still-unlocated error: with the
+  source-correct `Function` shape (which 2.19.6 and real 2.19.6 artifacts confirm) the parse
+  collapses to `libraries=1 / classes=1`. The previous layout scored better on `hello_2.18.1.aot`
+  only because an extra varint was compensating — it too parsed to `classes=2` against a healthy
+  ~320. The sample is registered in `KNOWN_COLLAPSED` in `tests/ground_truth.rs` with this reason,
+  and `FUNC_FLOOR` fails any *new* collapse. 2.18.1 should be treated as unsupported until that
+  second error is found; 2.15/2.16/2.17 and 2.19+ are fine.
 - Addresses are file-offset space, not runtime VAs (matches the blutter reference)
 - The snapshot/instructions sections are located in three layers: symbols (`kDartVm*` /
   single-snapshot `kDartSnapshot*`) → the Mach-O `LC_NOTE __dart_app_snap` appended blob
