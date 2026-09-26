@@ -124,8 +124,7 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
     let chunk = plan.len().div_ceil(n_threads).max(1);
     let ranges: Vec<(usize, usize)> = (0..plan.len())
         .step_by(chunk)
@@ -214,7 +213,7 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
     for p in parts.into_iter().flatten() {
         edges.extend(p);
     }
-    edges.sort_by(|a, b| (a.from, a.to, a.to_text.clone()).cmp(&(b.from, b.to, b.to_text.clone())));
+    edges.sort_by_key(|a| (a.from, a.to, a.to_text.clone()));
     edges
 }
 
@@ -410,6 +409,7 @@ fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
 /// * `mov r8d, <tag>; jmp <分配器>`（arm64 `mov/movk; b`）——**立刻转移**，是分配 stub；
 /// * `mov r8d, <tag>; je ..; cmp r8d, <运行期 cid>; jne <慢路径>`——**就地比较**，
 ///   是类型测试 stub（实测 x64 语料里 176 个 stub 有 88 个是这类，名字即被测类）。
+///
 /// 所以按「tag 物化之后是否立即无条件转移」分流，两条都只输出**解出来的**类名。
 fn alloc_stub_name(analyzer: &Analyzer, cs: &Capstone, addr: u64, is_arm64: bool) -> Option<String> {
     let foff = addr + analyzer.slice_off;

@@ -82,7 +82,7 @@ fn analyze(dir: &Path) -> Option<(usize, Vec<(String, usize)>)> {
     // 0=无问题、2=仅 warning/info、3=有 error、64=usage 错误（路径不存在等）
     let rc_agrees = match rc {
         3 => errors > 0,
-        0 | 1 | 2 => errors == 0,
+        0..=2 => errors == 0,
         _ => false,
     };
     if !summarized || !rc_agrees {
@@ -115,7 +115,7 @@ fn check(bin: &Path, out: &Path, label: &str, plat_name: &str) {
     let data: &'static [u8] = Box::leak(std::fs::read(bin).unwrap().into_boxed_slice());
     let (offs, _) = dae::platform::locate_snapshots(data, &plat).expect("定位快照");
     let sdk = dae::profile::detect::detect_or_default(data, offs, &s);
-    let a = Analyzer::new_located(data, &sdk, &plat, offs, false).expect("解析快照");
+    let a = Analyzer::new_located(data, sdk, &plat, offs, false).expect("解析快照");
     assert!(
         !a.warnings.iter().any(|w| w.starts_with("!!! drift")),
         "{label}: 自家源码产物解析漂移（profile/布局回归）：{:?}",

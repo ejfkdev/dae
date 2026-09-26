@@ -92,7 +92,7 @@ fn elf_func_symbols(data: &[u8]) -> BTreeMap<u64, String> {
             sym_off = u64at(o + 0x18) as usize;
             sym_num = (u64at(o + 0x20) as usize) / 24;
             sym_entsz = 24;
-            let link = u32at(o + 0x28) as usize; // sh_link
+            let link = u32at(o + 0x28); // sh_link
             let lo = shoff + link * shentsize;
             str_off = u64at(lo + 0x18) as usize;
             str_sz = u64at(lo + 0x20) as usize;
@@ -108,7 +108,7 @@ fn elf_func_symbols(data: &[u8]) -> BTreeMap<u64, String> {
         if o + 24 > data.len() {
             break;
         }
-        let st_name = u32at(o) as usize;
+        let st_name = u32at(o);
         let st_info = data[o + 4];
         let st_shndx = u16at(o + 6);
         let st_value = u64at(o + 8);

@@ -98,8 +98,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let t0 = std::time::Instant::now();
@@ -200,15 +199,15 @@ pub fn render_one(
         .collect();
     let mut of = String::with_capacity(insns.len() * 64 + 96);
     let _ = write!(of, "\n  {mangled}() {{\n");
-    let _ = write!(of, "    // ** addr: 0x{ep:x}, size: 0x{csize:x}\n");
+    let _ = writeln!(of, "    // ** addr: 0x{ep:x}, size: 0x{csize:x}");
     for (il, grp) in il_pass(analyzer, &insns) {
         if !il.is_empty() {
-            let _ = write!(of, "    // 0x{:x}: {}\n", grp[0].addr, il);
+            let _ = writeln!(of, "    // 0x{:x}: {}", grp[0].addr, il);
         }
         for insn in grp {
-            let _ = write!(
+            let _ = writeln!(
                 of,
-                "    //     0x{:x}: {:<12} {}\n",
+                "    //     0x{:x}: {:<12} {}",
                 insn.addr,
                 insn.mnem,
                 rewrite_ops(analyzer, &insn.ops)

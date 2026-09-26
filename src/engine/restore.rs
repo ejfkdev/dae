@@ -6,8 +6,8 @@ use std::collections::HashMap;
 /// DartLibrary::GetName() 的 mangling
 pub fn library_name(url: &str) -> String {
     let mut out = url.to_string();
-    if url.starts_with("package:") {
-        out = url[8..].to_string();
+    if let Some(rest) = url.strip_prefix("package:") {
+        out = rest.to_string();
     } else if url.starts_with("file:") {
         // 取倒数第二个 '/' 之后的段
         if let Some(i) = url.rfind('/') {
@@ -17,8 +17,8 @@ pub fn library_name(url: &str) -> String {
                 out = url[i + 1..].to_string();
             }
         }
-    } else if url.starts_with("dart:") {
-        out = format!("dart_{}", &url[5..]);
+    } else if let Some(rest) = url.strip_prefix("dart:") {
+        out = format!("dart_{rest}");
     }
     if let Some(stripped) = out.strip_suffix(".dart") {
         out = stripped.to_string();

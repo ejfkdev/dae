@@ -149,7 +149,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ContainerInfo, String> {
             let strtab_base = strtab.map(|t| t.offset as usize).unwrap_or(0);
             let strtab_size = strtab.map(|t| t.size as usize).unwrap_or(0);
             let entry_size = if s.entsize != 0 { s.entsize } else { if is64 { 24 } else { 16 } };
-            let count = if entry_size == 0 { 0 } else { (s.size / entry_size) as usize };
+            let count = s.size.checked_div(entry_size).unwrap_or(0) as usize;
             for i in 0..count {
                 let p = s.offset as usize + i * entry_size as usize;
                 if p + entry_size as usize > data.len() {

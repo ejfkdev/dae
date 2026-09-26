@@ -290,7 +290,7 @@ fn mask_regs(rl: &Roles, ops: &str) -> String {
     ] {
         pairs.push((k.to_string(), v.to_string()));
     }
-    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    pairs.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
     for (k, v) in &pairs {
         s = replace_word(&s, k, v);
     }
@@ -449,6 +449,7 @@ fn pool_map(analyzer: &Analyzer) -> BTreeMap<u64, String> {
 ///    CJK/控制字符），内联出来既读不懂也会破坏"产物零非 ASCII"的仓库口径；
 /// 2. **自己转义**：上游 `describe_into` 只做 `"{}"` 拼接，字符串里带引号/换行就会
 ///    把产物写成非法 Dart。
+///
 /// 不合规的（含非 ASCII、控制字符过多）返回 None → 调用方退回原来的 `mem(...)` 写法。
 fn dart_literal(raw: &str) -> Option<String> {
     const MAX: usize = 60;
@@ -461,8 +462,7 @@ fn dart_literal(raw: &str) -> Option<String> {
     }
     let mut out = String::with_capacity(raw.len() + 2);
     out.push('"');
-    let mut n = 0usize;
-    for c in raw.chars() {
+    for (n, c) in raw.chars().enumerate() {
         if n >= MAX {
             out.push_str("...");
             break;
@@ -479,7 +479,6 @@ fn dart_literal(raw: &str) -> Option<String> {
             '$' => out.push_str("\\$"),
             _ => out.push(c),
         }
-        n += 1;
     }
     out.push('"');
     Some(out)
@@ -562,8 +561,8 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // 池加载：ldr rN, [PP, #off] / mov rN, [PP+off]（x86）
     let ppx = rl.pp.to_uppercase();
-    if ops.contains(&ppx) || ops.contains(&rl.pp) {
-        if is_reg(&first) {
+    if (ops.contains(&ppx) || ops.contains(&rl.pp))
+        && is_reg(&first) {
             let idx = ops
                 .rfind("#0x")
                 .and_then(|i| u64::from_str_radix(&ops[i + 3..], 16).ok())
@@ -577,7 +576,6 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
                 src: Expr::Pool(idx),
             };
         }
-    }
     // 寄存器间 move
     if mnem == "mov" || mnem == "movq" || mnem == "movabs" {
         if is_reg(&first) && is_reg(&rest) {
@@ -590,7 +588,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             if let Some(v) = parse_imm_i(&rest) {
                 return Op::Assign {
                     dst: reg_name(&first),
-                    src: Expr::Imm(v as i64),
+                    src: Expr::Imm(v),
                 };
             }
             return Op::Assign {
@@ -722,7 +720,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         _ => None,
     };
     if let Some(op) = fbin {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 3 && is_reg(parts[0]) {
             return Op::Assign {
                 dst: reg_name(parts[0]),
@@ -732,7 +730,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // ---- 浮点一元/最值/转换：只标注读法，不猜类型 ----
     {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         let d = parts.first().copied().unwrap_or("");
         let unary = match mnem {
             "fneg" => Some("-"),
@@ -837,13 +835,13 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     // ---- 成对读写 stp/ldp：**栈基址**才是帧保存/恢复（纯簿记，合成注释）；
     //      其它基址是真实的对象字段读写，照常出语句。----
     if mnem == "stp" || mnem == "ldp" {
-        let base = mem_base(&ops);
+        let base = mem_base(ops);
         let is_stack = matches!(base, Some(b) if b == rl.sp.as_str() || b == "SP" || b == "sp");
         if is_stack {
             return Op::Note(format!("frame: {ops}"));
         }
         // 3 段 = 两个寄存器 + 一个地址（`ldp x0, x1, [x19, #0x10]`）
-        let parts: Vec<&str> = split_operands(&ops);
+        let parts: Vec<&str> = split_operands(ops);
         let (regs, mem) = if parts.len() >= 3 {
             (
                 format!("{}, {}", reg_name(parts[0].trim()), reg_name(parts[1].trim())),
@@ -895,20 +893,20 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // ---- 带进位/借位的加减（隐含标志位）：占位调用，别假装是普通加减 ----
     if mnem == "adc" || mnem == "adcx" {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 2 {
             return Op::Helper(format!("addCarry({}, {})", parts[0], parts[1]));
         }
     }
     if mnem == "sbb" || mnem == "sbcs" || mnem == "sbc" {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 2 {
             return Op::Helper(format!("subBorrow({}, {})", parts[0], parts[1]));
         }
     }
     // ---- 浮点取整到整数（arm64 fcvtm* = floor, fcvtp* = ceil）----
     if mnem.starts_with("fcvtm") || mnem.starts_with("fcvtp") || mnem.starts_with("fcvta") {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 2 && is_reg(parts[0]) {
             let which = if mnem.starts_with("fcvtm") {
                 "toIntFloor"
@@ -925,7 +923,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // ---- 融合乘减 msub d, n, m, a → d = a - (n * m) ----
     if mnem == "msub" {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 4 && is_reg(parts[0]) {
             return Op::Assign {
                 dst: reg_name(parts[0]),
@@ -935,7 +933,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // ---- 向量逻辑运算（xorps/andpd …）：与整数同形，标注 vector ----
     if matches!(mnem, "xorps" | "xorpd" | "andps" | "andpd" | "orps" | "orpd") {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 2 && is_reg(parts[0]) {
             let op = if mnem.starts_with("xor") {
                 "^"
@@ -959,7 +957,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         };
     }
     if mnem.starts_with("xchg") {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 2 {
             return Op::Helper(format!("xchg({}, {})", parts[0], parts[1]));
         }
@@ -977,7 +975,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // ---- 高位乘法（umulh/smulh）：结果取自乘积高位 ----
     if mnem == "umulh" || mnem == "smulh" {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 3 {
             return Op::Assign {
                 dst: reg_name(parts[0]),
@@ -994,7 +992,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     // ---- 独占存储（atomics）：目标寄存器是状态码，语义用占位调用表达 ----
     if mnem == "stxr" || mnem == "stlxr" {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 3 {
             return Op::Helper(format!("stxr({}, {})", reg_name(parts[0]), parts[2]));
         }
@@ -1021,7 +1019,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         }
     }
     if mnem.starts_with("cvt") {
-        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 2 && is_reg(parts[0]) {
             // 只标读法，不猜位宽
             let conv = if mnem.contains("2sd") {
@@ -1055,14 +1053,13 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         return Op::Note(format!("frame: {ops}"));
     }
     // ---- 负号/取反 ----
-    if mnem == "neg" || mnem == "mvn" {
-        if is_reg(&first) && is_reg(&rest) {
+    if (mnem == "neg" || mnem == "mvn")
+        && is_reg(&first) && is_reg(&rest) {
             return Op::Assign {
                 dst: reg_name(&first),
                 src: Expr::Text(format!("-{}", reg_name(&rest))),
             };
         }
-    }
     // ---- x64 零/符号扩展：movzx dst, byte ptr [..] 等 ----
     if mnem.starts_with("movzx") || mnem.starts_with("movsx") {
         let signed = mnem.starts_with("movsx");
@@ -1356,6 +1353,7 @@ fn mem_read(rl: &Roles, operand: &str) -> String {
 /// * `[PP, #0x2d8]`（arm64 常见，基址与位移分开）；
 /// * `[(PP + 0xb000), #0x778]`（adrp/add 折叠后基址带加数）；
 /// * `[PP + 0x17f7]`（x64：池指针**带 tag**，偏移是 `条目偏移 - 1`，且写在一个操作数里）。
+///
 /// 带 tag 的情况不靠平台知识判断，直接 `off` 与 `off + 1` 各试一次——池条目间距 8 字节，
 /// 相邻两个都是条目的概率为零，不会误命中。
 fn pool_value(rl: &Roles, m: &MemOperand) -> Option<String> {
@@ -1466,7 +1464,7 @@ fn mem_base(ops: &str) -> Option<&str> {
     let l = ops.find('[')?;
     let rest = &ops[l + 1..];
     let end = rest
-        .find(|c| c == ',' || c == ']')
+        .find([',', ']'])
         .unwrap_or(rest.len());
     Some(rest[..end].trim())
 }
@@ -1568,17 +1566,17 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
     }
     // 连边
     let starts: Vec<u64> = blocks.iter().map(|b| b.start).collect();
-    for i in 0..blocks.len() {
-        let last = blocks[i].stmts.last().cloned();
+    for (i, blk) in blocks.iter_mut().enumerate() {
+        let last = blk.stmts.last().cloned();
         let next = starts.get(i + 1).copied();
         match last.map(|s| s.op) {
             Some(Op::Branch { cond, target }) => {
                 if target != 0 && starts.contains(&target) {
-                    blocks[i].succs.push((cond.clone(), target));
+                    blk.succs.push((cond.clone(), target));
                 }
                 if cond.is_some() {
                     if let Some(nx) = next {
-                        blocks[i].succs.push((None, nx));
+                        blk.succs.push((None, nx));
                     }
                 }
             }
@@ -1587,7 +1585,7 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
             // 并为「陷阱/分发之后的字节」连出一条不存在的后续）
             _ => {
                 if let Some(nx) = next {
-                    blocks[i].succs.push((None, nx));
+                    blk.succs.push((None, nx));
                 }
             }
         }
@@ -1597,7 +1595,6 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
 
 // ---------------------------------------------------------------- emit
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     name: &str,
@@ -1987,7 +1984,7 @@ fn lift_chunks(
                 || (is_branch
                     && ins
                         .op_str()
-                        .and_then(|o| parse_addr(o))
+                        .and_then(parse_addr)
                         .map(|x| (first..=last).contains(&x) || known.contains(&x))
                         .unwrap_or(false));
             let len = ins.bytes().len();
@@ -2094,7 +2091,7 @@ pub fn render(
                     continue;
                 }
                 let n = dart_ident(
-                    &format!(
+                    format!(
                         "{}_{}",
                         _cls.replace(['.', ':', '&', '<', '>'], "_"),
                         f.mangled
@@ -2206,19 +2203,16 @@ pub fn render(
                 stats.blocks += blocks.len();
                 for b in &blocks {
                     for st in &b.stmts {
-                        match &st.op {
-                            Op::Call { target: Some(_), resolved, .. } => {
-                                stats.calls += 1;
-                                if resolved.is_some() {
-                                    stats.calls_named += 1;
-                                }
+                        if let Op::Call { target: Some(_), resolved, .. } = &st.op {
+                            stats.calls += 1;
+                            if resolved.is_some() {
+                                stats.calls_named += 1;
                             }
-                            _ => {}
                         }
                     }
                 }
                 let base = dart_ident(
-                    &format!(
+                    format!(
                         "{}_{}",
                         _cls.replace(['.', ':', '&', '<', '>'], "_"),
                         f.mangled
@@ -2297,7 +2291,7 @@ impl FieldCtx {
             return None;
         }
         let off = (disp + 1) as u64;
-        if off % self.word != 0 {
+        if !off.is_multiple_of(self.word) {
             return None;
         }
         Some(off)
@@ -2392,6 +2386,7 @@ pub fn recover_fields(analyzer: &Analyzer) -> Result<RecoveredFields, String> {
 /// 内存操作数 → (基址, 位移原文)。两种写法都要认：
 /// * arm64：`[x1, #0x17]` —— 基址与位移是两个逗号分隔的操作数；
 /// * x64：`[rdi + 0x17]` —— 基址与位移挤在**一个**操作数里（`+` 分隔）。
+///
 /// 三段式（`[base, index, lsl #3]`）返回 None：那是数组元素寻址，不是字段。
 fn base_disp(inner: &str) -> Option<(String, String)> {
     // 顶层（括号深度 0）的最后一个 `+` 处切开——`(mem(FP - 8)) + 7` 要切在外层那个 `+`
@@ -3290,10 +3285,9 @@ impl<'a> Structurer<'a> {
                 let fi = self.succ(h, 1);
                 let inside = ti.filter(|t| self.in_loop.get(t) == Some(&h));
                 let outside = fi.filter(|t| self.in_loop.get(t) != Some(&h));
-                if inside.is_some() && outside.is_some() {
-                    (Some(c), inside.unwrap())
-                } else {
-                    (None, self.succ(h, 0).unwrap_or(h))
+                match (inside, outside) {
+                    (Some(inn), Some(_)) => (Some(c), inn),
+                    _ => (None, self.succ(h, 0).unwrap_or(h)),
                 }
             }
             _ => (None, self.succ(h, 0).unwrap_or(h)),

@@ -91,15 +91,14 @@ pub fn parse_macho(data: &[u8]) -> Result<ContainerInfo, String> {
                     segs.push((va, vsize, foff));
                 }
             }
-            LC_SYMTAB => {
-                if p + 24 <= data.len() {
+            LC_SYMTAB
+                if p + 24 <= data.len() => {
                     let symoff = le32(&data[p + 8..p + 12]) as usize;
                     let nsyms = le32(&data[p + 12..p + 16]) as usize;
                     let stroff = le32(&data[p + 16..p + 20]) as usize;
                     let strsize = le32(&data[p + 20..p + 24]) as usize;
                     symtab = Some((symoff, nsyms, stroff, strsize));
                 }
-            }
             _ => {}
         }
         p += cmdsize;

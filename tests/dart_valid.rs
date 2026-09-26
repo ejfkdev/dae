@@ -64,7 +64,7 @@ fn analyze_errors(dir: &Path) -> Result<Vec<String>, String> {
         || text.contains("issue found");
     let rc_agrees = match rc {
         3 => !errs.is_empty(),
-        0 | 1 | 2 => errs.is_empty(),
+        0..=2 => errs.is_empty(),
         _ => false,
     };
     if !summarized || !rc_agrees {

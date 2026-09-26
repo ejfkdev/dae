@@ -398,7 +398,7 @@ fn source_anchors() {
     let s = dae::locale::messages(dae::locale::Lang::En);
     let (offs, _) = dae::platform::locate_snapshots(&data, &plat).unwrap();
     let sdk = dae::profile::detect::detect_or_default(&data, offs, &s);
-    let a = Analyzer::new_located(&data, &sdk, &plat, offs, false).unwrap();
+    let a = Analyzer::new_located(&data, sdk, &plat, offs, false).unwrap();
     let libs = a.build_functions(true);
     let out = std::env::temp_dir().join("dae_src_anchor");
     let _ = std::fs::remove_dir_all(&out);

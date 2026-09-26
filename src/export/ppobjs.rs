@@ -36,8 +36,7 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
     let n = entries.len();
     let chunk = n.div_ceil(n_threads).max(1);
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -53,17 +52,17 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
             let tx = tx.clone();
             scope.spawn(move || {
                 let mut of = String::with_capacity((e - b) * 48);
-                for i in b..e {
-                    let ent = &entries[i];
+                for (k, ent) in entries[b..e].iter().enumerate() {
+                    let i = b + k;
                     let off = 0x10 + i * 8;
                     if ent.typ == "obj" {
                         let _ = write!(of, "[pp+{off:#x}] ");
                         describe_into(analyzer, &mut of, ent.value.unwrap_or(0) as u64, 0);
                         of.push('\n');
                     } else if ent.typ == "imm" {
-                        let _ = write!(of, "[pp+{off:#x}] {}\n", hex_py(ent.value.unwrap_or(0)));
+                        let _ = writeln!(of, "[pp+{off:#x}] {}", hex_py(ent.value.unwrap_or(0)));
                     } else {
-                        let _ = write!(of, "[pp+{off:#x}] Stub\n");
+                        let _ = writeln!(of, "[pp+{off:#x}] Stub");
                     }
                 }
                 let _ = tx.send((pi, of));
@@ -103,8 +102,7 @@ fn write_objs(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
     let n = cands.len();
     let chunk = n.div_ceil(n_threads).max(1);
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -457,7 +455,7 @@ pub fn instance_block(analyzer: &Analyzer, ref_: u64, cid: u64, depth: usize) ->
             if vs.is_empty() {
                 continue; // null
             }
-            let h = hex_noprefix(off as i64);
+            let h = hex_noprefix(off);
             if let Some(nc) = nested_cid {
                 let inner =
                     instance_block(analyzer, v as u64, nc as u64, depth + 1).replace('\n', &format!("\n{pad}"));

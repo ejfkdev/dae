@@ -58,10 +58,10 @@ pub fn write(analyzer: &Analyzer, _libs: &LibGroups, out_dir: &Path) -> Result<u
     py.push_str("print(\"[dae] image base = {:#x}\".format(BN))\n\n");
 
     // 数据段
-    let _ = write!(py, "# {} named functions: (offset, size, name); size == 0 = boundary unknown\n", rows.len());
+    let _ = writeln!(py, "# {} named functions: (offset, size, name); size == 0 = boundary unknown", rows.len());
     py.push_str("NAMES = [\n");
     for (ep, size, name) in &rows {
-        let _ = write!(py, "    (0x{ep:x}, 0x{size:x}, \"{name}\"),\n");
+        let _ = writeln!(py, "    (0x{ep:x}, 0x{size:x}, \"{name}\"),");
     }
     py.push_str("]\n\n");
 

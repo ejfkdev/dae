@@ -214,9 +214,9 @@ impl<'a> Snapshot<'a> {
         profile: &SdkProfile,
         data: &'a [u8],
         base: usize,
-        mut out: Option<&mut Vec<String>>,
+        out: Option<&mut Vec<String>>,
     ) -> PResult<Snapshot<'a>> {
-        Self::parse_unit(profile, data, base, out.as_deref_mut(), false)
+        Self::parse_unit(profile, data, base, out, false)
     }
 
     /// 同 `parse`，但显式声明这是不是 VM isolate 快照（影响 canonical 表尾的读取）
@@ -224,7 +224,7 @@ impl<'a> Snapshot<'a> {
         profile: &SdkProfile,
         data: &'a [u8],
         base: usize,
-        mut out: Option<&mut Vec<String>>,
+        out: Option<&mut Vec<String>>,
         is_vm: bool,
     ) -> PResult<Snapshot<'a>> {
         if base + 20 > data.len() {
@@ -242,8 +242,7 @@ impl<'a> Snapshot<'a> {
             .position(|&b| b == 0)
             .map(|p| base + 52 + p)
             .ok_or("features 串未终止：快照起点可能有误".to_string())?;
-        let data_image = base + (((length as u64 + profile.object_start_alignment - 1)
-            / profile.object_start_alignment)
+        let data_image = base + ((length as u64).div_ceil(profile.object_start_alignment)
             * profile.object_start_alignment) as usize;
 
         let mut hdr = HashMap::new();
@@ -292,7 +291,7 @@ impl<'a> Snapshot<'a> {
             cid_index: Vec::new(),
         };
 
-        snap.parse_alloc(profile, &mut r, out.as_deref_mut())?;
+        snap.parse_alloc(profile, &mut r, out)?;
         snap.alloc_end = r.pos;
         snap.build_cid_index();
         Ok(snap)
@@ -548,7 +547,7 @@ impl<'a> Snapshot<'a> {
                 return None;
             }
             let u16s: Vec<u16> = d[a + 16..end]
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             Some(String::from_utf16_lossy(&u16s))

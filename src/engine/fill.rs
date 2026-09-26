@@ -256,7 +256,7 @@ pub fn fill_snapshot<'a>(
 }
 
 /// 布局解析：显式 cluster_layouts[cid] → 内置（instance/typed/typed_view）
-fn resolve_layout<'a>(profile: &'a SdkProfile, cid: u64) -> Option<&'a [Step]> {
+fn resolve_layout(profile: &SdkProfile, cid: u64) -> Option<&[Step]> {
     if let Some(ss) = profile.cluster_layouts.get(&cid.to_string()) {
         return Some(ss.pre());
     }
@@ -744,7 +744,7 @@ fn exec_compiled<'a>(
                     .ok_or_else(|| format!("string_fill 越界：{start:#x}+{nbytes}"))?;
                 let s = if two_byte {
                     let u16s: Vec<u16> = bytes
-                        .chunks_exact(2)
+                        .as_chunks::<2>().0.iter()
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
                     String::from_utf16_lossy(&u16s)
@@ -754,8 +754,8 @@ fn exec_compiled<'a>(
                 } else {
                     bytes.iter().map(|&b| b as char).collect() // latin1
                 };
-                if std::env::var("DART_AOT_DEBUG_STRFILL").is_ok() && (k < 6 || k % 5000 == 0) {
-                    eprintln!("[dbg-strfill] ref={} len={len} two_byte={two_byte} s={:?}", meta.start_ref + k, &s.chars().take(28).collect::<String>());
+                if std::env::var("DART_AOT_DEBUG_STRFILL").is_ok() && (k < 6 || k.is_multiple_of(5000)) {
+                    eprintln!("[dbg-strfill] ref={} len={len} two_byte={two_byte} s={:?}", meta.start_ref + k, s.chars().take(28).collect::<String>());
                 }
                 snap.strings.insert(meta.start_ref + k, Some(s));
             }
@@ -886,11 +886,8 @@ fn exec_compiled<'a>(
                 // 【临时实验，env 门控】alloc 与 fill 长度不一致 ⇒ fill 起点必然错位。
                 // alloc 长度是权威的（WriteAlloc/WriteFill 写同一个值），据此在整段数据里
                 // 反查能通过「全池解码」的位置并重定位，用于端到端确认漂移量。
-                if std::env::var("DAE_POOL_RELOCATE").is_ok()
-                    && alloc_len.is_some()
-                    && !alloc_agrees
-                {
-                    let al = alloc_len.unwrap();
+                if std::env::var("DAE_POOL_RELOCATE").is_ok() && !alloc_agrees {
+                  if let Some(al) = alloc_len {
                     let mut enc = Vec::new();
                     let mut v = al;
                     while v > 0x7f {
@@ -930,7 +927,7 @@ fn exec_compiled<'a>(
                             if ok {
                                 // 取离当前错位点最近的那个（绝对差最小）
                                 let d = (p as i64 - cur as i64).abs();
-                                if found.map_or(true, |f| (f as i64 - cur as i64).abs() > d) {
+                                if found.is_none_or(|f| (f as i64 - cur as i64).abs() > d) {
                                     found = Some(p);
                                 }
                             }
@@ -948,6 +945,7 @@ fn exec_compiled<'a>(
                     } else {
                         eprintln!("[dbg-relocate] 未找到可校验的池起点（alloc_len={al}）");
                     }
+                  }
                 }
                 if ln > 100000 && !alloc_agrees {
                     let mut np = None;

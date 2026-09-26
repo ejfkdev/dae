@@ -533,8 +533,7 @@ impl<'a> Analyzer<'a> {
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .min(8)
-            .max(1);
+            .clamp(1, 8);
         let n = funcs.len();
         let chunk = n.div_ceil(n_threads).max(1);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -872,8 +871,7 @@ fn n_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
-        .max(1)
+        .clamp(1, 8)
 }
 
 /// 清洗 ELF 函数符号名 → 简单可读名。去除 Precompiled_ 前缀、尾随 _<数字>；
@@ -911,7 +909,7 @@ fn elf_function_names(data: &[u8]) -> BTreeMap<u64, String> {
     // e_shoff(0x28 u64), e_shentsize(0x3a u16), e_shnum(0x3c u16), e_shstrndx(0x3e u16)
     // ELF (x86-64/etc) 为小端；以下一律按小端读。
     let le = |o: usize, n: usize| -> usize {
-        if o.checked_add(n).map_or(true, |e| e > data.len()) {
+        if o.checked_add(n).is_none_or(|e| e > data.len()) {
             usize::MAX
         } else {
             let mut v = 0usize;
@@ -971,7 +969,7 @@ fn elf_function_names(data: &[u8]) -> BTreeMap<u64, String> {
         }
         let sh_offset = le(sh + 0x18, 8);
         let sh_size = le(sh + 0x20, 8);
-        let sh_link = u32le(sh + 0x28) as u32;
+        let sh_link = u32le(sh + 0x28);
         let sh_entsize = le(sh + 0x38, 8);
         let entsize = if sh_entsize == 0 { 24 } else { sh_entsize };
         let (stro, strsz) = match strtabs.get(&sh_link) {
@@ -1092,8 +1090,9 @@ fn chunked_parent<'a>(
         drop(tx);
     });
     let nparts = iso_list.len().div_ceil(chunk);
-    let mut out: Vec<Option<(BTreeMap<i64, i64>, BTreeMap<i64, i64>)>> =
-        (0..nparts).map(|_| None).collect();
+    // 每个并行分片回收的两张映射（别名只为可读性，clippy::type_complexity）
+    type PartMaps = (BTreeMap<i64, i64>, BTreeMap<i64, i64>);
+    let mut out: Vec<Option<PartMaps>> = (0..nparts).map(|_| None).collect();
     for (pi, m) in rx {
         out[pi] = Some(m);
     }

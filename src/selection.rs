@@ -93,7 +93,7 @@ pub fn norm_lib(lib: &str) -> String {
         }
     }
     let s = s.trim_end_matches(".dart");
-    let s = s.replace('$', "/").replace(':', "/").replace("//", "/");
+    let s = s.replace(['$', ':'], "/").replace("//", "/");
     let s = s.trim_start_matches('/').to_string();
     s
 }

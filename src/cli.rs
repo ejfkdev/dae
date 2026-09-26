@@ -288,7 +288,7 @@ fn with_analyzer<T>(
         }
         None => crate::profile::detect::detect_or_default(&data, offs, s),
     };
-    let a = Analyzer::new_located(&data, &sdk, &platform, offs, used_fallback)?;
+    let a = Analyzer::new_located(&data, sdk, &platform, offs, used_fallback)?;
     if !quiet {
         // 诊断一律走 stderr：stdout 要留给数据（可管道）
         // SDK 行由 detect 自己打（同样是 stderr），这里只报目标与规模无关的定位信息
@@ -500,9 +500,9 @@ fn cmd_info(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
         );
         let _ = writeln!(
             out,
-            "{}\t{}",
+            "{}\t{:#x}",
             tr(lang, "指令段基址", "instructions base"),
-            format!("{:#x}", a.instr_base)
+            a.instr_base
         );
         let _ = writeln!(
             out,
@@ -527,9 +527,10 @@ fn cmd_info(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
         );
         let _ = writeln!(
             out,
-            "{}\t{}",
+            "{}\t{:?} / {:?}",
             tr(lang, "VM/ISO 对象", "VM/ISO objects"),
-            format!("{} / {}", a.vm.hdr.get("num_objects"), a.iso.hdr.get("num_objects"))
+            a.vm.hdr.get("num_objects"),
+            a.iso.hdr.get("num_objects")
         );
         let _ = writeln!(
             out,
@@ -550,7 +551,7 @@ fn cmd_libs(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
         let libs = a.build_functions(true);
         // 库名 → 类数 / 函数数；同时给出 url（libs.txt 里的原始 URL）便于对上
         let url_of = |target: &str| -> String {
-            for (_, rec) in &a.iso.libraries {
+            for rec in a.iso.libraries.values() {
                 let url = a.sref(rec.url_ref).unwrap_or_default();
                 if norm_lib(&url) == norm_lib(target) {
                     return url;
@@ -857,7 +858,7 @@ fn cmd_callers(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> 
             }
         }
         // 去重：同一调用点在同一函数里可能被记多次（多入口指向同一函数体）
-        rows.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+        rows.sort_by_key(|x| (x.0, x.1));
         rows.dedup_by_key(|r| (r.0, r.1));
         let mut out = String::new();
         for (at, fep, from, to, to_name) in rows.iter().take(limit_of(&o, usize::MAX)) {
