@@ -55,29 +55,29 @@ Fix history, in the order the analyzer found them (counts are for one real Flutt
 
 | sample | files | functions | structured | unmapped | analyze errors |
 |---|---|---|---|---|---|
-| hello_3.13.0 | 15 | 1174 | 1047 (89%) | 317 | 0 |
-| hello_3.12.2 | 15 | 1176 | 1049 (89%) | 311 | 0 |
-| hello_3.14b | 15 | 1161 | 1035 (89%) | 314 | 0 |
-| hello_3.11.6 | 15 | 1133 | 1015 (89%) | 275 | 0 |
-| hello_3.10.9 | 14 | 1104 | 987 (89%) | 274 | 0 |
-| hello_3.9.4 | 14 | 1106 | 991 (89%) | 286 | 0 |
-| hello_3.8.3 | 14 | 1103 | 989 (89%) | 286 | 0 |
-| hello_3.7.2 | 14 | 1111 | 996 (89%) | 287 | 0 |
-| hello_3.6.1 | 14 | 1108 | 1005 (90%) | 11 | 0 |
-| hello_3.5.0 | 13 | 1111 | 1007 (90%) | 11 | 0 |
-| hello_3.4.0 | 13 | 1138 | 1036 (91%) | 15 | 0 |
-| hello_3.3.4 (appended ELF blob) | 14 | 1130 | 1029 (91%) | 21 | 0 |
-| hello_3.2.0 | 14 | 1143 | 1029 (90%) | 290 | 0 |
-| hello_3.0.0 | 15 | 1207 | 1090 (90%) | 167 | 0 |
-| hello_2.19.6 | 2 | 229 | 212 (92%) | 22 | 0 |
-| hello_2.18.1 | 2 | 254 | 232 (91%) | 16 | 0 |
-| hello_2.17.0 | 14 | 1231 | 1114 (90%) | 159 | 0 |
-| hello_2.16.2 | 1 | 1086 | 995 (91%) | 142 | 0 |
-| hello_2.15.0 | 13 | 1167 | 1052 (90%) | 162 | 0 |
-| hello_2.14.4 (appended ELF blob) | 14 | 1123 | 1012 (90%) | 163 | 0 |
-| hello_2.13.4 (appended ELF blob) | 17 | 1259 | 1126 (89%) | 231 | 0 |
-| hello_2.12.4 (appended ELF blob) | 17 | 1212 | 1057 (87%) | 202 | 0 |
-| **testing_app (real Flutter app, arm64)** | 412 | 10245 | 9436 (92%) | 60 | 0 |
+| hello_3.13.0 | 15 | 1174 | 1051 (89%) | 170 | 0 |
+| hello_3.12.2 | 15 | 1176 | 1053 (89%) | 170 | 0 |
+| hello_3.14b | 15 | 1161 | 1039 (89%) | 170 | 0 |
+| hello_3.11.6 | 15 | 1133 | 1019 (89%) | 153 | 0 |
+| hello_3.10.9 | 14 | 1104 | 991 (89%) | 153 | 0 |
+| hello_3.9.4 | 14 | 1106 | 995 (89%) | 155 | 0 |
+| hello_3.8.3 | 14 | 1103 | 993 (90%) | 155 | 0 |
+| hello_3.7.2 | 14 | 1111 | 999 (89%) | 155 | 0 |
+| hello_3.6.1 | 14 | 1108 | 1007 (90%) | 1 | 0 |
+| hello_3.5.0 | 13 | 1111 | 1011 (90%) | 1 | 0 |
+| hello_3.4.0 | 13 | 1138 | 1040 (91%) | 1 | 0 |
+| hello_3.3.4 (appended ELF blob) | 14 | 1130 | 1033 (91%) | 1 | 0 |
+| hello_3.2.0 | 14 | 1143 | 1033 (90%) | 157 | 0 |
+| hello_3.0.0 | 15 | 1207 | 1094 (90%) | 35 | 0 |
+| hello_2.19.6 | 2 | 229 | 213 (93%) | 4 | 0 |
+| hello_2.18.1 | 2 | 254 | 234 (92%) | 3 | 0 |
+| hello_2.17.0 | 14 | 1231 | 1120 (90%) | 25 | 0 |
+| hello_2.16.2 | 1 | 1086 | 999 (91%) | 21 | 0 |
+| hello_2.15.0 | 13 | 1167 | 1059 (90%) | 26 | 0 |
+| hello_2.14.4 (appended ELF blob) | 14 | 1123 | 1019 (90%) | 26 | 0 |
+| hello_2.13.4 (appended ELF blob) | 17 | 1259 | 1133 (89%) | 42 | 0 |
+| hello_2.12.4 (appended ELF blob) | 17 | 1212 | 1063 (87%) | 44 | 0 |
+| **testing_app (real Flutter app, arm64)** | 412 | 10245 | 9502 (92%) | 3 | 0 |
 Totals: 691 files, 33,711 functions, **0 analyze errors**.
 
 The `unmapped` column counts instructions actually written out (it used to include blocks that
@@ -107,18 +107,26 @@ Code objects, and valid-Dart-ness is about syntax, not semantics. Only *address 
 
 ## Known weak spots (the backlog)
 
-1. **Old x64 executables (2.12–2.14, 3.3.4) were never weak** — 64–69% structured was the wrong
+1. Shared tails and irreducible loops: **forward** jumps into an already-emitted block are now
+   handled by tail duplication (`dup_tail` re-emits the straight-line run, marked with a
+   `duplicated tail` comment, bounded to 16 blocks / 256 statements per function or per run),
+   which recovered 66 functions on the app. **Backward** jumps to a non-header block are
+   genuinely irreducible loops (715 of them, verified: `is_loop_header=false`) — Dart cannot
+   express those without `goto`, so they keep `gotoLabel` and the `NOTE` header.
+2. `unmapped` is now down to single digits on most corpora (3 on the app, 1 on 3.3.4/3.4.0)
+   after the last lift batch (`xchg`/`idiv`/`sbc`/`adc`/`umulh`/`clz`/`stxr`/`br`/`msub`/`fcvtm*`/
+   SSE moves and conversions), with machine-only operations rendered as declared helper calls
+   (`Op::Helper`) rather than `// unmapped:`. `csel` conditions fold through the preceding `cmp`
+   now (`(x0 == x1) ? a : b` instead of `(hi) ? a : b`).
+3. **Old x64 executables (2.12–2.14, 3.3.4) were never weak** — 64–69% structured was the wrong
    bytes talking. With the addresses fixed they sit at **87–91% structured, 21–231 unmapped
    lines**, the same league as the rest. What genuinely remains for them: `add`/`or`/`sub`/`inc`/
    `dec` with a memory destination (`add byte ptr [rax], 8`) and `.byte` runs where the table's
    code size cuts a function short of its last branch target.
-2. `branch-to-done-block` (shared tail blocks) and `no-join:irreducible` — 809 of 10,245 app
-   functions stay unstructured and keep a `gotoLabel`; the shape is a jump to an already-emitted
-   block.
-3. No type recovery: every value is `dynamic`, field accesses are `mem(base, disp)`, and locals
+4. No type recovery: every value is `dynamic`, field accesses are `mem(base, disp)`, and locals
    are `local_m8`. Recovering types/fields is what would move the output from "readable
    pseudocode" to "recompilable code".
-4. The preamble is per file and mechanical; a smarter version would only declare what is used
+5. The preamble is per file and mechanical; a smarter version would only declare what is used
    and give the helpers real signatures.
 
 ## Adding a corpus

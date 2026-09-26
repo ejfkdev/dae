@@ -78,6 +78,12 @@ enum Op {
     Abort(i64),
     /// `cmp`/`tst`：只为保留地址占用一个语句位，不渲染（条件已并入紧随的分支）
     Cmp,
+    /// 间接跳转（arm64 `br x17` = 跳转表分发）：终止符，没有落空边
+    IndirectJump(String),
+    /// 用占位函数表达的机器操作（`xchg`/`idiv`/`sbc`/`fcvtms`…）：渲染成 `helper(args);`。
+    /// 与 `Other` 的区别：这些指令**认得出来**，只是没有 Dart 层的精确语义，
+    /// 写成占位调用比留成 `// unmapped:` 更接近实际（也便于 grep）。
+    Helper(String),
     /// 成对读（`ldp d1, d2, [base, disp]`）：Dart 没有元组赋值（`a, b = mem(...)` 不是
     /// 合法语法），渲染成 `memRead2(base, disp, d1, d2);`——语义是"读两个字进这两个寄存器"。
     PairLoad { base: String, disp: String, d1: String, d2: String },
@@ -140,6 +146,26 @@ fn lift(
             continue;
         }
         let s = match lift_one(&rl, is_arm64, &mnem, &ops, addr) {
+            // csel：条件码先换成 condFlag("cc")，再尝试用上一条 cmp 折成真条件
+            Op::Assign { dst, src: Expr::Text(t) } if mnem == "csel" || mnem == "csinc" => {
+                if let (Some((a, b)), Some(cc)) = (&last_cmp, sel_cc(&t)) {
+                    // fold_cond 的表是按跳转助记符（`b.eq`/`je`）写的，条件码要先补前缀；
+                    // **折不出来时它原样返回**，那就必须保留 condFlag(...)，不能把裸
+                    // `eq` 塞回去（`(eq) ? a : b` 过不了分析）。
+                    let as_branch = format!("b.{cc}");
+                    let folded = fold_cond(&as_branch, &Some((a.clone(), b.clone())));
+                    if folded == as_branch {
+                        Op::Assign { dst, src: Expr::Text(t) }
+                    } else {
+                        Op::Assign {
+                            dst,
+                            src: Expr::Text(t.replace(&sel_cond(cc), &folded)),
+                        }
+                    }
+                } else {
+                    Op::Assign { dst, src: Expr::Text(t) }
+                }
+            }
             Op::Branch { cond: Some(c), target } => {
                 // 条件已被这次分支消费：不清空的话，隔着若干条不设标志位的指令后
                 // 再来一个 `b.eq` 会错误复用**上一条**比较（拼出假条件）。
@@ -169,6 +195,22 @@ fn lift(
         out.push(Stmt { addr, op: s });
     }
     (out, raw)
+}
+
+/// 条件选择（csel）的条件码 → Dart 可达的布尔表达式。
+/// 认得的条件码（eq/ne/lt/gt…）写成 `condFlag("eq")`；调用方若能从上一条比较折出
+/// 真条件，会先用 `fold_cond` 替换掉它。返回值类型是 bool（占位函数声明如此），
+/// 这样 `(cond) ? a : b` 才过得了分析。
+fn sel_cond(cc: &str) -> String {
+    format!("condFlag(\"{cc}\")")
+}
+
+/// 从 `condFlag("hi")` 里取回条件码
+fn sel_cc(rendered: &str) -> Option<&str> {
+    let i = rendered.find("condFlag(\"")? + "condFlag(\"".len();
+    let rest = &rendered[i..];
+    let j = rest.find('"')?;
+    Some(&rest[..j])
 }
 
 /// 条件跳转 + 上一条比较 → 真条件表达式；拼不出来时保留 mnemonic（不猜）。
@@ -380,7 +422,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         }
     }
     // 寄存器间 move
-    if mnem == "mov" || mnem == "movq" {
+    if mnem == "mov" || mnem == "movq" || mnem == "movabs" {
         if is_reg(&first) && is_reg(&rest) {
             return Op::Assign {
                 dst: reg_name(&first),
@@ -492,9 +534,13 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     if mnem == "csel" || mnem == "csinc" {
         let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
         if parts.len() == 4 && is_reg(parts[0]) {
+            // 条件码（`hi`/`eq`…）不是 Dart 表达式：能从上一条 cmp 折出来就折，
+            // 折不出来写成 `condFlag("hi")`——返回 bool 的占位函数，别硬塞裸标识符
+            // （裸标识符会让 `(hi) ? a : b` 报 "Conditions must have a static type of 'bool'"）。
+            let cond = sel_cond(parts[3]);
             return Op::Assign {
                 dst: reg_name(parts[0]),
-                src: Expr::Text(format!("({}) ? {} : {}", parts[3], parts[1], parts[2])),
+                src: Expr::Text(format!("({cond}) ? {} : {}", parts[1], parts[2])),
             };
         }
     }
@@ -592,16 +638,16 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
                 src: Expr::Text(format!("({} as {})", parts[1], mnem)),
             };
         }
-        if mnem == "ubfiz" && parts.len() >= 4 && is_reg(d) {
+        if (mnem == "ubfiz" || mnem == "sbfiz") && parts.len() >= 4 && is_reg(d) {
             let lsb = parse_imm_i(parts[2]).unwrap_or(0);
             let w = parse_imm_i(parts[3]).unwrap_or(0);
             let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             return Op::Assign {
                 dst: reg_name(d),
-                src: Expr::Text(format!(
-                    "(({} & {mask:#x}) << {lsb})",
-                    parts[1]
-                )),
+                src: Expr::Text(match mnem {
+                    "sbfiz" => format!("(({} & {mask:#x}) << {lsb}) /* signed */", parts[1]),
+                    _ => format!("(({} & {mask:#x}) << {lsb})", parts[1]),
+                }),
             };
         }
         // cset dst, cond：条件成立取 1
@@ -678,6 +724,161 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             d1,
             d2,
         };
+    }
+    // ---- arm64 间接跳转 `br x17`：跳转表分发，是终止符（不落入下一条）----
+    if mnem == "br" || mnem == "braa" || mnem == "brab" {
+        return Op::IndirectJump(reg_name(&first));
+    }
+    // ---- 交换：xchg a, b（x64 常见于自旋锁/交换）----
+    // ---- 单操作数 imul（x86：RDX:RAX = RAX * 操作数）----
+    if mnem.starts_with("imul") && !ops.contains(',') {
+        return Op::Helper(format!("mul({first})"));
+    }
+    // ---- 带进位/借位的加减（隐含标志位）：占位调用，别假装是普通加减 ----
+    if mnem == "adc" || mnem == "adcx" {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            return Op::Helper(format!("addCarry({}, {})", parts[0], parts[1]));
+        }
+    }
+    if mnem == "sbb" || mnem == "sbcs" || mnem == "sbc" {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            return Op::Helper(format!("subBorrow({}, {})", parts[0], parts[1]));
+        }
+    }
+    // ---- 浮点取整到整数（arm64 fcvtm* = floor, fcvtp* = ceil）----
+    if mnem.starts_with("fcvtm") || mnem.starts_with("fcvtp") || mnem.starts_with("fcvta") {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 2 && is_reg(parts[0]) {
+            let which = if mnem.starts_with("fcvtm") {
+                "toIntFloor"
+            } else if mnem.starts_with("fcvtp") {
+                "toIntCeil"
+            } else {
+                "toIntRound"
+            };
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("{which}({})", parts[1])),
+            };
+        }
+    }
+    // ---- 融合乘减 msub d, n, m, a → d = a - (n * m) ----
+    if mnem == "msub" {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 4 && is_reg(parts[0]) {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("{} - ({} * {})", parts[3], parts[1], parts[2])),
+            };
+        }
+    }
+    // ---- 向量逻辑运算（xorps/andpd …）：与整数同形，标注 vector ----
+    if matches!(mnem, "xorps" | "xorpd" | "andps" | "andpd" | "orps" | "orpd") {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 2 && is_reg(parts[0]) {
+            let op = if mnem.starts_with("xor") {
+                "^"
+            } else if mnem.starts_with("and") {
+                "&"
+            } else {
+                "|"
+            };
+            let rhs = if parts.len() >= 3 { parts[2] } else { parts[1] };
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("({} {op} {rhs}) /* vector */", parts[1])),
+            };
+        }
+    }
+    // ---- 释放语义的存储（arm64 stlr）：就是一次存储 ----
+    if mnem.starts_with("stlr") {
+        return Op::Store {
+            target: rest.clone(),
+            value: reg_name(&first),
+        };
+    }
+    if mnem.starts_with("xchg") {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            return Op::Helper(format!("xchg({}, {})", parts[0], parts[1]));
+        }
+    }
+    // ---- 单操作数 neg（x64 `neg rax`）：dst = -dst ----
+    if mnem == "neg" && is_reg(&first) && rest.is_empty() {
+        return Op::Assign {
+            dst: reg_name(&first),
+            src: Expr::Text(format!("-{}", reg_name(&first))),
+        };
+    }
+    // ---- 有符号除法（x86 idiv 用隐含的 RDX:RAX，操作数里看不出来）：写成占位调用 ----
+    if mnem.starts_with("idiv") {
+        return Op::Helper(format!("idiv({first})"));
+    }
+    // ---- 高位乘法（umulh/smulh）：结果取自乘积高位 ----
+    if mnem == "umulh" || mnem == "smulh" {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 3 {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("mulHigh({} * {})", parts[1], parts[2])),
+            };
+        }
+    }
+    // ---- 前导零计数 ----
+    if mnem == "clz" && is_reg(&first) && !rest.is_empty() {
+        return Op::Assign {
+            dst: reg_name(&first),
+            src: Expr::Text(format!("clz({rest})")),
+        };
+    }
+    // ---- 独占存储（atomics）：目标寄存器是状态码，语义用占位调用表达 ----
+    if mnem == "stxr" || mnem == "stlxr" {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 3 {
+            return Op::Helper(format!("stxr({}, {})", reg_name(parts[0]), parts[2]));
+        }
+    }
+    if mnem == "clrex" {
+        return Op::Note("clrex (clear exclusive)".to_string());
+    }
+    // ---- 浮点搬移/转换（x64 SSE）：movsd/movss/movd 等搬移，cvt* 转换 ----
+    if (mnem.starts_with("movs") || mnem.starts_with("movd") || mnem.starts_with("movq")
+        || mnem.starts_with("movl"))
+        && !first.is_empty()
+    {
+        if first.contains('[') {
+            return Op::Store {
+                target: first.clone(),
+                value: rest.trim().to_string(),
+            };
+        }
+        if !rest.is_empty() {
+            return Op::Assign {
+                dst: reg_name(&first),
+                src: Expr::Reg(reg_name(&rest)),
+            };
+        }
+    }
+    if mnem.starts_with("cvt") {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 2 && is_reg(parts[0]) {
+            // 只标读法，不猜位宽
+            let conv = if mnem.contains("2sd") {
+                "toDouble"
+            } else if mnem.contains("2ss") {
+                "toFloat"
+            } else if mnem.contains("2si") || mnem.contains("2sq") {
+                "toInt"
+            } else {
+                "convert"
+            };
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("{conv}({})", parts[1])),
+            };
+        }
     }
     // ---- x64 帧簿记：push/pop（含 push rbp 的序言、pop rbp 的收尾）与对齐填充 ----
     if matches!(mnem, "push" | "pop" | "int3" | "nop" | "endbr64" | "endbr32") {
@@ -1102,9 +1303,9 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
                     }
                 }
             }
-            Some(Op::Return { .. }) | Some(Op::Abort(_)) => {}
-            // brk 也是终止符：不再造落空边（否则结构化器会把它当普通语句，
-            // 并为「陷阱之后的字节」连出一条不存在的后续）
+            Some(Op::Return { .. }) | Some(Op::Abort(_)) | Some(Op::IndirectJump(_)) => {}
+            // brk / br 也是终止符：不再造落空边（否则结构化器会把它当普通语句，
+            // 并为「陷阱/分发之后的字节」连出一条不存在的后续）
             _ => {
                 if let Some(nx) = next {
                     blocks[i].succs.push((None, nx));
@@ -1319,6 +1520,20 @@ const PSEUDO_FUNCS: &[(&str, &str)] = &[
     ("mem", "dynamic mem(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
     ("memSet", "dynamic memSet(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
     ("memRead2", "dynamic memRead2(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
+    ("gotoIndirect", "dynamic gotoIndirect(dynamic a) => null;"),
+    ("convert", "dynamic convert(dynamic a) => null;"),
+    ("mul", "dynamic mul(dynamic a) => null;"),
+    ("addCarry", "dynamic addCarry(dynamic a, dynamic b) => null;"),
+    ("subBorrow", "dynamic subBorrow(dynamic a, dynamic b) => null;"),
+    ("toIntFloor", "dynamic toIntFloor(dynamic a) => null;"),
+    ("toIntCeil", "dynamic toIntCeil(dynamic a) => null;"),
+    ("toIntRound", "dynamic toIntRound(dynamic a) => null;"),
+    ("xchg", "dynamic xchg(dynamic a, dynamic b) => null;"),
+    ("idiv", "dynamic idiv(dynamic a) => null;"),
+    ("mulHigh", "dynamic mulHigh(dynamic a) => null;"),
+    ("condFlag", "bool condFlag(String cc) => false;"),
+    ("clz", "dynamic clz(dynamic a) => null;"),
+    ("stxr", "dynamic stxr(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
     ("callIndirect", "dynamic callIndirect(dynamic a) => null;"),
     ("gotoLabel", "dynamic gotoLabel(dynamic a) => null;"),
     ("addr", "dynamic addr(dynamic a) => null;"),
@@ -1757,6 +1972,8 @@ struct Structurer<'a> {
     /// 但该循环体可能已经在别处发完了；此时再发 `continue` 就跑到循环外面去了
     /// （实测一个 10k 函数应用里有 1 例，dart analyze 报 continue_outside_of_loop）。
     loop_stack: Vec<usize>,
+    /// 尾复制已发射的语句数（每函数有上限，避免产物爆炸）
+    dup_lines: usize,
     unstructured: bool,
     /// 未结构化的**首个**原因（诊断用；一旦置位不再改写，便于归因统计）
     reason: String,
@@ -1863,6 +2080,7 @@ impl<'a> Structurer<'a> {
             in_loop,
             done: BTreeSet::new(),
             loop_stack: Vec::new(),
+            dup_lines: 0,
             unstructured: false,
             reason: String::new(),
         }
@@ -1884,7 +2102,10 @@ impl<'a> Structurer<'a> {
         let n = blk.stmts.len();
         let cut = matches!(
             self.term(b),
-            Some(Op::Branch { .. }) | Some(Op::Return { .. }) | Some(Op::Abort(_))
+            Some(Op::Branch { .. })
+                | Some(Op::Return { .. })
+                | Some(Op::Abort(_))
+                | Some(Op::IndirectJump(_))
         ) as usize;
         let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], &self.rl);
         for s in &nested {
@@ -1895,12 +2116,66 @@ impl<'a> Structurer<'a> {
         v
     }
 
+    /// 尾复制：目标块**已经发射过**（前向跳转 = 共享尾块），把那段直线代码再写一遍。
+    ///
+    /// 为什么不是 goto：Dart 没有 goto（产物只能写 `gotoLabel(...)` 占位），而共享尾块在
+    /// 真实 Dart 代码里对应的就是重复的代码；IDA/LLVM 对这种情况同样做尾复制。
+    /// 纪律：只复制**单后继的直线段**，必须在终止符（return/abort）收尾；段长与每函数
+    /// 总复制量都有上限；回头跳（循环）不复制。复制出来的语句前会打一行注释说明来源。
+    fn dup_tail(&mut self, start: usize, budget_blocks: usize) -> Option<Vec<Node>> {
+        let mut out: Vec<Node> = Vec::new();
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut b = start;
+        let mut lines = 0usize;
+        for _ in 0..budget_blocks {
+            if !seen.insert(b) {
+                return None; // 自环
+            }
+            lines += self.body_lines(b).len();
+            if self.dup_lines + lines > 256 {
+                return None;
+            }
+            out.extend(self.body_lines(b));
+            match self.term(b) {
+                Some(Op::Return { value }) => {
+                    out.push(Node::Line(match &value {
+                        Some(v) => format!("return {v};"),
+                        None => "return;".to_string(),
+                    }));
+                    self.dup_lines += lines;
+                    return Some(out);
+                }
+                Some(Op::Abort(n)) => {
+                    out.push(Node::Line(format!("abort(); // brk #{n:#x}")));
+                    self.dup_lines += lines;
+                    return Some(out);
+                }
+                // 有条件分支：复制它就得连两支一起复制，超出"共享尾块"的范围了
+                Some(Op::Branch { cond: Some(_), .. }) => return None,
+                Some(Op::Branch { cond: None, target }) => match self.idx.get(&target) {
+                    Some(&t) if t != b => b = t,
+                    _ => return None,
+                },
+                _ => match self.succ(b, 0) {
+                    Some(n) if n != b => b = n,
+                    _ => {
+                        self.dup_lines += lines;
+                        return Some(out);
+                    }
+                },
+            }
+        }
+        None
+    }
+
     /// 该分支是否「自身终止」（沿路只走单后继、最终遇到 return/brk/区域外跳转）。
     /// 用于 if-return 形状：`if (c) { return x; } <继续走另一支>`
     fn terminates(&self, mut b: usize) -> bool {
         for _ in 0..64 {
             match self.term(b) {
-                Some(Op::Return { .. }) | Some(Op::Abort(_)) => return true,
+                Some(Op::Return { .. }) | Some(Op::Abort(_)) | Some(Op::IndirectJump(_)) => {
+                    return true
+                }
                 Some(Op::Branch { cond: Some(_), .. }) => return false,
                 Some(Op::Branch { cond: None, target }) => match self.idx.get(&target) {
                     Some(&t) if t != b => b = t,
@@ -1997,6 +2272,10 @@ impl<'a> Structurer<'a> {
                 }
                 Some(Op::Abort(n)) => {
                     out.push(Node::Line(format!("abort(); // brk #{n:#x}")));
+                    break;
+                }
+                Some(Op::IndirectJump(r)) => {
+                    out.push(Node::Line(format!("gotoIndirect({r});")));
                     break;
                 }
                 Some(Op::Branch { cond: Some(c), target }) => {
@@ -2111,7 +2390,19 @@ impl<'a> Structurer<'a> {
                         Some(ti) if !self.done.contains(&ti) => {
                             cur = Some(ti);
                         }
-                        Some(_) => {
+                        Some(ti) => {
+                            let forward = self.blocks[ti].start > self.blocks[b].start;
+                            if forward {
+                                if let Some(tail) = self.dup_tail(ti, 16) {
+                                    out.push(Node::Line(format!(
+                                        "// duplicated tail (join at {:#x}; the same code was \
+                                         emitted above)",
+                                        self.blocks[ti].start
+                                    )));
+                                    out.extend(tail);
+                                    break;
+                                }
+                            }
                             self.bail("branch-to-done-block");
                             out.push(Node::Goto(target));
                             break;
@@ -2296,6 +2587,8 @@ fn render_op_inner(op: &Op, addr: u64) -> Option<String> {
     match op {
         Op::Assign { dst, src } => Some(format!("{dst} = {}; // {addr:#x}", src.text())),
         Op::Cmp => None,
+        Op::IndirectJump(r) => Some(format!("gotoIndirect({r}); // {addr:#x}")),
+        Op::Helper(t) => Some(format!("{t}; // {addr:#x}")),
         Op::PairLoad { base, disp, d1, d2 } => {
             Some(format!("memRead2({base}, {disp}, {d1}, {d2}); // {addr:#x}"))
         }
@@ -2360,7 +2653,13 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
     };
     for st in stmts {
         match &st.op {
-            Op::Note(_) | Op::Abort(_) | Op::Other(_) | Op::Cmp | Op::PairLoad { .. } => {
+            Op::Note(_)
+            | Op::Abort(_)
+            | Op::Other(_)
+            | Op::Cmp
+            | Op::IndirectJump(_)
+            | Op::Helper(_)
+            | Op::PairLoad { .. } => {
                 out.push(Stmt { addr: st.addr, op: st.op.clone() });
                 pending.clear();
                 continue;
