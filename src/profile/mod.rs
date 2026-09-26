@@ -54,6 +54,12 @@ impl HeaderField {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllocConfig {
     pub rodata_cids: Vec<u64>,
+    /// 压缩指针构建**没有 ROData 簇**（内存镜像不保证落在 4GB 内，见 SDK
+    /// `NewClusterForClass` 的 `#if !defined(DART_COMPRESSED_POINTERS)`），字符串
+    /// 改走普通簇：alloc 逐对象写 `(length<<1)|two_byte`，fill 重写该编码 + 原始字节。
+    /// 这些 cid 列在这里 → alloc kind = "string"。
+    #[serde(default)]
+    pub string_cids: Vec<u64>,
     pub var_cids: Vec<u64>,
     pub mint_cid: u64,
     pub code_cid: u64,
@@ -175,6 +181,17 @@ pub enum Step {
     },
     /// 跳过 lengths[k] * elem_width(cid) 原始字节（TypedData payload）
     SkipRawElemWidth,
+    /// 跳过「别名里刚读到的变长值」所指的字节数（`shift` 位移，默认 0）。
+    /// 压缩指针构建里 PcDescriptors / CodeSourceMap 的 fill 是 `uvarint(len) + len 字节`；
+    /// CompressedStackMaps 的 len 在 `flags_and_size` 的 bit2 起（`shift: 2`）。
+    SkipAliasBytes {
+        on: String,
+        #[serde(default)]
+        shift: Option<u32>,
+    },
+    /// 压缩指针构建的字符串簇 fill：`uvarint((len<<1)|two_byte)` + 原始字节
+    /// → 解码后写进 strings 表（与 rodata 路径产出的字符串同形）
+    StringFill,
     /// 对齐填充：跳到 position % n == 0（≤2.9 ExternalTypedData 的
     /// kDataSerializationAlignment=8 对齐）
     SkipAlign { n: u64 },
@@ -414,7 +431,10 @@ impl SdkProfile {
     /// class / instance / library / function
     pub fn alloc_kind(&self, cid: u64) -> &'static str {
         let a = &self.alloc;
-        if a.rodata_cids.contains(&cid) {
+        if a.string_cids.contains(&cid) {
+            // 压缩指针构建的字符串簇（填充式，不是 rodata 偏移）
+            "string"
+        } else if a.rodata_cids.contains(&cid) {
             "rodata"
         } else if self.is_var_kind(cid) {
             "var"
@@ -535,7 +555,53 @@ pub const SDK_PROFILES: &[(&str, &str)] = &[
     ("dart/2.19.6", include_str!("../../profiles/sdk/dart-2.19.6-w64-no-compressed.json")),
     ("dart/1.24.3", include_str!("../../profiles/sdk/dart-1.24.3-w64-no-compressed.json")),
     ("dart/2.0.0", include_str!("../../profiles/sdk/dart-2.0.0-w64-no-compressed.json")),
+    // ---- 压缩指针变体（移动端 Flutter 产物：Android/iOS 目标默认 compressed-pointers）----
+    ("dart/2.13.4", include_str!("../../profiles/sdk/dart-2.13.4-w32-compressed.json")),
+    ("dart/2.14.4", include_str!("../../profiles/sdk/dart-2.14.4-w32-compressed.json")),
+    ("dart/2.15.0", include_str!("../../profiles/sdk/dart-2.15.0-w32-compressed.json")),
+    ("dart/2.16.2", include_str!("../../profiles/sdk/dart-2.16.2-w32-compressed.json")),
+    ("dart/2.17.0", include_str!("../../profiles/sdk/dart-2.17.0-w32-compressed.json")),
+    ("dart/2.18.1", include_str!("../../profiles/sdk/dart-2.18.1-w32-compressed.json")),
+    ("dart/2.19.6", include_str!("../../profiles/sdk/dart-2.19.6-w32-compressed.json")),
+    ("dart/3.0.0", include_str!("../../profiles/sdk/dart-3.0.0-w32-compressed.json")),
+    ("dart/3.2.0", include_str!("../../profiles/sdk/dart-3.2.0-w32-compressed.json")),
+    ("dart/3.3.4", include_str!("../../profiles/sdk/dart-3.3.4-w32-compressed.json")),
+    ("dart/3.4.0", include_str!("../../profiles/sdk/dart-3.4.0-w32-compressed.json")),
+    ("dart/3.5.0", include_str!("../../profiles/sdk/dart-3.5.0-w32-compressed.json")),
+    ("dart/3.6.1", include_str!("../../profiles/sdk/dart-3.6.1-w32-compressed.json")),
+    ("dart/3.7.2", include_str!("../../profiles/sdk/dart-3.7.2-w32-compressed.json")),
+    ("dart/3.8.3", include_str!("../../profiles/sdk/dart-3.8.3-w32-compressed.json")),
+    ("dart/3.9.4", include_str!("../../profiles/sdk/dart-3.9.4-w32-compressed.json")),
+    ("dart/3.10.9", include_str!("../../profiles/sdk/dart-3.10.9-w32-compressed.json")),
+    ("dart/3.11.6", include_str!("../../profiles/sdk/dart-3.11.6-w32-compressed.json")),
+    ("dart/3.12.2", include_str!("../../profiles/sdk/dart-3.12.2-w32-compressed.json")),
+    ("dart/3.13.0", include_str!("../../profiles/sdk/dart-3.13.0-w32-compressed.json")),
+    ("dart/3.14.0-95.1.beta", include_str!("../../profiles/sdk/dart-3.14.0-95.1.beta-w32-compressed.json")),
 ];
+
+/// Profile 变体标签。同一 SDK 版本可以有多个变体：桌面/无压缩指针（默认）与
+/// **移动端压缩指针**（`--compressed`，字符串走填充簇、词宽 4、无 ROData 簇）。
+/// 由 profile 自身的 `compressed_pointers` 推出，不额外加 schema 字段。
+pub const VARIANT_DEFAULT: &str = "w64-no-compressed";
+pub const VARIANT_COMPRESSED: &str = "w32-compressed";
+
+pub fn variant_of(p: &SdkProfile) -> &'static str {
+    if p.compressed_pointers {
+        VARIANT_COMPRESSED
+    } else {
+        VARIANT_DEFAULT
+    }
+}
+
+/// 从快照 features 串判定需要哪个变体（`compressed-pointers` 是唯一判据；
+/// `dwarf_stack_traces_mode` 只影响 Code 簇的少量 ref，dae 两种模式实测都能读，不参与选型）。
+pub fn wanted_variant(features: &str) -> &'static str {
+    if features.split_whitespace().any(|f| f == "compressed-pointers") {
+        VARIANT_COMPRESSED
+    } else {
+        VARIANT_DEFAULT
+    }
+}
 
 /// 解析后的注册表（惰性，一次）
 static SDK_REGISTRY: OnceLock<Vec<(String, SdkProfile)>> = OnceLock::new();

@@ -286,8 +286,17 @@ fn field_into_or_null(analyzer: &Analyzer, w: &mut String, kind: &str, v: i64, d
     }
 }
 
+/// 值嵌套的深度上限：数组元素是**无界递归**（`List([List([…`）；正常产物 5 层足够，
+/// 超过就写 `...` 收尾。这条是拿真机的坏快照试出来的——移动端产物解析失配时
+/// ref 指向垃圾，数组自引用会让递归打穿线程栈（导出线程 2MB），进程直接 SIGABRT。
+const MAX_FIELD_DEPTH: usize = 8;
+
 /// _field_val 的 sink 版：文本写入 w，返回嵌套用户类 cid（无嵌套为 None）。
 fn field_into(analyzer: &Analyzer, w: &mut String, kind: &str, v: i64, depth: usize) -> Option<i64> {
+    if depth > MAX_FIELD_DEPTH {
+        w.push_str("...");
+        return None;
+    }
     if kind == "unboxed" {
         let u = v as u64;
         if u <= 0x1000_0000_0000_0000 || u >= 0xFFFF_FFFF_FFFF_0000 {

@@ -228,6 +228,17 @@ fn run(
             s.target_label, nl, s.sum_libs, nc, s.sum_classes, nf, s.sum_funcs
         );
     }
+    // 解析漂移 = 快照布局与所选 Profile 不匹配（实测：移动端 product + compressed-pointers
+    // 产物会漂成 libraries=1/classes=1）。此时**所有**产物都不可信，但对象池/字符串这类
+    // 原始 dump 仍可人工核对，所以照常落盘、额外写一份 PARSE_DRIFT.txt，并以非零退出码收尾
+    // ——让脚本和人都不会把垃圾当成结果。
+    let drift: Vec<String> = analyzer
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("!!! drift") || w.starts_with("!! alloc mismatch"))
+        .cloned()
+        .collect();
+
     let summary = export::run_with(&analyzer, &out_abs, sel)?;
     println!("{} {}:", s.export_done, out_display);
     println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
@@ -304,6 +315,30 @@ fn run(
         s.elapsed_label,
         since.elapsed().as_secs_f64()
     );
+    if !drift.is_empty() {
+        let mut body = String::from(
+            "Snapshot parse drifted: the SDK profile does not match this binary.\n\
+             Every artifact in this directory was produced from a mismatched parse and must not be trusted.\n\
+             The raw dumps (text/strings.txt, text/pp.txt) are still worth reading by hand.\n\n",
+        );
+        for w in &drift {
+            body.push_str(w);
+            body.push('\n');
+        }
+        body.push_str(
+            "\nCommon cause: a mobile/Android build (features string contains `compressed-pointers`,\n\
+             and often `dwarf_stack_traces_mode`) analyzed with a desktop profile.\n\
+             Run `dae info <binary>` to see the detected SDK and the warnings, then pass an\n\
+             explicit --sdk-profile if you have one for that build.\n",
+        );
+        let _ = std::fs::write(out_abs.join("PARSE_DRIFT.txt"), &body);
+        eprintln!("{}", s.parse_drift_fatal);
+        return Err(if s.lang == dae::locale::Lang::Zh {
+            format!("快照解析漂移（{} 条告警）——产物不可信，详见 {}/PARSE_DRIFT.txt", drift.len(), out_abs.display())
+        } else {
+            format!("parse drifted ({} warnings) -- artifacts not trustworthy, see {}/PARSE_DRIFT.txt", drift.len(), out_abs.display())
+        });
+    }
     Ok(())
 }
 

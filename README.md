@@ -15,7 +15,7 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
 
 ## Features
 
-- **Self-contained & auto-detecting** — all 26 SDK profiles are embedded; the Dart version is matched by snapshot hash, with a structural-probe fallback for custom/Flutter-engine builds.
+- **Self-contained & auto-detecting** — all 26 SDK profiles plus **21 compressed-pointer variants** are embedded; the Dart version is matched by snapshot hash and the variant (`compressed-pointers`, i.e. every mobile Flutter build) from the snapshot's own features string, with a structural-probe fallback for custom/Flutter-engine builds. Verified against real Flutter apps: Android arm64 (Reqable 3.3.4, ChatGLM 3.11.6, CHSI 3.7.2) and macOS arm64.
 - **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference).
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
 - **Progressive mode** — `dae libs` / `classes` / `functions` / `strings` / `callers` to query the

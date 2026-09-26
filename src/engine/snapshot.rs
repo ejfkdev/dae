@@ -120,6 +120,11 @@ pub struct Snapshot<'a> {
     pub objectpool_entries: Option<Vec<PoolEntry>>,
     pub payload_infos: Option<Vec<u64>>,
     pub code_start_ref: Option<u64>,
+    /// VM isolate 快照标记。canonical 集合的表尾（`WriteCanonicalSetLayout`）在 VM 侧
+    /// **不写**：SDK 的字符串簇是 `StringSerializationCluster(is_canonical,
+    /// cluster_represents_canonical_set && !vm_)`；而压缩指针构建下 VM 的字符串簇
+    /// canonical 位仍为 1，按「canonical 就读表尾」会多读一段 → 整个 VM 快照漂移。
+    pub is_vm: bool,
     /// ≤2.16（bare instructions）：Code fill 的 text-offset delta 逐对象累加和，
     /// 顺序 = 非 deferred code 对象的填充顺序（对应 SDK previous_text_offset_）。
     /// entry_point = instr_base + text_offsets[i] (+polymorphic 偏移)。
@@ -200,6 +205,7 @@ impl<'a> Snapshot<'a> {
             payload_infos: None,
             code_start_ref: None,
             text_offsets: None,
+            is_vm: false,
         }
     }
 
@@ -209,6 +215,17 @@ impl<'a> Snapshot<'a> {
         data: &'a [u8],
         base: usize,
         mut out: Option<&mut Vec<String>>,
+    ) -> PResult<Snapshot<'a>> {
+        Self::parse_unit(profile, data, base, out.as_deref_mut(), false)
+    }
+
+    /// 同 `parse`，但显式声明这是不是 VM isolate 快照（影响 canonical 表尾的读取）
+    pub fn parse_unit(
+        profile: &SdkProfile,
+        data: &'a [u8],
+        base: usize,
+        mut out: Option<&mut Vec<String>>,
+        is_vm: bool,
     ) -> PResult<Snapshot<'a>> {
         if base + 20 > data.len() {
             return Err(format!("快照 @ {base:#x} 越界（文件太小?）"));
@@ -240,6 +257,11 @@ impl<'a> Snapshot<'a> {
             hdr.insert(f.name().to_string(), v);
         }
         let hdr = Header { map: hdr };
+        if std::env::var("DART_AOT_DEBUG_HDR").is_ok() {
+            let mut v: Vec<String> = hdr.map.iter().map(|(k, x)| format!("{k}={x}")).collect();
+            v.sort();
+            eprintln!("[dbg-hdr] {}", v.join(" "));
+        }
 
         let mut snap = Snapshot {
             data,
@@ -266,6 +288,7 @@ impl<'a> Snapshot<'a> {
             payload_infos: None,
             code_start_ref: None,
             text_offsets: None,
+            is_vm,
             cid_index: Vec::new(),
         };
 
@@ -335,10 +358,14 @@ impl<'a> Snapshot<'a> {
                     predefined_count: 0,
                     class_ids: Vec::new(),
                 });
+                if std::env::var("DART_AOT_DEBUG_ALLOC").is_ok() {
+                    eprintln!("[dbg-alloc] i={i} cid={cid} cid_only pos={:#x}", r.pos);
+                }
                 continue;
             }
             let count = r.read_unsigned()?;
             let kind = profile.alloc_kind(cid).to_string();
+            let alloc_pos = r.pos;
             let mut meta = ClusterMeta {
                 cid,
                 canonical,
@@ -353,8 +380,24 @@ impl<'a> Snapshot<'a> {
                 predefined_count: 0,
                 class_ids: Vec::new(),
             };
+            if std::env::var("DART_AOT_DEBUG_ALLOC").is_ok() {
+                eprintln!("[dbg-alloc] i={i} cid={cid} kind={kind} count={count} pos={alloc_pos:#x}");
+            }
+            if std::env::var("DART_AOT_DEBUG_ALLOC_LENS").is_ok() && cid == 23 {
+                // 用副本 Reader 窥探，不动真流
+                let mut peek = Reader { data: r.data, pos: r.pos };
+                let mut tmp = Vec::new();
+                for _ in 0..count.min(10) {
+                    match peek.read_unsigned() {
+                        Ok(v) => tmp.push(v),
+                        Err(_) => break,
+                    }
+                }
+                eprintln!("[dbg-lens23] count={count} 前 10 个 alloc 长度: {tmp:?}");
+            }
             match kind.as_str() {
-                "var" => {
+                "var" | "string" => {
+                    // string（压缩指针构建）：逐对象 `(length<<1)|two_byte`，fill 侧再解
                     for _ in 0..count {
                         meta.lengths.push(r.read_unsigned()?);
                     }
@@ -440,7 +483,14 @@ impl<'a> Snapshot<'a> {
                 eprintln!("[dbg-cluster] #{i} @+{} cid={cid} canonical={} count={} kind={}",
                     r.pos, canonical, count, kind);
             }
-            if canonical && profile.alloc.canonical_table_cids.contains(&cid) {
+            // canonical 集合表尾（`WriteCanonicalSetLayout`）的两种形态，SDK 里分别对应：
+            //  * **rodata 字符串簇**（非压缩构建）：`RODataSerializationCluster` 的
+            //    `is_canonical && IsStringClassId(cid)` —— **没有** `!vm_`，VM 侧照写表尾；
+            //  * **填充式字符串簇**（压缩构建，`string_cids`）：`StringSerializationCluster(
+            //    is_canonical, cluster_represents_canonical_set && !vm_)` —— VM 侧**不写**，
+            //    而该簇的 canonical 位仍为 1，照读会多读一段 → 整个 VM 快照漂移（实测）。
+            let vm_filled_strings = self.is_vm && kind == "string";
+            if canonical && !vm_filled_strings && profile.alloc.canonical_table_cids.contains(&cid) {
                 // canonical 表：table_length + [first_element] + gaps。
                 // first_element 仅「子集型」表写入（2.13/2.14 = 只有 Type 簇，
                 // kAllCanonicalObjectsAreIncludedIntoSet=false；2.15+ 全部簇都写）。

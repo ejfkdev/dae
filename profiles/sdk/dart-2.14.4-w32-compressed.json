@@ -1,27 +1,27 @@
 {
-  "abi": "dart/3.9.4",
+  "abi": "dart/2.14.4",
   "_meta": {
     "generator_rev": 3
   },
-  "word_size": 8,
-  "compressed_pointers": false,
-  "status": "verified",
+  "word_size": 4,
+  "compressed_pointers": true,
+  "status": "unverified",
   "format": {
-    "ref_encoding": "ref_id_128",
-    "instructions_table_source": "snapshot_rodata",
-    "cluster_header": "cid_tags",
+    "ref_encoding": "unsigned_leb128",
+    "instructions_table_source": "code_text_offsets",
+    "cluster_header": "cid_and_canonical",
     "single_snapshot": false,
     "class_alloc": "pre_ids",
     "code_leading_refs": 0,
-    "string_clusters_separate": false,
+    "string_clusters_separate": true,
     "code_alloc": "state_deferred",
     "type_dual_count": false,
     "instance_legacy": false,
     "objectpool_legacy": false,
-    "objectpool_type_low7": false,
+    "objectpool_type_low7": true,
     "objectpool_type_low7_swapped": false,
-    "code_refs": 6,
-    "code_has_text_offset": false,
+    "code_refs": 7,
+    "code_has_text_offset": true,
     "class_fill_adj": 0,
     "code_fill_adj": 0,
     "elf_name_backfill": false
@@ -40,11 +40,11 @@
       "kind": "unsigned"
     },
     {
-      "name": "instructions_table_len",
+      "name": "initial_field_table_len",
       "kind": "unsigned"
     },
     {
-      "name": "instructions_table_rodata_offset",
+      "name": "instructions_table_len",
       "kind": "unsigned"
     }
   ],
@@ -54,45 +54,53 @@
     "object_alignment_log2": 4,
     "smi_mask": 1,
     "smi_shift": 1,
-    "cid_tag_pos": 12,
-    "cid_tag_mask": 1048575,
-    "num_predefined_cids": 175
+    "cid_tag_pos": 16,
+    "cid_tag_mask": 65535,
+    "num_predefined_cids": 152
   },
   "full_aot_kind": 3,
-  "object_start_alignment": 64,
+  "object_start_alignment": 16,
   "alloc": {
-    "rodata_cids": [
+    "rodata_cids": [],
+    "string_cids": [
+      81,
+      82,
+      83
+    ],
+    "var_cids": [
+      20,
+      21,
+      22,
+      23,
       24,
       25,
       26,
+      27,
+      44,
+      79,
+      80
+    ],
+    "mint_cid": 54,
+    "code_cid": 16,
+    "class_cid": 4,
+    "instance_cid": 42,
+    "instance_min": 152,
+    "library_cid": 12,
+    "function_cid": 6,
+    "type_cid": 46,
+    "type_parameter_cid": 49,
+    "ffi_cids": [
+      65,
+      66,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
       93,
       94,
-      95
-    ],
-    "var_cids": [
-      17,
-      23,
-      27,
-      28,
-      29,
-      30,
-      47,
-      67,
-      90,
-      91
-    ],
-    "mint_cid": 61,
-    "code_cid": 18,
-    "class_cid": 5,
-    "instance_cid": 45,
-    "instance_min": 175,
-    "library_cid": 13,
-    "function_cid": 7,
-    "type_cid": 49,
-    "type_parameter_cid": 52,
-    "ffi_cids": [
-      72,
-      73,
+      95,
       96,
       97,
       98,
@@ -100,27 +108,18 @@
       100,
       101,
       102,
-      103,
-      104,
-      105,
-      106,
-      107,
-      108,
-      109,
-      110,
-      111
+      103
     ],
     "canonical_table_cids": [
+      44,
+      46,
       47,
       49,
-      50,
-      51,
-      52,
-      93
+      81
     ],
-    "typed_data_first": 112,
-    "typed_data_count": 56,
-    "typed_data_stride": 4,
+    "typed_data_first": 104,
+    "typed_data_count": 42,
+    "typed_data_stride": 3,
     "typed_data_elem_widths": [
       1,
       1,
@@ -138,23 +137,20 @@
       16
     ],
     "typed_data_var_rem": [
-      0,
-      2
+      0
     ],
     "typed_data_view_rem": [
-      1,
-      3
+      1
     ],
-    "string_cid": 93,
-    "one_byte_string_cid": 94,
-    "two_byte_string_cid": 95,
+    "string_cid": 81,
+    "one_byte_string_cid": 82,
+    "two_byte_string_cid": 83,
     "canonical_subset_table_cids": [
+      44,
+      46,
       47,
       49,
-      50,
-      51,
-      52,
-      93
+      81
     ],
     "cid_only_alloc_cids": []
   },
@@ -184,9 +180,70 @@
     "Float64x2"
   ],
   "cluster_layouts": {
-    "5": {
-      "_doc": "Class: 13 refs + 7 varint，class_id>=2^20 无 unboxed bitmap",
-      "steps": [
+    "4": {
+      "pre": [
+        {
+          "op": "refs",
+          "n": 13,
+          "aliases": [
+            "name_ref",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "library_ref",
+            null,
+            "super_type_ref",
+            null,
+            null,
+            null
+          ]
+        },
+        {
+          "op": "svarint",
+          "alias": "class_id"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint",
+          "alias": "nfo"
+        },
+        {
+          "op": "svarint",
+          "alias": "tao"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "svarint"
+        },
+        {
+          "op": "uvarint",
+          "alias": "fbm"
+        },
+        {
+          "op": "emit",
+          "store": "classes",
+          "fields": {
+            "name_ref": "name_ref",
+            "library_ref": "library_ref",
+            "class_id": "class_id",
+            "super_type_ref": "super_type_ref",
+            "next_field_off": "nfo",
+            "type_arg_off": "tao",
+            "field_bitmap": "fbm"
+          }
+        }
+      ],
+      "post": [
         {
           "op": "refs",
           "n": 13,
@@ -233,7 +290,7 @@
         {
           "op": "cond",
           "on": "class_id",
-          "lt": 1048576,
+          "lt": 65536,
           "then": [
             {
               "op": "uvarint",
@@ -259,14 +316,15 @@
         }
       ]
     },
-    "6": {
+    "5": {
       "_doc": "PatchClass: 2 refs (wrapped_class, script)",
       "steps": [
         {
           "op": "refs",
-          "n": 2,
+          "n": 3,
           "aliases": [
             "wrapped_class",
+            null,
             null
           ]
         },
@@ -279,7 +337,7 @@
         }
       ]
     },
-    "7": {
+    "6": {
       "_doc": "Function: name, owner, signature, data refs + code_index(ReadUnsigned) + kind_tag(uint32 有符号变长)",
       "steps": [
         {
@@ -297,6 +355,9 @@
           "alias": "code_index"
         },
         {
+          "op": "svarint"
+        },
+        {
           "op": "svarint",
           "alias": "kind_tag"
         },
@@ -312,7 +373,7 @@
         }
       ]
     },
-    "8": {
+    "7": {
       "_doc": "TypeParameters: 4 refs (names, flags, bounds, defaults)",
       "steps": [
         {
@@ -321,19 +382,23 @@
         }
       ]
     },
-    "9": {
+    "8": {
       "_doc": "ClosureData (AOT: context_scope 不写): 2 refs + packed_fields(ReadUnsigned)",
       "steps": [
         {
           "op": "refs",
-          "n": 2
+          "n": 2,
+          "aliases": [
+            "parent_function",
+            "closure"
+          ]
         },
         {
           "op": "uvarint"
         }
       ]
     },
-    "10": {
+    "9": {
       "_doc": "FfiTrampolineData: 4 refs + callback_id int32 + ffi_function_kind uint8",
       "steps": [
         {
@@ -341,14 +406,11 @@
           "n": 4
         },
         {
-          "op": "svarint"
-        },
-        {
-          "op": "byte"
+          "op": "uvarint"
         }
       ]
     },
-    "11": {
+    "10": {
       "_doc": "Field: 4 refs (name/owner/type/initializer) + kind_bits + host_offset_or_field_id(Smi)",
       "steps": [
         {
@@ -373,6 +435,16 @@
           ]
         },
         {
+          "op": "cond",
+          "on": "kind_bits",
+          "bit": 0,
+          "then": [
+            {
+              "op": "uvarint"
+            }
+          ]
+        },
+        {
           "op": "emit",
           "store": "fields",
           "fields": {
@@ -384,7 +456,7 @@
         }
       ]
     },
-    "12": {
+    "11": {
       "_doc": "Script (AOT PRODUCT): url ref + kernel_script_index int32",
       "steps": [
         {
@@ -396,7 +468,7 @@
         }
       ]
     },
-    "13": {
+    "12": {
       "_doc": "Library: 10 refs (name=0, url=1) + index + num_imports + load_state + flags",
       "steps": [
         {
@@ -429,7 +501,7 @@
         }
       ]
     },
-    "14": {
+    "13": {
       "_doc": "Namespace (AOT: 仅 target)",
       "steps": [
         {
@@ -438,33 +510,19 @@
         }
       ]
     },
-    "17": {
-      "_doc": "WeakArray: length(ReadUnsigned) + N refs",
-      "steps": [
-        {
-          "op": "uvarint"
-        },
-        {
-          "op": "loop",
-          "times": "lengths",
-          "steps": [
-            {
-              "op": "refs",
-              "n": 1
-            }
-          ]
-        }
-      ]
-    },
-    "18": {
+    "16": {
       "_doc": "Code: payload_info(uvarint, 仅 k<nondef) + 6 refs，捕获 payload_infos/code_start_ref",
       "steps": [
         {
-          "op": "code"
+          "op": "text_offset"
+        },
+        {
+          "op": "refs",
+          "n": 8
         }
       ]
     },
-    "23": {
+    "20": {
       "_doc": "ObjectPool: 每对象 length + 每 entry bits 派遣（捕获 pp.txt entries）",
       "steps": [
         {
@@ -472,19 +530,47 @@
         }
       ]
     },
-    "24": {
-      "_doc": "PcDescriptors (ROData): fill 空",
-      "steps": []
+    "21": {
+      "_doc": "压缩指针：PcDescriptors 普通簇（fill = uvarint(len) + len 字节）",
+      "steps": [
+        {
+          "op": "uvarint",
+          "alias": "n"
+        },
+        {
+          "op": "skip_alias_bytes",
+          "on": "n"
+        }
+      ]
+    },
+    "22": {
+      "_doc": "压缩指针：CodeSourceMap 普通簇（fill = uvarint(len) + len 字节）",
+      "steps": [
+        {
+          "op": "uvarint",
+          "alias": "n"
+        },
+        {
+          "op": "skip_alias_bytes",
+          "on": "n"
+        }
+      ]
+    },
+    "23": {
+      "_doc": "压缩指针：CompressedStackMaps 普通簇（长度在 flags_and_size 的 bit2 起）",
+      "steps": [
+        {
+          "op": "uvarint",
+          "alias": "n"
+        },
+        {
+          "op": "skip_alias_bytes",
+          "on": "n",
+          "shift": 2
+        }
+      ]
     },
     "25": {
-      "_doc": "CodeSourceMap (ROData): fill 空",
-      "steps": []
-    },
-    "26": {
-      "_doc": "CompressedStackMaps (ROData): fill 空",
-      "steps": []
-    },
-    "28": {
       "_doc": "ExceptionHandlers: packed_fields + handled_types ref + N*(pc,svarint×2,byte×3)",
       "steps": [
         {
@@ -517,7 +603,7 @@
         }
       ]
     },
-    "29": {
+    "26": {
       "_doc": "Context: length + parent ref + N refs",
       "steps": [
         {
@@ -539,7 +625,7 @@
         }
       ]
     },
-    "35": {
+    "30": {
       "_doc": "UnlinkedCall: 2 refs + can_patch_to_monomorphic byte",
       "steps": [
         {
@@ -551,22 +637,16 @@
         }
       ]
     },
-    "38": {
+    "35": {
       "_doc": "SubtypeTestCache: cache ref + num_inputs + num_occupied",
       "steps": [
         {
           "op": "refs",
           "n": 1
-        },
-        {
-          "op": "svarint"
-        },
-        {
-          "op": "svarint"
         }
       ]
     },
-    "39": {
+    "36": {
       "_doc": "LoadingUnit: parent ref + id int32",
       "steps": [
         {
@@ -578,7 +658,7 @@
         }
       ]
     },
-    "47": {
+    "44": {
       "_doc": "TypeArguments: length + hash int32 + nullability + instantiations ref + N types refs",
       "steps": [
         {
@@ -606,28 +686,32 @@
         }
       ]
     },
-    "49": {
+    "46": {
       "_doc": "Type: 3 refs + flags(ReadUnsigned)，type_class_id=(flags>>4)&cid_tag_mask",
       "steps": [
         {
           "op": "refs",
-          "n": 3
+          "n": 4,
+          "aliases": [
+            null,
+            "tc",
+            null,
+            null
+          ]
         },
         {
-          "op": "uvarint",
-          "alias": "flags",
-          "transform": "shr4_and_mask"
+          "op": "byte"
         },
         {
           "op": "emit",
           "store": "type_cids",
           "fields": {
-            "type_cid": "flags"
+            "type_cid": "tc"
           }
         }
       ]
     },
-    "50": {
+    "47": {
       "_doc": "FunctionType: 6 refs + flags uint8 + packed counts",
       "steps": [
         {
@@ -645,19 +729,7 @@
         }
       ]
     },
-    "51": {
-      "_doc": "RecordType: 4 refs + flags uint8",
-      "steps": [
-        {
-          "op": "refs",
-          "n": 4
-        },
-        {
-          "op": "byte"
-        }
-      ]
-    },
-    "52": {
+    "49": {
       "_doc": "TypeParameter: 3 refs + base int16 + index int16 + flags uint8",
       "steps": [
         {
@@ -668,14 +740,17 @@
           "op": "svarint"
         },
         {
-          "op": "svarint"
+          "op": "byte"
+        },
+        {
+          "op": "byte"
         },
         {
           "op": "byte"
         }
       ]
     },
-    "57": {
+    "50": {
       "_doc": "Closure: 6 refs",
       "steps": [
         {
@@ -684,11 +759,11 @@
         }
       ]
     },
-    "61": {
+    "54": {
       "_doc": "Mint: fill 空（值在 alloc 捕获）",
       "steps": []
     },
-    "62": {
+    "55": {
       "_doc": "Double: 每对象 1 有符号变长 int64",
       "steps": [
         {
@@ -696,73 +771,7 @@
         }
       ]
     },
-    "67": {
-      "_doc": "Record: shape(ReadUnsigned) + N refs",
-      "steps": [
-        {
-          "op": "uvarint"
-        },
-        {
-          "op": "loop",
-          "times": "lengths",
-          "steps": [
-            {
-              "op": "refs",
-              "n": 1
-            }
-          ]
-        }
-      ]
-    },
-    "87": {
-      "_doc": "ConstMap: type_arguments, hash_mask, data, used_data, deleted_keys → map_data",
-      "steps": [
-        {
-          "op": "refs",
-          "n": 5,
-          "aliases": [
-            null,
-            null,
-            "data_ref",
-            "used_ref",
-            null
-          ]
-        },
-        {
-          "op": "emit",
-          "store": "map_data",
-          "fields": {
-            "data_ref": "data_ref",
-            "used_ref": "used_ref"
-          }
-        }
-      ]
-    },
-    "89": {
-      "_doc": "ConstSet: 同 ConstMap → map_data",
-      "steps": [
-        {
-          "op": "refs",
-          "n": 5,
-          "aliases": [
-            null,
-            null,
-            "data_ref",
-            "used_ref",
-            null
-          ]
-        },
-        {
-          "op": "emit",
-          "store": "map_data",
-          "fields": {
-            "data_ref": "data_ref",
-            "used_ref": "used_ref"
-          }
-        }
-      ]
-    },
-    "90": {
+    "79": {
       "_doc": "Array: length + type_arguments ref + N refs → array_elements",
       "steps": [
         {
@@ -796,7 +805,7 @@
         }
       ]
     },
-    "91": {
+    "80": {
       "_doc": "ImmutableArray: 同 Array",
       "steps": [
         {
@@ -830,7 +839,7 @@
         }
       ]
     },
-    "92": {
+    "57": {
       "_doc": "GrowableObjectArray: 3 refs",
       "steps": [
         {
@@ -839,43 +848,23 @@
         }
       ]
     },
-    "93": {
-      "_doc": "String (ROData): fill 空（引擎按 offsets 解码）",
-      "steps": []
-    },
-    "27": {
+    "81": {
+      "_doc": "压缩指针：String 普通簇（alloc `(len<<1)|two_byte`，fill 重写编码 + 原始字节）",
       "steps": [
         {
-          "op": "uvarint"
-        },
-        {
-          "op": "loop",
-          "times": "lengths",
-          "steps": [
-            {
-              "op": "refs",
-              "n": 1
-            },
-            {
-              "op": "svarint"
-            },
-            {
-              "op": "svarint"
-            },
-            {
-              "op": "svarint"
-            },
-            {
-              "op": "svarint"
-            },
-            {
-              "op": "svarint"
-            }
-          ]
+          "op": "string_fill"
         }
       ]
     },
-    "30": {
+    "48": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    },
+    "27": {
       "steps": [
         {
           "op": "uvarint"
@@ -889,14 +878,85 @@
           "steps": [
             {
               "op": "refs",
-              "n": 4
+              "n": 1
             }
           ]
         }
       ]
     },
+    "33": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 4
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "34": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 4
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
+    "70": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 3
+        }
+      ]
+    },
+    "37": {
+      "steps": [
+        {
+          "op": "uvarint"
+        },
+        {
+          "op": "refs",
+          "n": 1
+        }
+      ]
+    },
+    "38": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "byte"
+        }
+      ]
+    },
+    "39": {
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "svarint"
+        }
+      ]
+    },
     "40": {
-      "steps": []
+      "steps": [
+        {
+          "op": "refs",
+          "n": 1
+        },
+        {
+          "op": "svarint"
+        }
+      ]
     },
     "41": {
       "steps": [
@@ -906,27 +966,19 @@
         }
       ]
     },
-    "42": {
+    "82": {
+      "_doc": "压缩指针：String 普通簇（alloc `(len<<1)|two_byte`，fill 重写编码 + 原始字节）",
       "steps": [
         {
-          "op": "refs",
-          "n": 4
+          "op": "string_fill"
         }
       ]
     },
-    "43": {
+    "83": {
+      "_doc": "压缩指针：String 普通簇（alloc `(len<<1)|two_byte`，fill 重写编码 + 原始字节）",
       "steps": [
         {
-          "op": "refs",
-          "n": 2
-        }
-      ]
-    },
-    "44": {
-      "steps": [
-        {
-          "op": "refs",
-          "n": 1
+          "op": "string_fill"
         }
       ]
     }
@@ -934,352 +986,302 @@
   "frida_cid_constants": [
     [
       "ClassIdTagPos",
-      "12"
+      "16"
     ],
     [
       "ClassIdTagMask",
-      "0xfffff"
+      "0xffff"
     ],
     [
       "NumPredefinedCids",
-      "175"
+      "152"
     ],
     [
       "CidObject",
-      "45"
+      "42"
     ],
     [
       "CidNull",
-      "171"
+      "148"
     ],
     [
       "CidSmi",
-      "60"
+      "53"
     ],
     [
       "CidMint",
-      "61"
+      "54"
     ],
     [
       "CidDouble",
-      "62"
+      "55"
     ],
     [
       "CidBool",
-      "63"
+      "56"
     ],
     [
       "CidString",
-      "94"
+      "82"
     ],
     [
       "CidTwoByteString",
-      "95"
+      "83"
     ],
     [
       "CidArray",
-      "90"
+      "79"
     ],
     [
       "CidGrowableArray",
-      "92"
-    ],
-    [
-      "CidSet",
-      "88"
-    ],
-    [
-      "CidMap",
-      "86"
-    ],
-    [
-      "CidClosure",
       "57"
     ],
     [
+      "CidClosure",
+      "50"
+    ],
+    [
       "CidUint8Array",
-      "116"
+      "107"
     ],
     [
       "CidInt8Array",
-      "112"
+      "104"
     ],
     [
       "CidInt16Array",
-      "124"
+      "113"
     ],
     [
       "CidUint16Array",
-      "128"
+      "116"
     ],
     [
       "CidInt32Array",
-      "132"
+      "119"
     ],
     [
       "CidUint32Array",
-      "136"
+      "122"
     ],
     [
       "CidInt64Array",
-      "140"
+      "125"
     ],
     [
       "CidUint64Array",
-      "144"
+      "128"
     ]
   ],
   "frida_special_layouts": {
-    "63": {
+    "56": {
       "name": "bool",
       "fields": {
-        "valOffset": 8
+        "valOffset": 4
       }
     },
-    "61": {
+    "54": {
       "name": "int",
       "fields": {
-        "valOffset": 8
+        "valOffset": 4
       }
     },
-    "62": {
+    "55": {
       "name": "double",
       "fields": {
-        "valOffset": 8
+        "valOffset": 4
       }
     },
-    "94": {
+    "82": {
       "name": "String",
       "fields": {
-        "lenOffset": 8,
-        "dataOffset": 16
+        "lenOffset": 4,
+        "dataOffset": 8
       }
     },
-    "95": {
+    "83": {
       "name": "TwoByteString",
       "fields": {
-        "lenOffset": 8,
-        "dataOffset": 16
+        "lenOffset": 4,
+        "dataOffset": 8
       }
     },
-    "90": {
+    "79": {
       "name": "List",
       "fields": {
-        "lenOffset": 16,
-        "dataOffset": 24,
-        "typeOffset": 8
-      }
-    },
-    "92": {
-      "name": "GrowableList",
-      "fields": {
-        "lenOffset": 16,
-        "dataOffset": 24,
-        "typeOffset": 8
-      }
-    },
-    "86": {
-      "name": "Map",
-      "fields": {
-        "usedOffset": 32,
-        "delOffset": 40,
-        "dataOffset": 24,
-        "typeOffset": 8
-      }
-    },
-    "88": {
-      "name": "Set",
-      "fields": {
-        "usedOffset": 32,
-        "delOffset": 40,
-        "dataOffset": 24,
-        "typeOffset": 8
+        "lenOffset": 8,
+        "dataOffset": 12,
+        "typeOffset": 4
       }
     },
     "57": {
-      "name": "Closure",
+      "name": "GrowableList",
       "fields": {
-        "fnOffset": 32,
-        "contextOffset": 40,
-        "epOffset": 56
+        "lenOffset": 8,
+        "dataOffset": 12,
+        "typeOffset": 4
       }
     },
-    "45": {
+    "50": {
+      "name": "Closure",
+      "fields": {
+        "fnOffset": 16,
+        "contextOffset": 20,
+        "epOffset": 28
+      }
+    },
+    "42": {
       "name": "Object",
       "fields": {
-        "size": 8
+        "size": 4
       }
     }
   },
   "frida_int_typed_cids": [
-    112,
+    104,
+    107,
+    113,
     116,
-    124,
-    128,
-    132,
-    136,
-    140,
-    144
+    119,
+    122,
+    125,
+    128
   ],
   "class_id_names": {
     "0": "Illegal",
-    "1": "NativePointer",
-    "2": "FreeListElement",
-    "3": "ForwardingCorpse",
-    "4": "Object",
-    "5": "Class",
-    "6": "PatchClass",
-    "7": "Function",
-    "8": "TypeParameters",
-    "9": "ClosureData",
-    "10": "FfiTrampolineData",
-    "11": "Field",
-    "12": "Script",
-    "13": "Library",
-    "14": "Namespace",
-    "15": "KernelProgramInfo",
-    "16": "WeakSerializationReference",
-    "17": "WeakArray",
-    "18": "Code",
-    "19": "Bytecode",
-    "20": "Instructions",
-    "21": "InstructionsSection",
-    "22": "InstructionsTable",
-    "23": "ObjectPool",
-    "24": "PcDescriptors",
-    "25": "CodeSourceMap",
-    "26": "CompressedStackMaps",
-    "27": "LocalVarDescriptors",
-    "28": "ExceptionHandlers",
-    "29": "Context",
-    "30": "ContextScope",
-    "31": "Sentinel",
-    "32": "SingleTargetCache",
-    "33": "MonomorphicSmiableCall",
-    "34": "CallSiteData",
-    "35": "UnlinkedCall",
-    "36": "ICData",
-    "37": "MegamorphicCache",
-    "38": "SubtypeTestCache",
-    "39": "LoadingUnit",
-    "40": "Error",
-    "41": "ApiError",
-    "42": "LanguageError",
-    "43": "UnhandledException",
-    "44": "UnwindError",
-    "45": "Instance",
-    "46": "LibraryPrefix",
-    "47": "TypeArguments",
-    "48": "AbstractType",
-    "49": "Type",
-    "50": "FunctionType",
-    "51": "RecordType",
-    "52": "TypeParameter",
-    "53": "FinalizerBase",
-    "54": "Finalizer",
-    "55": "NativeFinalizer",
-    "56": "FinalizerEntry",
-    "57": "Closure",
-    "58": "Number",
-    "59": "Integer",
-    "60": "Smi",
-    "61": "Mint",
-    "62": "Double",
-    "63": "Bool",
-    "64": "Float32x4",
-    "65": "Int32x4",
-    "66": "Float64x2",
-    "67": "Record",
-    "68": "TypedDataBase",
-    "69": "TypedData",
-    "70": "ExternalTypedData",
-    "71": "TypedDataView",
-    "72": "Pointer",
-    "73": "DynamicLibrary",
-    "74": "Capability",
-    "75": "ReceivePort",
-    "76": "SendPort",
-    "77": "StackTrace",
-    "78": "SuspendState",
-    "79": "RegExp",
-    "80": "WeakProperty",
-    "81": "WeakReference",
-    "82": "MirrorReference",
-    "83": "FutureOr",
-    "84": "UserTag",
-    "85": "TransferableTypedData",
-    "86": "Map",
-    "87": "ConstMap",
-    "88": "Set",
-    "89": "ConstSet",
-    "90": "Array",
-    "91": "ImmutableArray",
-    "92": "GrowableObjectArray",
-    "93": "String",
-    "94": "OneByteString",
-    "95": "TwoByteString",
-    "113": "TypedDataInt8View",
-    "114": "ExternalTypedDataInt8",
-    "115": "UnmodifiableTypedDataInt8View",
-    "117": "TypedDataUint8View",
-    "118": "ExternalTypedDataUint8",
-    "119": "UnmodifiableTypedDataUint8View",
-    "121": "TypedDataUint8ClampedView",
-    "122": "ExternalTypedDataUint8Clamped",
-    "123": "UnmodifiableTypedDataUint8ClampedView",
-    "125": "TypedDataInt16View",
-    "126": "ExternalTypedDataInt16",
-    "127": "UnmodifiableTypedDataInt16View",
-    "129": "TypedDataUint16View",
-    "130": "ExternalTypedDataUint16",
-    "131": "UnmodifiableTypedDataUint16View",
-    "133": "TypedDataInt32View",
-    "134": "ExternalTypedDataInt32",
-    "135": "UnmodifiableTypedDataInt32View",
-    "137": "TypedDataUint32View",
-    "138": "ExternalTypedDataUint32",
-    "139": "UnmodifiableTypedDataUint32View",
-    "141": "TypedDataInt64View",
-    "142": "ExternalTypedDataInt64",
-    "143": "UnmodifiableTypedDataInt64View",
-    "145": "TypedDataUint64View",
-    "146": "ExternalTypedDataUint64",
-    "147": "UnmodifiableTypedDataUint64View",
-    "149": "TypedDataFloat32View",
-    "150": "ExternalTypedDataFloat32",
-    "151": "UnmodifiableTypedDataFloat32View",
-    "153": "TypedDataFloat64View",
-    "154": "ExternalTypedDataFloat64",
-    "155": "UnmodifiableTypedDataFloat64View",
-    "157": "TypedDataFloat32x4View",
-    "158": "ExternalTypedDataFloat32x4",
-    "159": "UnmodifiableTypedDataFloat32x4View",
-    "161": "TypedDataInt32x4View",
-    "162": "ExternalTypedDataInt32x4",
-    "163": "UnmodifiableTypedDataInt32x4View",
-    "165": "TypedDataFloat64x2View",
-    "166": "ExternalTypedDataFloat64x2",
-    "167": "UnmodifiableTypedDataFloat64x2View",
-    "168": "_ByteDataView",
-    "169": "_UnmodifiableByteDataView",
-    "170": "_ByteBuffer",
-    "171": "Null",
-    "172": "dynamic",
-    "173": "void",
-    "174": "Never",
-    "112": "TypedDataInt8",
-    "116": "TypedDataUint8",
-    "120": "TypedDataUint8Clamped",
-    "124": "TypedDataInt16",
-    "128": "TypedDataUint16",
-    "132": "TypedDataInt32",
-    "136": "TypedDataUint32",
-    "140": "TypedDataInt64",
-    "144": "TypedDataUint64",
-    "148": "TypedDataFloat32",
-    "152": "TypedDataFloat64",
-    "156": "TypedDataFloat32x4",
-    "160": "TypedDataInt32x4",
-    "164": "TypedDataFloat64x2"
+    "1": "FreeListElement",
+    "2": "ForwardingCorpse",
+    "3": "Object",
+    "4": "Class",
+    "5": "PatchClass",
+    "6": "Function",
+    "7": "TypeParameters",
+    "8": "ClosureData",
+    "9": "FfiTrampolineData",
+    "10": "Field",
+    "11": "Script",
+    "12": "Library",
+    "13": "Namespace",
+    "14": "KernelProgramInfo",
+    "15": "WeakSerializationReference",
+    "16": "Code",
+    "17": "Instructions",
+    "18": "InstructionsSection",
+    "19": "InstructionsTable",
+    "20": "ObjectPool",
+    "21": "PcDescriptors",
+    "22": "CodeSourceMap",
+    "23": "CompressedStackMaps",
+    "24": "LocalVarDescriptors",
+    "25": "ExceptionHandlers",
+    "26": "Context",
+    "27": "ContextScope",
+    "28": "Sentinel",
+    "29": "SingleTargetCache",
+    "30": "UnlinkedCall",
+    "31": "MonomorphicSmiableCall",
+    "32": "CallSiteData",
+    "33": "ICData",
+    "34": "MegamorphicCache",
+    "35": "SubtypeTestCache",
+    "36": "LoadingUnit",
+    "37": "Error",
+    "38": "ApiError",
+    "39": "LanguageError",
+    "40": "UnhandledException",
+    "41": "UnwindError",
+    "42": "Instance",
+    "43": "LibraryPrefix",
+    "44": "TypeArguments",
+    "45": "AbstractType",
+    "46": "Type",
+    "47": "FunctionType",
+    "48": "TypeRef",
+    "49": "TypeParameter",
+    "50": "Closure",
+    "51": "Number",
+    "52": "Integer",
+    "53": "Smi",
+    "54": "Mint",
+    "55": "Double",
+    "56": "Bool",
+    "57": "GrowableObjectArray",
+    "58": "Float32x4",
+    "59": "Int32x4",
+    "60": "Float64x2",
+    "61": "TypedDataBase",
+    "62": "TypedData",
+    "63": "ExternalTypedData",
+    "64": "TypedDataView",
+    "65": "Pointer",
+    "66": "DynamicLibrary",
+    "67": "Capability",
+    "68": "ReceivePort",
+    "69": "SendPort",
+    "70": "StackTrace",
+    "71": "RegExp",
+    "72": "WeakProperty",
+    "73": "MirrorReference",
+    "74": "FutureOr",
+    "75": "UserTag",
+    "76": "TransferableTypedData",
+    "77": "LinkedHashMap",
+    "78": "LinkedHashSet",
+    "79": "Array",
+    "80": "ImmutableArray",
+    "81": "String",
+    "82": "OneByteString",
+    "83": "TwoByteString",
+    "84": "ExternalOneByteString",
+    "85": "ExternalTwoByteString",
+    "86": "FfiPointer",
+    "105": "TypedDataInt8View",
+    "106": "ExternalTypedDataInt8",
+    "108": "TypedDataUint8View",
+    "109": "ExternalTypedDataUint8",
+    "111": "TypedDataUint8ClampedView",
+    "112": "ExternalTypedDataUint8Clamped",
+    "114": "TypedDataInt16View",
+    "115": "ExternalTypedDataInt16",
+    "117": "TypedDataUint16View",
+    "118": "ExternalTypedDataUint16",
+    "120": "TypedDataInt32View",
+    "121": "ExternalTypedDataInt32",
+    "123": "TypedDataUint32View",
+    "124": "ExternalTypedDataUint32",
+    "126": "TypedDataInt64View",
+    "127": "ExternalTypedDataInt64",
+    "129": "TypedDataUint64View",
+    "130": "ExternalTypedDataUint64",
+    "132": "TypedDataFloat32View",
+    "133": "ExternalTypedDataFloat32",
+    "135": "TypedDataFloat64View",
+    "136": "ExternalTypedDataFloat64",
+    "138": "TypedDataFloat32x4View",
+    "139": "ExternalTypedDataFloat32x4",
+    "141": "TypedDataInt32x4View",
+    "142": "ExternalTypedDataInt32x4",
+    "144": "TypedDataFloat64x2View",
+    "145": "ExternalTypedDataFloat64x2",
+    "146": "_ByteDataView",
+    "147": "_ByteBuffer",
+    "148": "Null",
+    "149": "dynamic",
+    "150": "void",
+    "151": "Never",
+    "104": "TypedDataInt8",
+    "107": "TypedDataUint8",
+    "110": "TypedDataUint8Clamped",
+    "113": "TypedDataInt16",
+    "116": "TypedDataUint16",
+    "119": "TypedDataInt32",
+    "122": "TypedDataUint32",
+    "125": "TypedDataInt64",
+    "128": "TypedDataUint64",
+    "131": "TypedDataFloat32",
+    "134": "TypedDataFloat64",
+    "137": "TypedDataFloat32x4",
+    "140": "TypedDataInt32x4",
+    "143": "TypedDataFloat64x2"
   }
 }

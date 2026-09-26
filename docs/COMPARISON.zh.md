@@ -84,6 +84,124 @@ python3 testing/compare_aotopsy.py <libapp.so> [out_root]
    暗示 `code_base_ref` 标记的是 stub 前缀；实测这些语料上 `first_entry` 是 0，
    被跳过的 167 个 Code 对象是 **`ci <= code_base_ref`** 标出的 stub 段。
 
+## 2026-09-26 复测：真机应用，以及此前语料在哪儿骗了我们
+
+上面那张表量的是 x64 ELF 语料。换成**真实 Flutter 应用**（用户本机 APK 集 + 一个商业 macOS 应用）
+之后，结论在一个要紧的地方变了。
+
+### 移动端（Android）Flutter 产物：**当天已修**（2026-09-26）
+
+下面那节描述的缺口在测出来的同一天就补上了：dae 现在**随包压缩指针 profile 变体**，并按快照自带的
+features 串自动选中——不需要任何额外参数：
+
+```
+dae /tmp/android/libapp.so out/          # 自动识别 dart/3.3.4 + w32-compressed 变体
+```
+
+| 应用 | SDK | dae 现在 | aotopsy（同一文件） |
+|---|---|---|---|
+| Reqable（安卓） | 3.3.4 | 表项 57,960、库 496、类 1,141、**0 告警** | 57,960 函数 / 8,216 类 |
+| ChatGLM | 3.11.6 | 表项 30,782、库 1,211、类 4,603 | 30,782 / 5,501 |
+| 学信网 | 3.7.2 | 表项 19,752、库 875、类 3,256 | 19,752 / 3,819 |
+| 飞书 Lark | 3.6.1 | 能解析，对象池之前仍有漂移（未结） | 79,327 / 12,929 |
+| 微博 | 2.19.6 | 同类残余（未结） | 22,623 / 4,232 |
+
+Reqable 的安卓产物还能反编译：**1,707 函数、95.5% 完全结构化、`dart analyze` 0 错误**，并从访问器
+符号恢复出 227 个字段名——其中 144 个与 aotopsy 的类布局**名字与字节偏移完全一致、0 真冲突**
+（`type` vs 它给类型参数槽的合成名 `type_arguments_field` 是命名取舍，不是分歧）。
+
+三个应用的表项数与 aotopsy **逐一吻合**，是没有符号时能拿到的最强证据：两个独立实现算出的函数数量一致。
+
+修法（全在 `src/engine` 与 `tools/sdk2profile.py`，不是重写）：
+
+1. **压缩构建没有 ROData 簇** —— `NewClusterForClass` 把整个 `RODataSerializationCluster` 类包在
+   `#if !defined(DART_COMPRESSED_POINTERS)` 里（内存镜像的装载地址不保证落在压缩指针可寻址的 4GB 内）。
+   字符串因此走普通填充簇：alloc 逐对象写 `(length<<1)|two_byte`，fill 重写该编码 + 原始字节；
+   `PcDescriptors` / `CodeSourceMap` / `CompressedStackMaps` 同理（`uvarint(len) + len 字节`）。
+2. **实例字段槽按指针宽度计** —— fill 用 4 字节步长走 `next_field_offset = nfo << kCompressedWordSizeLog2`，
+   字段从 8 字节头部之后开始，故槽数 = `nfo − 2`（不是 `nfo − 1`）。算错会让每个实例多读一个槽，
+   填流累积漂移 4.8KB，对象池长度随即读成垃圾。
+3. **VM isolate 不写字符串簇的 canonical 集合表尾** —— `StringSerializationCluster(is_canonical,
+   cluster_represents_canonical_set && !vm_)`；而非压缩构建的 *rodata* 字符串簇没有这个排除。
+   两条规则现在各自绑定到自己的簇形态。
+4. **压缩构建的 data image 仍按 64 对齐**（指令表放在那里），表本身读到 `data_image + rodata_offset + 16`
+   （它是一段 OneByteString 的载荷）。
+
+### 缺口最初测到的样子（2026-09-26，修复前）
+
+从 8 个 Flutter APK 里取出 `lib/arm64-v8a/libapp.so`，两个工具各跑一遍：
+
+| 应用 | SDK（读快照自己的 hash） | aotopsy | dae |
+|---|---|---|---|
+| Reqable | 3.3.4 | 57,960 函数 / 8,216 类 | 漂移，已拒绝导出 |
+| 飞书 Lark | 3.6.1 | 79,327 / 12,929 | 漂移，拒绝 |
+| ChatGLM | 3.11.6 | 30,782 / 5,501 | 漂移，拒绝 |
+| 学信网 | 3.7.2 | 19,752 / 3,819 | 漂移，拒绝 |
+| 微博 | 2.19.6 | 22,623 / 4,232 | 漂移，拒绝 |
+| 微信 | 2.15.0 | 未建模 | 漂移 |
+| 同花顺 | 2.7.2 | 未建模 | 漂移 |
+
+原因就写在产物自己的 features 串里（dae 本来就要扫过它才能找到头）：
+
+```
+桌面构建: product no-code_comments no-dwarf_stack_traces_mode ... macos     no-compressed-pointers
+安卓构建: product no-code_comments    dwarf_stack_traces_mode ... android compressed-pointers
+```
+
+两个构建开关改变了快照布局，而 **dae 随包的 26 个 profile 全是"桌面 + 非压缩指针"**：
+
+- `compressed-pointers`：指针宽度 4 而非 8（aotopsy 对这些产物一律报 `ptr_size: 4`），
+  整个解析走过的对象布局、对齐、槽位都不同；
+- `dwarf_stack_traces_mode`：Code 簇少 push 两个 ref（3.3.4 `app_snapshot.cc`：
+  `if (!FLAG_precompiled_mode || !FLAG_dwarf_stack_traces_mode) { push inlined_id_to_function_;
+  push code_source_map_; }`），其后的 fill 流整体错位。
+
+两者都是 **profile 差异**（解析引擎本身没问题），所以这是一件"生成 profile 变体"的活，不是重写：
+`tools/sdk2profile.py` 已经支持 `--word-size 4 --compressed`，工作区里有 24 个版本的 SDK 源码，
+`dwarf_stack_traces_mode` 变体只需让 `code_refs` 的推导也认这个 flag。检测可以做到**精确**而非启发式：
+dae 本来就在解析 features 串，直接按 `compressed-pointers` / `dwarf_stack_traces_mode` 选 profile 即可。
+
+这些失败解析还暴露出两个健壮性 bug（都已修）：嵌套值渲染**无深度上限**，坏解析下数组自引用会把
+导出线程的栈打穿、进程 SIGABRT（现在封顶 8 层）；解析漂移此前只打警告、照样写产物并 rc=0
+（现在打 FATAL、写 `PARSE_DRIFT.txt`、以非零退出码收尾，`text/strings.txt` / `text/pp.txt`
+这类原始 dump 保留——它们仍可人工读）。
+
+版本口径值得一提：同一份 Reqable，aotopsy 报 `dart: 3.3.0`，dae 报 `3.3.4`——后者是快照自带 hash
+（`ee1eb666c76a5cb7746faf39d0b97547`，与它 macOS 产物的 hash 一致，blutter 在同一文件上也这么报）
+说的；aotopsy 那个是它**最近的建模版本**。
+
+### 一个商业 macOS 应用（只有 dae 能读：aotopsy 不吃 Mach-O）
+
+`/Applications/Reqable.app`（26 MB 的 App.framework 二进制、代码混淆、`dwarf_stack_traces_mode`）：
+
+| | dae |
+|---|---|
+| 库 / 类 | 564 / 1,285 |
+| 具名字段 | 2,105 |
+| 反编译出的函数 | 1,808（完全结构化 1,716 = **94.9%**） |
+| 未识别指令行 | 1 |
+| `dart analyze` 错误 | **0** |
+| `text/pp.txt` / `text/objs.txt` 与 blutter 在同一文件上的输出 | **逐字节一致** |
+| 耗时 | 118 s |
+
+aotopsy 对同一文件：`error: elfx: not an ELF file: bad magic number [202 254 186 190]`——
+它的 loader 只认 ELF，所以 macOS/iOS/Windows 的 Flutter 产物是 dae 独占的地盘。
+（这次 `dart analyze` 原本是 1 个错误：池里的 `"$IsolateException"` 没转义，Dart 当成字符串插值。
+已修——`$` 现在与其它元字符一样转义，并补了单测。）
+
+### 字段名正面对照（T4_blank，2.12.4）
+
+| | dae | aotopsy |
+|---|---|---|
+| 具名 (类, 偏移) 对 | 34 | 149 |
+| 其中合成名 | 0 | 107（泛型类的类型参数槽 `type_arguments_field`）+ 约 10 |
+
+- **32 对名字与偏移完全一致，0 冲突**——两个独立实现读同一条快照事实
+  （`MintValues[host_offset] × word_size`）的结果。
+- dae 有 2 个名字是 aotopsy 的布局表里没有的（走访问器符号那条路来的）。
+- aotopsy 在**呈现**上仍领先：它用全程序类型推断把访问重写成 `base.field`；
+  dae 把名字写成归属注释，保留 `mem(base, disp)`。
+
 ## 说明与保留
 
 - **aotopsy 只吃 ELF**（`libapp.so`，"ELF parse"）。Flutter macOS/iOS 的 `App.framework`（Mach-O）

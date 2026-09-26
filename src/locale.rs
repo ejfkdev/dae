@@ -92,6 +92,8 @@ pub struct Messages {
     pub sum_arrays: &'static str,
     pub sum_maps: &'static str,
     pub sum_fields: &'static str,
+    /// 解析漂移时的醒目提示（产物不可信）
+    pub parse_drift_fatal: &'static str,
     pub sum_cg_d: &'static str,
     pub sum_cg_i: &'static str,
     pub sum_cg_r: &'static str,
@@ -169,6 +171,10 @@ pub fn messages(lang: Lang) -> Messages {
         sum_arrays: p("个数组", "arrays"),
         sum_maps: p("个映射", "maps"),
         sum_fields: p("条具名字段", "named fields"),
+        parse_drift_fatal: p(
+            "【严重】快照解析漂移：SDK Profile 与该二进制不匹配，本次产物不可信（已写 PARSE_DRIFT.txt）",
+            "[FATAL] snapshot parse drifted: the SDK profile does not match this binary; artifacts are not trustworthy (see PARSE_DRIFT.txt)",
+        ),
         sum_cg_d: p("条直接边", "direct edges"),
         sum_cg_i: p("个间接调用", "indirect calls"),
         sum_cg_r: p("条解析到名字", "resolved"),

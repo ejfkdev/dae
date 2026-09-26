@@ -460,6 +460,10 @@ fn dart_literal(raw: &str) -> Option<String> {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // `$` 必须转义：池里的字符串常带 Dart 的 `$` 前缀（实测真机应用里有
+            // `"$IsolateException"`），不转义就是字符串插值 → dart analyze 报
+            // undefined_identifier，产物不再是合法 Dart。
+            '$' => out.push_str("\\$"),
             _ => out.push(c),
         }
         n += 1;
@@ -1244,6 +1248,32 @@ impl MemOperand {
             i += 1;
         }
         out.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::dart_literal;
+
+    /// 池里的字符串要变成**合法 Dart 字面量**：每个元字符都得转义。
+    /// `$` 那条是真机应用里踩出来的——`"$IsolateException"` 不转义就是插值，
+    /// `dart analyze` 直接报 undefined_identifier。
+    #[test]
+    fn escapes_dart_string_metacharacters() {
+        assert_eq!(dart_literal("plain").as_deref(), Some("\"plain\""));
+        assert_eq!(dart_literal("a\"b").as_deref(), Some("\"a\\\"b\""));
+        assert_eq!(dart_literal("a\\b").as_deref(), Some("\"a\\\\b\""));
+        // 换行要「大部分可打印」才会走到转义分支（纯控制字符整体被拒，见下个用例）
+        assert_eq!(dart_literal("abcd\n").as_deref(), Some("\"abcd\\n\""));
+        assert_eq!(dart_literal("$IsolateException").as_deref(), Some("\"\\$IsolateException\""));
+        assert_eq!(dart_literal("${x}").as_deref(), Some("\"\\${x}\""));
+    }
+
+    /// 非可打印 ASCII 与二进制垃圾不进产物（保持「导出物零非 ASCII」）
+    #[test]
+    fn rejects_binary_and_non_ascii() {
+        assert!(dart_literal("中文").is_none());
+        assert!(dart_literal("\u{1}\u{2}\u{3}").is_none());
     }
 }
 
@@ -2298,7 +2328,10 @@ pub fn recover_fields(analyzer: &Analyzer) -> Result<RecoveredFields, String> {
     let mut from_accessors = 0usize;
     let mut agreements = 0usize;
     let mut conflicts: Vec<(String, u64, String, String)> = Vec::new();
-    if !analyzer.profile.compressed_pointers {
+    // 压缩指针构建的位移折算已实测核对（真机产物：`_FutureListener.result` 在压缩词宽下
+    // 是词 3 → 字节 12 → 位移 11；桌面词宽下同名字段是词 3 → 24 → 位移 23），两种词宽
+    // 都走同一套「Mint 字索引 × word_size − 1」链条，故不再按变体关掉。
+    if true {
         let probe = FieldCtx { by_class_off: BTreeMap::new(), word };
         for (k, v) in accessor_fields(&cs, analyzer, &rl, &probe) {
             match by_class_off.get(&k) {

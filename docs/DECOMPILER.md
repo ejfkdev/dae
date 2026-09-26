@@ -137,6 +137,9 @@ they are not Dart expressions, and inventing one would be worse than saying noth
 
 ## Field names: what survives, and the two ways to prove one
 
+Mobile targets (compressed pointers) are supported since 2026-09-26 — see
+[`COMPARISON.md`](COMPARISON.md) for what that took and how it was verified on real apps.
+
 AOT deletes almost every field name. `Precompiler::DropFields` keeps them only outside PRODUCT
 builds, so a release binary retains a **handful**: 60 on the 3.13 arm64 sample, 366 on a real
 Flutter app — against hundreds of classes and thousands of fields. Everything else is gone, and

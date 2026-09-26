@@ -15,7 +15,7 @@
 
 ## 特性
 
-- **开箱即用、自动识别**——26 份 SDK profile 内嵌进二进制；按快照哈希匹配版本，自定义/Flutter 引擎构建走结构探针兜底。
+- **开箱即用、自动识别**——26 份 SDK profile + **21 份压缩指针变体**内嵌进二进制；按快照哈希匹配版本，变体（`compressed-pointers`，即所有移动端 Flutter 构建）按快照自带的 features 串自动选中，自定义/Flutter 引擎构建走结构探针兜底。已在真机应用上实测：Android arm64（Reqable 3.3.4、ChatGLM 3.11.6、学信网 3.7.2）与 macOS arm64。
 - **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
 - **渐进式模式**——`dae libs`/`classes`/`functions`/`strings`/`callers` 像查数据库一样查快照，

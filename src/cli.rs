@@ -484,6 +484,11 @@ fn cmd_info(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
         let (nl, nc, nf) = counts(&libs);
         let mut out = String::new();
         let _ = writeln!(out, "{}\t{}", tr(lang, "容器", "container"), p.container.kind);
+        if let Some(fp) = a.fingerprint.as_ref() {
+            // 构建开关（compressed-pointers / dwarf_stack_traces_mode）决定该配哪套 profile：
+            // 移动端产物与桌面 profile 不匹配时，这一行就是第一现场
+            let _ = writeln!(out, "{}\t{}", tr(lang, "features", "features"), fp.features);
+        }
         let _ = writeln!(out, "{}\t{}", tr(lang, "架构", "arch"), p.arch);
         let _ = writeln!(out, "{}\t{}", tr(lang, "SDK", "sdk"), sdk.abi);
         let _ = writeln!(out, "{}\t{}", tr(lang, "SDK 状态", "sdk status"), sdk.status);

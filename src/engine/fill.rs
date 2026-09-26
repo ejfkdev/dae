@@ -38,14 +38,17 @@ pub fn fill_snapshot<'a>(
         let count = meta.count;
         let start_ref = meta.start_ref;
 
-        // 字符串：fill 空，按 rodata offsets 解码。
+        // 字符串：**rodata 形态**的 fill 为空，按 alloc 期记下的镜像偏移解码。
         // 2.15+ 集中在 string_cid 一个簇（对象 tags 区分单/双字节）；
         // ≤2.14（string_clusters_separate）则 string/one_byte/two_byte 三个 cid
         // 各自成 ROData 簇，均需按 offsets 解码。
-        if cid == profile.alloc.string_cid
-            || (profile.format.string_clusters_separate
-                && (cid == profile.alloc.one_byte_string_cid
-                    || cid == profile.alloc.two_byte_string_cid))
+        // 压缩指针构建没有 ROData 簇（kind == "string"）：字符串在 fill 流里，
+        // 走下面布局里的 `string_fill` 步骤，这里不能进。
+        if meta.kind != "string"
+            && (cid == profile.alloc.string_cid
+                || (profile.format.string_clusters_separate
+                    && (cid == profile.alloc.one_byte_string_cid
+                        || cid == profile.alloc.two_byte_string_cid)))
         {
             for k in 0..count {
                 let off = *meta.offsets.get(k as usize).ok_or(format!(
@@ -309,6 +312,11 @@ enum CStep {
         default: Vec<(u32, i64)>,
     },
     SkipRawElemWidth,
+    /// 跳过「别名槽里刚读到的值」所指的字节数（压缩指针构建的
+    /// PcDescriptors/CodeSourceMap/CompressedStackMaps fill）
+    SkipAliasBytes { slot: u32, shift: u32 },
+    /// 压缩指针构建的字符串簇 fill
+    StringFill,
     SkipConst(u64),
     SkipAlign(u64),
     ObjectPool,
@@ -432,6 +440,11 @@ fn compile_steps<'a>(
                     .collect(),
             },
             Step::SkipRawElemWidth => CStep::SkipRawElemWidth,
+            Step::SkipAliasBytes { on, shift } => CStep::SkipAliasBytes {
+                slot: slot_of(on.as_str(), slot_names, &mut next),
+                shift: shift.unwrap_or(0),
+            },
+            Step::StringFill => CStep::StringFill,
             Step::SkipConst { n } => CStep::SkipConst(*n),
             Step::SkipAlign { n } => CStep::SkipAlign(*n),
             Step::ObjectPool => CStep::ObjectPool,
@@ -638,6 +651,64 @@ fn exec_compiled<'a>(
                 let n = length_of(meta, k)? * profile.elem_width(meta.cid);
                 r.skip(n as usize).map_err(|e| format!("skip_raw: {e:?}"))?;
             }
+            CStep::SkipAliasBytes { slot, shift } => {
+                let v = ctx.get(*slot as usize).copied().flatten().unwrap_or(0);
+                let n = (v >> *shift).max(0) as usize;
+                if std::env::var("DART_AOT_DEBUG_FILLCHECK").is_ok() && *shift == 0 {
+                    if let Some(al) = meta.lengths.get(k as usize) {
+                        if *al != v as u64 {
+                            eprintln!(
+                                "[dbg-fillcheck] 不一致：cid={} 对象#{} fill_len={v} alloc_len={al}",
+                                meta.cid, k
+                            );
+                        }
+                    }
+                }
+                r.skip(n).map_err(|e| format!("skip_alias_bytes({n}): {e:?}"))?;
+            }
+            CStep::StringFill => {
+                if std::env::var("DART_AOT_DEBUG_STRFILL").is_ok() && k < 6 {
+                    let peek = r.data.get(r.pos..r.pos + 24).map(|b| format!("{:02x?}", b)).unwrap_or_default();
+                    eprintln!("[dbg-strfill] cluster_start_ref={} k={k} pos={:#x} bytes={peek}", meta.start_ref, r.pos);
+                }
+                // 压缩指针构建：`uvarint((len<<1)|two_byte)` + 原始字节
+                let encoded = read_unsigned(r)?;
+                if std::env::var("DART_AOT_DEBUG_FILLCHECK").is_ok() {
+                    if let Some(al) = meta.lengths.get(k as usize) {
+                        if *al != encoded {
+                            eprintln!(
+                                "[dbg-fillcheck] 字符串簇不一致：对象#{k} fill_enc={encoded} alloc_enc={al} len={}",
+                                encoded >> 1
+                            );
+                        }
+                    }
+                }
+                let len = (encoded >> 1) as usize;
+                let two_byte = encoded & 1 == 1;
+                let nbytes = if two_byte { len * 2 } else { len };
+                let start = r.pos;
+                r.skip(nbytes).map_err(|e| format!("string_fill(len={len}): {e:?}"))?;
+                let bytes = r
+                    .data
+                    .get(start..start + nbytes)
+                    .ok_or_else(|| format!("string_fill 越界：{start:#x}+{nbytes}"))?;
+                let s = if two_byte {
+                    let u16s: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16_lossy(&u16s)
+                } else if bytes.is_ascii() {
+                    // SAFETY: is_ascii → 全部 < 0x80，必为合法 UTF-8
+                    unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
+                } else {
+                    bytes.iter().map(|&b| b as char).collect() // latin1
+                };
+                if std::env::var("DART_AOT_DEBUG_STRFILL").is_ok() && (k < 6 || k % 5000 == 0) {
+                    eprintln!("[dbg-strfill] ref={} len={len} two_byte={two_byte} s={:?}", meta.start_ref + k, &s.chars().take(28).collect::<String>());
+                }
+                snap.strings.insert(meta.start_ref + k, Some(s));
+            }
             CStep::SkipConst(n) => {
                 r.skip(*n as usize).map_err(|e| format!("skip_const: {e:?}"))?;
             }
@@ -661,6 +732,17 @@ fn exec_compiled<'a>(
                 let mut ln = read_unsigned(r)?;
                 if std::env::var("DART_AOT_DEBUG_FILL").is_ok() {
                     eprintln!("[dbg-pool] ln={ln} pos={:#x}", r.pos);
+                }
+                if std::env::var("DART_AOT_DEBUG_FILLCHECK").is_ok() {
+                    if let Some(al) = meta.lengths.get(k as usize) {
+                        if *al != ln {
+                            eprintln!(
+                                "[dbg-fillcheck] 不一致：cid={} 对象#{} fill_len={ln} alloc_len={al} \
+                                 （fill 起点已被前面的簇读偏）",
+                                meta.cid, k
+                            );
+                        }
+                    }
                 }
                 if ln > 100000 {
                     let mut np = None;
@@ -821,10 +903,16 @@ fn exec_compiled<'a>(
                 } else {
                     *instance_bitmaps.get(&meta.start_ref).unwrap_or(&0)
                 };
-                let slots = meta.next_field_offset_in_words - 1;
+                // 字段槽计数随目标指针宽度变：
+                //   未压缩：next_field_offset = nfo × 8 字节，字段从偏移 8 起 → 槽数 = nfo − 1（头部 1 槽）
+                //   压缩：  next_field_offset = nfo × 4 字节，字段同样从偏移 8 起 → 槽数 = nfo − 2（头部 2 槽）
+                // 按 8 字节算会让每个实例多读一个槽（真机产物实测：填流累积漂移 4.8KB，
+                // 对象池长度读成垃圾）。
+                let hdr_slots: i64 = if profile.word_size == 4 { 2 } else { 1 };
+                let slots = meta.next_field_offset_in_words - hdr_slots;
                 let mut vals = Vec::new();
                 for j in 0..slots {
-                    if bitmap & (1u64 << (j + 1)) != 0 {
+                    if bitmap & (1u64 << (j + hdr_slots)) != 0 {
                         // ReadWordWith32BitReads = 2 × Raw<4>::Read，而 Raw<4>::Read 走
                         // Read32()=有符号变长（datastream.h），故 unboxed 槽恒为两个
                         // svarint（2.15-2.19 全版本一致，曾误判 2.15-2.17 为 4B raw）。

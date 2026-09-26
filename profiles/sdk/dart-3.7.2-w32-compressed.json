@@ -1,11 +1,11 @@
 {
-  "abi": "dart/3.9.4",
+  "abi": "dart/3.7.2",
   "_meta": {
     "generator_rev": 3
   },
-  "word_size": 8,
-  "compressed_pointers": false,
-  "status": "verified",
+  "word_size": 4,
+  "compressed_pointers": true,
+  "status": "unverified",
   "format": {
     "ref_encoding": "ref_id_128",
     "instructions_table_source": "snapshot_rodata",
@@ -61,10 +61,8 @@
   "full_aot_kind": 3,
   "object_start_alignment": 64,
   "alloc": {
-    "rodata_cids": [
-      24,
-      25,
-      26,
+    "rodata_cids": [],
+    "string_cids": [
       93,
       94,
       95
@@ -72,6 +70,9 @@
     "var_cids": [
       17,
       23,
+      24,
+      25,
+      26,
       27,
       28,
       29,
@@ -473,16 +474,44 @@
       ]
     },
     "24": {
-      "_doc": "PcDescriptors (ROData): fill 空",
-      "steps": []
+      "_doc": "压缩指针：PcDescriptors 普通簇（fill = uvarint(len) + len 字节）",
+      "steps": [
+        {
+          "op": "uvarint",
+          "alias": "n"
+        },
+        {
+          "op": "skip_alias_bytes",
+          "on": "n"
+        }
+      ]
     },
     "25": {
-      "_doc": "CodeSourceMap (ROData): fill 空",
-      "steps": []
+      "_doc": "压缩指针：CodeSourceMap 普通簇（fill = uvarint(len) + len 字节）",
+      "steps": [
+        {
+          "op": "uvarint",
+          "alias": "n"
+        },
+        {
+          "op": "skip_alias_bytes",
+          "on": "n"
+        }
+      ]
     },
     "26": {
-      "_doc": "CompressedStackMaps (ROData): fill 空",
-      "steps": []
+      "_doc": "压缩指针：CompressedStackMaps 普通簇（长度在 flags_and_size 的 bit2 起）",
+      "steps": [
+        {
+          "op": "uvarint",
+          "alias": "n"
+        },
+        {
+          "op": "skip_alias_bytes",
+          "on": "n",
+          "shift": 2
+        }
+      ]
     },
     "28": {
       "_doc": "ExceptionHandlers: packed_fields + handled_types ref + N*(pc,svarint×2,byte×3)",
@@ -539,7 +568,7 @@
         }
       ]
     },
-    "35": {
+    "33": {
       "_doc": "UnlinkedCall: 2 refs + can_patch_to_monomorphic byte",
       "steps": [
         {
@@ -840,8 +869,12 @@
       ]
     },
     "93": {
-      "_doc": "String (ROData): fill 空（引擎按 offsets 解码）",
-      "steps": []
+      "_doc": "压缩指针：String 普通簇（alloc `(len<<1)|two_byte`，fill 重写编码 + 原始字节）",
+      "steps": [
+        {
+          "op": "string_fill"
+        }
+      ]
     },
     "27": {
       "steps": [
@@ -927,6 +960,22 @@
         {
           "op": "refs",
           "n": 1
+        }
+      ]
+    },
+    "94": {
+      "_doc": "压缩指针：String 普通簇（alloc `(len<<1)|two_byte`，fill 重写编码 + 原始字节）",
+      "steps": [
+        {
+          "op": "string_fill"
+        }
+      ]
+    },
+    "95": {
+      "_doc": "压缩指针：String 普通簇（alloc `(len<<1)|two_byte`，fill 重写编码 + 原始字节）",
+      "steps": [
+        {
+          "op": "string_fill"
         }
       ]
     }
@@ -1033,81 +1082,81 @@
     "63": {
       "name": "bool",
       "fields": {
-        "valOffset": 8
+        "valOffset": 4
       }
     },
     "61": {
       "name": "int",
       "fields": {
-        "valOffset": 8
+        "valOffset": 4
       }
     },
     "62": {
       "name": "double",
       "fields": {
-        "valOffset": 8
+        "valOffset": 4
       }
     },
     "94": {
       "name": "String",
       "fields": {
-        "lenOffset": 8,
-        "dataOffset": 16
+        "lenOffset": 4,
+        "dataOffset": 8
       }
     },
     "95": {
       "name": "TwoByteString",
       "fields": {
-        "lenOffset": 8,
-        "dataOffset": 16
+        "lenOffset": 4,
+        "dataOffset": 8
       }
     },
     "90": {
       "name": "List",
       "fields": {
-        "lenOffset": 16,
-        "dataOffset": 24,
-        "typeOffset": 8
+        "lenOffset": 8,
+        "dataOffset": 12,
+        "typeOffset": 4
       }
     },
     "92": {
       "name": "GrowableList",
       "fields": {
-        "lenOffset": 16,
-        "dataOffset": 24,
-        "typeOffset": 8
+        "lenOffset": 8,
+        "dataOffset": 12,
+        "typeOffset": 4
       }
     },
     "86": {
       "name": "Map",
       "fields": {
-        "usedOffset": 32,
-        "delOffset": 40,
-        "dataOffset": 24,
-        "typeOffset": 8
+        "usedOffset": 16,
+        "delOffset": 20,
+        "dataOffset": 12,
+        "typeOffset": 4
       }
     },
     "88": {
       "name": "Set",
       "fields": {
-        "usedOffset": 32,
-        "delOffset": 40,
-        "dataOffset": 24,
-        "typeOffset": 8
+        "usedOffset": 16,
+        "delOffset": 20,
+        "dataOffset": 12,
+        "typeOffset": 4
       }
     },
     "57": {
       "name": "Closure",
       "fields": {
-        "fnOffset": 32,
-        "contextOffset": 40,
-        "epOffset": 56
+        "fnOffset": 16,
+        "contextOffset": 20,
+        "epOffset": 28
       }
     },
     "45": {
       "name": "Object",
       "fields": {
-        "size": 8
+        "size": 4
       }
     }
   },
@@ -1155,9 +1204,9 @@
     "30": "ContextScope",
     "31": "Sentinel",
     "32": "SingleTargetCache",
-    "33": "MonomorphicSmiableCall",
-    "34": "CallSiteData",
-    "35": "UnlinkedCall",
+    "33": "UnlinkedCall",
+    "34": "MonomorphicSmiableCall",
+    "35": "CallSiteData",
     "36": "ICData",
     "37": "MegamorphicCache",
     "38": "SubtypeTestCache",

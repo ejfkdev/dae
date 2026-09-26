@@ -62,6 +62,10 @@ pub struct Analyzer<'a> {
     pub elf_names: BTreeMap<u64, String>,
     /// 函数 ref → (entry, pc 索引)，new() 里一次算好（name_by_ep/build_functions/导出共享）
     pub func_eps: BTreeMap<u64, (u64, usize)>,
+    /// 快照外层指纹：kind + 32B 版本 hash + features 串。
+    /// features 里的构建开关（`compressed-pointers` / `dwarf_stack_traces_mode`）决定
+    /// 该配哪套 profile——移动端产物与桌面 profile 不匹配时，这是第一现场。
+    pub fingerprint: Option<crate::engine::snapshot::SnapshotFingerprint>,
     /// 解析期告警（drift/alloc mismatch 等）
     pub warnings: Vec<String>,
     /// Field 簇恢复出的实例字段（AOT 只保留少量具名字段，见 docs/DECOMPILER.md）
@@ -129,7 +133,7 @@ impl<'a> Analyzer<'a> {
         let mut vm = if profile.format.single_snapshot {
             Snapshot::stub(profile, data)
         } else {
-            Snapshot::parse(profile, data, vm_off as usize, Some(&mut warnings))?
+            Snapshot::parse_unit(profile, data, vm_off as usize, Some(&mut warnings), true)?
         };
         t("parse vm(外层+alloc)", &mut since);
         let mut iso = Snapshot::parse(profile, data, iso_off as usize, Some(&mut warnings))?;
@@ -242,8 +246,26 @@ impl<'a> Analyzer<'a> {
             warnings,
             fields_rec: Vec::new(),
             field_by_class_off: BTreeMap::new(),
+            fingerprint: crate::engine::snapshot::read_fingerprint(data, vm_off as usize),
         };
         a.build_fields();
+
+        // 构建开关与 profile 对不上时先明说：`compressed-pointers` 决定指针宽度、
+        // 对象对齐与整条解析路径；配错 profile 的结果是**静默漂移**（实测移动端产物
+        // 漂成 libraries=1/classes=1）。这里只提示，真正的拒绝由导出层的漂移检查做。
+        if let Some(fp) = a.fingerprint.as_ref() {
+            let feat_comp = fp.features.split_whitespace().any(|f| f == "compressed-pointers");
+            if !fp.features.is_empty() && feat_comp != profile.compressed_pointers {
+                a.warnings.push(format!(
+                    "pointer-mode mismatch: binary features say {:?} but the profile is {} (word_size={}); \
+                     this build needs a {}compressed-pointer profile",
+                    if feat_comp { "compressed-pointers" } else { "no-compressed-pointers" },
+                    if profile.compressed_pointers { "compressed" } else { "not compressed" },
+                    profile.word_size,
+                    if feat_comp { "" } else { "no-" },
+                ));
+            }
+        }
 
         t("payload_infos", &mut since);
         a.build_name_by_ep();

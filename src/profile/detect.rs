@@ -9,6 +9,7 @@
 
 use crate::engine::fill::fill_snapshot;
 use crate::engine::snapshot::{read_fingerprint, Snapshot};
+use crate::profile::{variant_of, wanted_variant, VARIANT_DEFAULT};
 use crate::profile::{abi_for_hash, sdk_registry, SdkProfile};
 
 pub struct Detection {
@@ -65,10 +66,21 @@ pub fn detect_sdk(
 ) -> Option<(&'static SdkProfile, Detection)> {
     let registry = sdk_registry();
 
+    // 变体：`compressed-pointers`（移动端 Flutter 产物默认开）决定字符串簇与词宽，
+    // 由快照 features 串直接判定；缺该变体时退回默认变体（并由上层告警说明）。
+    let want = read_fingerprint(data, vm_off)
+        .map(|fp| wanted_variant(&fp.features))
+        .unwrap_or(VARIANT_DEFAULT);
+
     // 1) 版本 hash 精确命中
     if let Some(fp) = read_fingerprint(data, vm_off) {
         if let Some(abi) = abi_for_hash(&fp.version_hash) {
-            if let Some((_, p)) = registry.iter().find(|(a, _)| *a == abi) {
+            let same_abi = |a: &str| a == abi;
+            let pick = registry
+                .iter()
+                .find(|(a, p)| same_abi(a) && variant_of(p) == want)
+                .or_else(|| registry.iter().find(|(a, _)| same_abi(a)));
+            if let Some((_, p)) = pick {
                 if probe(p, data, vm_off, iso_off).is_some() {
                     return Some((p, Detection { hash_hit: true, clean: true }));
                 }
@@ -80,9 +92,21 @@ pub fn detect_sdk(
     // 2) 结构探针：alloc 段试解析 + fill 决胜
     let single = vm_off == iso_off;
     let mut cands: Vec<(&'static SdkProfile, Probe)> = Vec::new();
-    for (_, p) in registry
+    // 有目标变体时只在同变体内挑（压缩/非压缩的目标布局不同，混着比会选错）
+    let variant_pool: Vec<&'static SdkProfile> = registry
         .iter()
-        .filter(|(_, p)| p.status != "unsupported" && p.format.single_snapshot == single)
+        .filter(|(_, p)| p.status != "unsupported" && p.format.single_snapshot == single
+            && variant_of(p) == want)
+        .map(|(_, p)| p)
+        .collect();
+    let cand_iter: Box<dyn Iterator<Item = &'static SdkProfile>> = if variant_pool.is_empty() {
+        Box::new(registry.iter().filter(|(_, p)| {
+            p.status != "unsupported" && p.format.single_snapshot == single
+        }).map(|(_, p)| p))
+    } else {
+        Box::new(variant_pool.into_iter())
+    };
+    for p in cand_iter
     {
         if let Some(pr) = probe(p, data, vm_off, iso_off) {
             cands.push((p, pr));
