@@ -14,7 +14,15 @@ cargo test --release --test dart_valid              # 门禁：每个可用语�
 cargo test --release --test dart_valid -- --ignored --nocapture   # 全量基线（25 个 SDK 产物）
 cargo test --release --test decompiler_shape       # 形态门禁 + 地址自洽性门禁
 cargo test --release --test field_names            # 字段名恢复：两源一致 + 零冲突
+cargo test --release --test source_truth           # 现编 tests/fixtures/truth.dart，反编译后对源码判
+DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # 同一套判据跑压缩指针 arm64 产物
 ```
+
+`tests/source_truth.rs` 是唯一**输入是源码**的门禁：用本机 `dart` 编 `tests/fixtures/truth.dart`，
+反编译后断言源码说必须留下来的东西——快照里归属该库的每个函数都渲染出来、`main` 会走到的字符串常量
+被内联、`Account.withdraw` 保留 `-1` 分支与比较（未被内联时）、产物零 `dart analyze` 错误、解析不漂移。
+安卓变体对 `flutter assemble` 现编的 arm64 **压缩指针**产物跑同一套判据（刻意绕开 Gradle：
+它首跑会长时间卡在依赖下载上）。
 
 `tests/dart_valid.rs` 对产物目录调 `dart analyze`，只数 `error -` 行：警告与提示（未使用变量、
 未使用 import）不计——它们不影响"能不能编译"。`dart` 不在 `PATH` 时整条测试自动跳过，
@@ -218,7 +226,13 @@ dae 不跟踪基址的类型，在不知道基址就是接收者的情况下写�
    所以访问写成 `mem(base, disp) /* 类.字段 (off 0x..) */` 而不是 `base.field`。补这一步和
    aotopsy 的 `typetrack` 是同一件事：从调用点、池条目和接收者槽做全程序传播。
    局部变量与参数仍是 `dynamic`。
-5. 前导声明是每文件机械生成的；更聪明的做法是只声明用到的，并给占位函数真实签名。
+5. **调用点不显示实参**，于是调用方准备的寄存器看起来像死写：`x1 = NULL; x2 = 6; sub_0x2bb1d0();`
+   ——这是 `unused_local_variable` 警告的主要来源（整个 Flutter 构建 10,023 条，160 行的真值语料
+   1,475 条）。写成 `sub_0x2bb1d0(x0, x1, x2)` 看着 trivial，但**现在还不诚实**：某个实参寄存器可能是在
+   一次**中间调用之前**写的（Dart 的栈溢出 stub 会保留接收者，所以下一个 `bl` 处 x0 仍有效），而 dae
+   手里没有经过验证的**各 ABI 破坏寄存器表**——有了它就能算真正的活跃性，再把实参写出来。
+   已经试过并撤回，正是被真值语料抓出来的（x0 是 8 条指令、一次调用之前写的）。
+6. 前导声明是每文件机械生成的；更聪明的做法是只声明用到的，并给占位函数真实签名。
 
 ## 加语料
 

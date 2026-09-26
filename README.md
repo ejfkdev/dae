@@ -208,7 +208,10 @@ recovery (everything is `dynamic`, field access is `mem(base, disp)`). Unrecogni
 are emitted verbatim as `// unmapped:` rather than approximated, and the count is printed in the
 run summary — treat it as the quality dial.
 
-Gates run on every change: `tests/dart_valid.rs` (real `dart analyze`, zero errors),
+Gates run on every change: `tests/source_truth.rs` (compiles `tests/fixtures/truth.dart` with the
+local `dart`, decompiles it, and checks the result against the source — plus the same battery on a
+compressed-pointer arm64 build under `DAE_TRUTH_ANDROID=1`), `tests/dart_valid.rs` (real
+`dart analyze`, zero errors),
 `tests/decompiler_shape.rs` (braces must balance in every emitted file — an unbalanced file means
 a branch was silently dropped — every in-function statement must terminate, a structured-rate
 floor, and **address self-consistency**: function ends look like terminators and direct calls land

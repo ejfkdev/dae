@@ -3,7 +3,9 @@
   "name": "pe-x64",
   "arch": "x64",
   "endianness": "little",
-  "container": { "kind": "pe" },
+  "container": {
+    "kind": "pe"
+  },
   "symbols": {
     "vm_data": "_kDartVmSnapshotData",
     "isolate_data": "_kDartIsolateSnapshotData",
@@ -19,8 +21,20 @@
     "ic_data": "rbx"
   },
   "register_aliases": {},
-  "non_field_base": ["r14", "rsp", "rbp", "r15", "r12", "rbx"],
+  "non_field_base": [
+    "r14",
+    "rsp",
+    "rbp",
+    "r15",
+    "r12",
+    "rbx"
+  ],
   "polymorphic_entry_offset_aot": 0,
   "frida_heap_address_reg": "",
-  "status": "unverified"
+  "status": "unverified",
+  "symbols_alt": {
+    "vm_data": "_kDartSnapshotData",
+    "isolate_data": "_kDartSnapshotData",
+    "isolate_instructions": "_kDartSnapshotText"
+  }
 }

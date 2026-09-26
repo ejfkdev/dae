@@ -15,7 +15,18 @@ cargo test --release --test dart_valid              # gate: every available corp
 cargo test --release --test dart_valid -- --ignored --nocapture   # full scorecard (all 25 SDK artifacts)
 cargo test --release --test decompiler_shape       # shape + address self-consistency gates
 cargo test --release --test field_names            # field-name recovery: cross-source agreement, zero conflicts
+cargo test --release --test source_truth           # build tests/fixtures/truth.dart, decompile it, check against the source
+DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # same gate on a compressed-pointer arm64 build
 ```
+
+`tests/source_truth.rs` is the only gate whose **input is source code**: it compiles
+`tests/fixtures/truth.dart` with the local `dart`, decompiles the result, and asserts what the
+source says must survive — every function the snapshot attributes to that library is rendered,
+the string constants `main` reaches are inlined, `Account.withdraw` keeps its `-1` branch and its
+comparison (when the compiler did not inline it), the output analyses with zero errors, and the
+parse never drifts. The Android variant runs the same assertions on an arm64
+**compressed-pointer** build produced by `flutter assemble` (it bypasses Gradle, whose first run
+stalls on dependency downloads).
 
 `tests/dart_valid.rs` shells out to `dart analyze` over the emitted `dart/` directory and counts
 `error -` lines. Warnings and infos (unused variable, unused import) are ignored — they do not
@@ -252,7 +263,16 @@ corpora both tools read, 0 `dart analyze` errors vs ~70k — see [`COMPARISON.md
    `mem(base, disp) /* Class.field (off 0x..) */` rather than `base.field`. Closing that is the
    same job as aotopsy's `typetrack`: whole-program propagation from call sites, pool entries and
    the receiver slot. Locals and parameters are still `dynamic`.
-5. The preamble is per file and mechanical; a smarter version would only declare what is used
+5. **Call sites show no arguments**, so the registers a caller sets up look like dead stores:
+   `x1 = NULL; x2 = 6; sub_0x2bb1d0();` is the remaining bulk of the `unused_local_variable`
+   warnings (10,023 on a full Flutter build, 1,475 on the 160-line truth fixture). Rendering
+   `sub_0x2bb1d0(x0, x1, x2)` looks trivial but is not honest yet: an argument register may have
+   been written *before* an intervening call (Dart's stack-overflow stub preserves the receiver,
+   so `x0` is still live at the next `bl`), and dae has no verified clobber list per ABI — with
+   one it could compute real liveness and then show the arguments. Attempted and reverted for
+   exactly this reason; the truth fixture caught it (`x0` was set 8 instructions and one call
+   earlier).
+6. The preamble is per file and mechanical; a smarter version would only declare what is used
    and give the helpers real signatures.
 
 ## Adding a corpus

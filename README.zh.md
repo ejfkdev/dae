@@ -193,7 +193,9 @@ dae getlib    <binary> <LIB>                  只反编译这个库（包）
 补法与 aotopsy 的 `typetrack` 同源）。认不出的指令原样输出为 `// unmapped:`，不做近似；
 运行摘要里会打印这个行数——可以把它当质量刻度看。
 
-每次改动都有门禁：`tests/dart_valid.rs`（真跑 `dart analyze`，要求零错误）、
+每次改动都有门禁：`tests/source_truth.rs`（用本机 `dart` 现编 `tests/fixtures/truth.dart`，
+反编译后**对源码判**；`DAE_TRUTH_ANDROID=1` 时再对压缩指针 arm64 产物跑同一套）、
+`tests/dart_valid.rs`（真跑 `dart analyze`，要求零错误）、
 `tests/decompiler_shape.rs`（产物文件花括号必须配平（不配平=静默丢分支）、函数体内语句必须正常
 结束、结构化率有下限、**地址必须自洽**（函数末尾像终止符、直接调用命中函数入口））与
 `tests/field_names.rs`（两条字段名路径必须互相印证、零冲突，且产物里每个注解都要在恢复表里

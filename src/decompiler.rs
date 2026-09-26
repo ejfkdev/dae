@@ -216,10 +216,15 @@ fn sel_cc(rendered: &str) -> Option<&str> {
 
 /// 条件跳转 + 上一条比较 → 真条件表达式；拼不出来时保留 mnemonic（不猜）。
 fn fold_cond(mnem: &str, last: &Option<(String, String)>) -> String {
+    // 纯**标志位**条件（进位/溢出/奇偶…）：`adds r0, r3, r3` + `b.vc` 这类。它们不是
+    // 比较，Dart 层表达不出来，但必须**明确说这是 CPU 标志**，而不是把助记符原文
+    // （`b.vc`）塞进 `if (...)`——那会编译得过、语义却什么都不是（实测一个自编程序里
+    // 有 335 处 `if (b.vc)`）。`condFlag("vc")` 是前导里已声明的占位。
+    let flag_only = |cc: &str| format!("condFlag(\"{cc}\")");
     let op = match mnem {
-        // arm64
+        // arm64：其余条件码统一走 condFlag
         "b.eq" | "b.ne" | "b.lt" | "b.le" | "b.gt" | "b.ge" | "b.hi" | "b.hs" | "b.lo" | "b.ls"
-        | "b.mi" | "b.pl" | "b.vs" | "b.vc" => match mnem {
+        | "b.mi" | "b.pl" => match mnem {
             "b.eq" => "==",
             "b.ne" => "!=",
             "b.lt" => "<",
@@ -231,9 +236,10 @@ fn fold_cond(mnem: &str, last: &Option<(String, String)>) -> String {
             "b.lo" => "<",
             "b.ls" => "<=",
             "b.mi" => "<",
-            _ => return mnem.to_string(),
+            _ => ">=",
         },
-        // x86
+        "b.vs" | "b.vc" | "b.cs" | "b.cc" => return flag_only(&mnem[2..]),
+        // x86：同上
         "je" | "jz" => "==",
         "jne" | "jnz" => "!=",
         "jl" | "jb" | "jnae" => "<",
@@ -242,11 +248,18 @@ fn fold_cond(mnem: &str, last: &Option<(String, String)>) -> String {
         "jge" | "jae" | "jnb" => ">=",
         "js" => "<",
         "jns" => ">=",
-        _ => return mnem.to_string(),
+        "jo" | "jno" | "jc" | "jnc" | "jp" | "jnp" | "jpe" | "jpo" => {
+            return flag_only(&mnem[1..])
+        }
+        _ => return format!("condFlag(\"{mnem}\")"),
     };
     match last {
         Some((a, b)) => format!("{a} {op} {b}"),
-        None => mnem.to_string(),
+        // 没有可折的比较：不能把助记符原文当表达式，明确标成标志位
+        None => {
+            let cc = mnem.trim_start_matches('b').trim_start_matches('.');
+            flag_only(cc)
+        }
     }
 }
 
@@ -779,7 +792,9 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         {
             return Op::Assign {
                 dst: reg_name(d),
-                src: Expr::Text(format!("({} as {})", parts[1], mnem)),
+                // 扩展/位宽指令（`sxtw w1, w2`）写成声明过的占位函数：`(w2 as sxtw)` 是
+            // 「把没赋值的 w 寄存器转型」→ dart analyze 报 cast_from_nullable_always_fails
+            src: Expr::Text(format!("{mnem}({})", parts[1])),
             };
         }
         if (mnem == "ubfiz" || mnem == "sbfiz") && parts.len() >= 4 && is_reg(d) {
@@ -1643,26 +1658,35 @@ fn emit_function(
         match &st.op {
             Op::Assign { dst, .. } => {
                 let dst = sanitize_regs(dst);
-                if declared.insert(dst.clone()) {
-                    let _ = writeln!(out, "  dynamic {dst};");
-                }
+                declared.insert(dst);
             }
             Op::Call { dst: Some(d), .. } => {
                 let d = sanitize_regs(d);
-                if declared.insert(d.clone()) {
-                    let _ = writeln!(out, "  dynamic {d};");
-                }
+                declared.insert(d);
             }
             Op::PairLoad { d1, d2, .. } => {
                 for d in [d1, d2] {
                     let d = sanitize_regs(d);
-                    if declared.insert(d.clone()) {
-                        let _ = writeln!(out, "  dynamic {d};");
-                    }
+                    declared.insert(d);
                 }
             }
             _ => {}
         }
+    }
+    // 只声明**正文代码里**出现过的标识符：注释里出现的不算（`// frame: FP, LR, …` 会让
+    // FP/BARRIER 这类角色寄存器挂着声明却无人读 → 每函数一条 unused_local_variable）。
+    let code_only: String = body
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let words: std::collections::HashSet<&str> = code_only
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let decls: Vec<String> = declared.into_iter().filter(|d| words.contains(d.as_str())).collect();
+    for d in decls {
+        let _ = writeln!(out, "  dynamic {d};");
     }
     out.push_str(&body);
     out.push_str("}\n");
@@ -1813,11 +1837,18 @@ const PSEUDO_FUNCS: &[(&str, &str)] = &[
     ("toInt", "dynamic toInt(dynamic a) => null;"),
     ("toIntUnsigned", "dynamic toIntUnsigned(dynamic a) => null;"),
     ("toDouble", "dynamic toDouble(dynamic a) => null;"),
+    // 子寄存器扩展（arm64 `sxtw w1, w2`）：占位函数而非 `as` 转型
+    ("sxtb", "dynamic sxtb(dynamic a) => null;"),
+    ("sxth", "dynamic sxth(dynamic a) => null;"),
+    ("sxtw", "dynamic sxtw(dynamic a) => null;"),
+    ("uxtb", "dynamic uxtb(dynamic a) => null;"),
+    ("uxth", "dynamic uxth(dynamic a) => null;"),
+    ("uxtw", "dynamic uxtw(dynamic a) => null;"),
 ];
 
 /// 位宽/扩展名（`as u8`、`as sxtw` 里的类型位）→ `typedef ... = int;`
 const WIDTH_NAMES: &[&str] = &[
-    "u8", "u16", "u32", "i8", "i16", "i32", "sxtb", "sxth", "sxtw", "uxtb", "uxth", "uxtw",
+    "u8", "u16", "u32", "i8", "i16", "i32",
 ];
 
 /// 文件前导：伪运行时 + 用到但本文件没定义的标识符声明。
@@ -2870,6 +2901,12 @@ impl<'a> Structurer<'a> {
         ) as usize;
         let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], &self.rl);
         for s in &nested {
+            // 帧簿记走注释（与 stp/ldp 同口径）：Dart 里没有 FP/SP，写成赋值只会
+            // 制造「写了没人读」的噪声
+            if let Some(note) = Self::frame_note(s, &self.rl) {
+                v.push(Node::Line(note));
+                continue;
+            }
             if let Some(line) = render_op(&self.rl, &s.op, s.addr) {
                 v.push(Node::Line(line));
             }
@@ -2899,10 +2936,7 @@ impl<'a> Structurer<'a> {
             out.extend(self.body_lines(b));
             match self.term(b) {
                 Some(Op::Return { value }) => {
-                    out.push(Node::Line(match &value {
-                        Some(v) => format!("return {v};"),
-                        None => "return;".to_string(),
-                    }));
+                    out.push(Node::Line(self.ret_line(b, &value)));
                     self.dup_lines += lines;
                     return Some(out);
                 }
@@ -2924,6 +2958,47 @@ impl<'a> Structurer<'a> {
                         return Some(out);
                     }
                 },
+            }
+        }
+        None
+    }
+
+    /// `ret` 的渲染：`Return { value: None }` 在机器层是「x0/rax 里是返回值」。
+    /// 若本块最后一条语句正是写返回寄存器，就写成 `return x0;`——比裸 `return;` 忠实，
+    /// 也消掉一大类 `unused_local_variable`（实测一个自编程序里 3,290 条警告，多数是
+    /// 「写了返回值寄存器却没人读」的形态）。
+    fn ret_line(&self, b: usize, value: &Option<String>) -> String {
+        if let Some(v) = value {
+            return format!("return {v};");
+        }
+        const RET_REGS: [&str; 3] = ["x0", "rax", "eax"];
+        let last_assign = self.blocks[b]
+            .stmts
+            .iter()
+            .rev()
+            .find_map(|st| match &st.op {
+                Op::Assign { dst, .. } => Some(dst.as_str()),
+                _ => None,
+            });
+        match last_assign {
+            Some(d) if RET_REGS.contains(&d) => format!("return {d};"),
+            _ => "return;".to_string(),
+        }
+    }
+
+    /// 帧簿记（`FP = SP` / `SP = SP ± n`）在 Dart 层不存在，与 `stp/ldp` 一样当注释保留。
+    /// 这样 FP/SP 不再以「写了没人读」的赋值形态出现。
+    fn frame_note(st: &Stmt, rl: &Roles) -> Option<String> {
+        let Op::Assign { dst, src } = &st.op else { return None };
+        let d = sanitize_regs(dst);
+        let sx = src.text(rl);
+        if d == "FP" && sx.trim_start_matches('(').starts_with("SP") {
+            return Some(format!("// frame: {d} = {sx} // {:#x}", st.addr));
+        }
+        if d == "SP" {
+            let rest = sx.trim_start_matches('(').trim_start_matches("SP").trim_start();
+            if rest.starts_with('+') || rest.starts_with('-') {
+                return Some(format!("// frame: {d} = {sx} // {:#x}", st.addr));
             }
         }
         None
@@ -3036,10 +3111,7 @@ impl<'a> Structurer<'a> {
             out.extend(self.body_lines(b));
             match self.term(b) {
                 Some(Op::Return { value }) => {
-                    out.push(Node::Line(match &value {
-                        Some(v) => format!("return {v};"),
-                        None => "return;".to_string(),
-                    }));
+                    out.push(Node::Line(self.ret_line(b, &value)));
                     break;
                 }
                 Some(Op::Abort(n)) => {

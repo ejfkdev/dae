@@ -3,7 +3,9 @@
   "name": "elf-arm64",
   "arch": "arm64",
   "endianness": "little",
-  "container": { "kind": "elf" },
+  "container": {
+    "kind": "elf"
+  },
   "symbols": {
     "vm_data": "_kDartVmSnapshotData",
     "isolate_data": "_kDartIsolateSnapshotData",
@@ -22,13 +24,37 @@
     "heap_bits": "x28"
   },
   "register_aliases": {
-    "x31": "SP", "xzr": "xzr", "wzr": "wzr",
-    "x15": "SP", "x29": "fp", "x30": "lr",
-    "x26": "THR", "x22": "NULL", "x16": "BARRIER",
-    "x18": "ARG2", "x23": "CODE_REG", "x27": "PP", "x28": "HEAP"
+    "x31": "SP",
+    "xzr": "xzr",
+    "wzr": "wzr",
+    "x15": "SP",
+    "x29": "fp",
+    "x30": "lr",
+    "x26": "THR",
+    "x22": "NULL",
+    "x16": "BARRIER",
+    "x18": "ARG2",
+    "x23": "CODE_REG",
+    "x27": "PP",
+    "x28": "HEAP"
   },
-  "non_field_base": ["x29", "x15", "x26", "x30", "x27", "x21", "x24", "x28", "x22"],
+  "non_field_base": [
+    "x29",
+    "x15",
+    "x26",
+    "x30",
+    "x27",
+    "x21",
+    "x24",
+    "x28",
+    "x22"
+  ],
   "polymorphic_entry_offset_aot": 24,
   "frida_heap_address_reg": "x28",
-  "status": "unverified"
+  "status": "unverified",
+  "symbols_alt": {
+    "vm_data": "_kDartSnapshotData",
+    "isolate_data": "_kDartSnapshotData",
+    "isolate_instructions": "_kDartSnapshotText"
+  }
 }
