@@ -24,6 +24,15 @@ DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # 同一套判据
 安卓变体对 `flutter assemble` 现编的 arm64 **压缩指针**产物跑同一套判据（刻意绕开 Gradle：
 它首跑会长时间卡在依赖下载上）。
 
+**门禁要能自证。** 一个「什么都没量到也能通过」的门禁比没有门禁更坏——这个仓库为此付过两次学费
+（序言率检查替掉了「末指令是终止符」检查，后者在地址全错时照样 95.7%，因为它在数 x64 的 `int3` 填充）。
+所以两个 `dart analyze` 门禁都会拿**工具自己的退出码与总结行**（`No issues found!` / `N issues found.`）
+反查自己的解析结果：rc=0/1/2 必须解析出 0 个 error、rc=3 必须解析出至少 1 个，且总结行必须出现。
+`dart analyze` 指向不存在的目录时返回 rc=64 + usage 文本，里面一条 `error - ` 都没有，
+旧解析器把它读成「0 错误」——对一份根本没被分析过的产物盖了通过章。现在每个门禁都带一条
+`*_rejects_directory_it_never_analyzed` 自检测试，那个洞一回来就失败；`dart_valid` 还额外断言
+每个语料都真的产出了文件与函数，于是「产物为空」再也不能冒充「产物干净」。
+
 `tests/dart_valid.rs` 对产物目录调 `dart analyze`，只数 `error -` 行：警告与提示（未使用变量、
 未使用 import）不计——它们不影响"能不能编译"。`dart` 不在 `PATH` 时整条测试自动跳过，
 所以在没有 Dart SDK 的机器上不会变成红。

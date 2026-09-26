@@ -31,7 +31,12 @@ fn which(cmd: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// `dart analyze <dir>` → (error 条数, 诊断码 → 条数)。没有 dart 时返回 None。
+/// `dart analyze <dir>` → (error 条数, 诊断码 → 条数)。
+///
+/// **只有「本机没有 dart」才返回 None**（那是合法跳过）。analyze 真跑了却看不懂输出时
+/// **直接 panic**，绝不静默返回 0：实测 `dart analyze /不存在的路径` 返回 rc=64 + usage
+/// 文本，里面一条 `error - ` 都没有，旧实现会解析出 `errors=0` 然后断言通过——
+/// 门禁在根本没分析任何文件的情况下绿灯，正是本项目反复踩过的「假门禁」形态。
 fn analyze(dir: &Path) -> Option<(usize, Vec<(String, usize)>)> {
     let dart = which("dart")?;
     let out = std::process::Command::new(&dart)
@@ -39,6 +44,7 @@ fn analyze(dir: &Path) -> Option<(usize, Vec<(String, usize)>)> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
+    let rc = out.status.code().unwrap_or(-1);
     let mut errors = 0usize;
     let mut codes: std::collections::BTreeMap<String, usize> = Default::default();
     for line in text.lines() {
@@ -57,6 +63,27 @@ fn analyze(dir: &Path) -> Option<(usize, Vec<(String, usize)>)> {
         if let Some(code) = rest.rsplit(" - ").next() {
             *codes.entry(code.trim().to_string()).or_insert(0) += 1;
         }
+    }
+
+    // 自证 1：必须有 dart 自己的总结行，否则说明输出格式变了（解析到的 0 毫无意义）
+    let summarized = text.contains("No issues found")
+        || text.contains("issues found")
+        || text.contains("issue found");
+    // 自证 2：退出码与解析结果必须互相印证。实测语义：
+    // 0=无问题、2=仅 warning/info、3=有 error、64=usage 错误（路径不存在等）
+    let rc_agrees = match rc {
+        3 => errors > 0,
+        0 | 1 | 2 => errors == 0,
+        _ => false,
+    };
+    if !summarized || !rc_agrees {
+        panic!(
+            "dart analyze 结果无法自证（rc={rc}，解析到 {errors} 个 error，总结行出现={summarized}）。\n\
+             要么输出格式变了，要么目标目录不存在/为空——两种情况都不能当作「0 错误」放过。\n\
+             目标目录：{}\nstdout 前 400 字：{}",
+            dir.display(),
+            text.chars().take(400).collect::<String>()
+        );
     }
     Some((errors, codes.into_iter().collect()))
 }
@@ -150,9 +177,12 @@ fn check(bin: &Path, out: &Path, label: &str, plat_name: &str) {
     }
 
     // 4) 可编译
-    if let Some((errors, codes)) = analyze(&out.join("dart")) {
-        println!("{label}: dart analyze error={errors} 诊断={codes:?}");
-        assert_eq!(errors, 0, "{label}: 产物有 dart analyze 错误");
+    match analyze(&out.join("dart")) {
+        Some((errors, codes)) => {
+            println!("{label}: dart analyze error={errors} 诊断={codes:?}");
+            assert_eq!(errors, 0, "{label}: 产物有 dart analyze 错误");
+        }
+        None => println!("{label}: 本机没有 dart，跳过可编译性检查（其余判据已执行）"),
     }
 }
 
@@ -182,12 +212,20 @@ fn source_truth_desktop() {
         "dart compile 失败：{}",
         String::from_utf8_lossy(&st.stderr)
     );
-    // 容器随宿主平台变：ELF 用 elf-*，Mach-O 用 macho-arm64（本机 arm64）
-    let magic = std::fs::read(&bin).unwrap()[..4].to_vec();
-    let plat = if magic == vec![0x7f, b'E', b'L', b'F'] {
-        "elf-x64.json"
-    } else {
-        "macho-arm64.json"
+    // `dart compile exe` 不做交叉编译，产物容器与架构就等于宿主，
+    // 因此按 host OS/ARCH 选 profile。曾按魔数二分支（ELF→x64，否则→macho-arm64），
+    // 那在 linux-arm64 上会选成 elf-x64、在 windows 上会选成 macho-arm64，门禁自身就不可移植。
+    let plat = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "elf-x64.json",
+        ("linux", "aarch64") => "elf-arm64.json",
+        ("macos", "x86_64") => "macho-x64.json",
+        ("macos", "aarch64") => "macho-arm64.json",
+        ("windows", "x86_64") => "pe-x64.json",
+        ("windows", "aarch64") => "pe-arm64.json",
+        (os, arch) => {
+            println!("source_truth_desktop: 宿主 {os}/{arch} 没有对应 platform profile，跳过");
+            return;
+        }
     };
     check(&bin, &work.join("out"), "desktop", plat);
 }
@@ -252,4 +290,23 @@ fn source_truth_android_optin() {
     let so = work.join("aot/arm64-v8a/app.so");
     assert!(so.exists(), "没产出 app.so");
     check(&so, &work.join("out"), "android", "elf-arm64.json");
+}
+
+/// **门禁自检**：目录不存在时必须炸，不能静默报 0 错误。
+/// 这条测的是门禁本身——`dart analyze /不存在的路径` 返回 rc=64 + usage 文本，
+/// 里面一条 `error - ` 都没有，旧实现解析出 `errors=0` 然后断言通过，
+/// 等于在根本没分析任何文件的情况下给产物盖了「可编译」的章。
+#[test]
+fn analyze_rejects_directory_it_never_analyzed() {
+    if which("dart").is_none() {
+        println!("analyze_rejects_directory_it_never_analyzed: 没有 dart，跳过");
+        return;
+    }
+    let bogus = Path::new("/tmp/dae_gate_selfcheck_definitely_not_here");
+    let r = std::panic::catch_unwind(|| analyze(bogus));
+    assert!(
+        r.is_err(),
+        "门禁自证失效：analyze() 对一个它根本没分析过的目录没有报错，\
+         假通过洞又回来了（见 docs/DECOMPILER.md 的「假门禁」教训）"
+    );
 }

@@ -24,20 +24,45 @@ fn dart_bin() -> Option<String> {
     out.status.success().then(|| "dart".to_string())
 }
 
-/// 对一个输出目录跑 `dart analyze`，返回 error 行
+/// 对一个输出目录跑 `dart analyze`，返回 error 行。
+///
+/// **必须自证看懂了输出**：实测退出码语义为 0=无问题、2=仅 warning/info、3=有 error、
+/// 64=usage 错误（目录不存在等）。旧实现只 filter `error -` 行，于是目录不存在时
+/// 返回空列表、格式变化时也返回空列表，调用方再 `unwrap_or_default()` 一吞——
+/// 门禁在根本没分析任何文件的情况下报 0 错误。这类「指标全绿但量的是别的东西」
+/// 是本仓库踩过的最贵的坑，所以这里宁可 Err 也不给一个看起来合理的 0。
 fn analyze_errors(dir: &Path) -> Result<Vec<String>, String> {
     let out = Command::new("dart")
         .arg("analyze")
         .arg(".")
         .current_dir(dir)
         .output()
-        .map_err(|e| format!("启动 dart analyze 失败: {e}"))?;
+        .map_err(|e| format!("启动 dart analyze 失败（目录 {}）: {e}", dir.display()))?;
     let text = String::from_utf8_lossy(&out.stdout);
+    let rc = out.status.code().unwrap_or(-1);
     let errs: Vec<String> = text
         .lines()
         .filter(|l| l.trim_start().starts_with("error -"))
         .map(|l| l.trim().to_string())
         .collect();
+
+    let summarized = text.contains("No issues found")
+        || text.contains("issues found")
+        || text.contains("issue found");
+    let rc_agrees = match rc {
+        3 => !errs.is_empty(),
+        0 | 1 | 2 => errs.is_empty(),
+        _ => false,
+    };
+    if !summarized || !rc_agrees {
+        return Err(format!(
+            "dart analyze 结果无法自证（rc={rc}，解析到 {} 条 error，总结行出现={summarized}）；\n\
+             目录：{}\nstdout 前 400 字：{}",
+            errs.len(),
+            dir.display(),
+            text.chars().take(400).collect::<String>()
+        ));
+    }
     Ok(errs)
 }
 
@@ -75,6 +100,8 @@ struct Score {
     funcs: usize,
     structured: usize,
     unmapped: usize,
+    /// 预期内不支持（JIT 快照按设计拒绝）——只有这种才允许 files/funcs 为 0。
+    skipped: bool,
 }
 
 fn score_one(bin: &str, label: &str, so: &Path, sdk: Option<&str>, plat: Option<&str>) -> Score {
@@ -107,6 +134,7 @@ fn score_one(bin: &str, label: &str, so: &Path, sdk: Option<&str>, plat: Option<
                 funcs: 0,
                 structured: 0,
                 unmapped: 0,
+                skipped: true,
             };
         }
         panic!("{label}: dae 导出失败: {stderr}");
@@ -115,7 +143,7 @@ fn score_one(bin: &str, label: &str, so: &Path, sdk: Option<&str>, plat: Option<
     let files = std::fs::read_dir(&dart_dir)
         .map(|d| d.filter_map(|e| e.ok()).count())
         .unwrap_or(0);
-    let errs = analyze_errors(&dart_dir).unwrap_or_default();
+    let errs = analyze_errors(&dart_dir).unwrap_or_else(|e| panic!("{label}: {e}"));
     let first = errs.first().cloned().unwrap_or_default();
     // dae 的摘要行里带质量指标（函数数 / 已结构化 / 未映射行），一并收进基线
     let stdout = String::from_utf8_lossy(&status.stdout);
@@ -128,6 +156,7 @@ fn score_one(bin: &str, label: &str, so: &Path, sdk: Option<&str>, plat: Option<
         funcs,
         structured,
         unmapped,
+        skipped: false,
     }
 }
 
@@ -194,6 +223,13 @@ fn emitted_dart_is_valid() {
         println!(
             "{:26} 文件 {:4} 函数 {:5} 结构化 {:5} 未映射 {:5}  dart analyze 错误 {}",
             s.label, s.files, s.funcs, s.structured, s.unmapped, s.errors
+        );
+        // 产物存在性：0 error 但 0 文件/0 函数不是"干净"，是根本没量到东西。
+        // 只有预期内不支持（JIT 快照）才允许为空。
+        assert!(
+            s.skipped || (s.files > 0 && s.funcs > 0),
+            "{}: dart analyze 报 0 错误，但产物是空的（文件 {} / 函数 {}）——             这说明 dae 没写出 .dart 或摘要解析失效，不能当作通过",
+            s.label, s.files, s.funcs
         );
         if s.errors > 0 {
             bad.push(s);
@@ -279,5 +315,23 @@ fn full_scorecard() {
         rows.iter().map(|r| r.files).sum::<usize>(),
         rows.iter().map(|r| r.funcs).sum::<usize>(),
         total
+    );
+}
+
+/// **门禁自检**：`analyze_errors` 对一个不存在/没产出任何东西的目录必须返回 Err。
+/// 旧实现返回空列表，调用方 `unwrap_or_default()` 一吞就变成「0 错误」——
+/// 产物为空和产物干净在门禁眼里没有区别，这正是本仓库最贵的那类坑。
+#[test]
+fn analyze_errors_rejects_directory_it_never_analyzed() {
+    if dart_bin().is_none() {
+        println!("analyze_errors_rejects_directory_it_never_analyzed: 没有 dart，跳过");
+        return;
+    }
+    let r = analyze_errors(Path::new("/tmp/dae_gate_selfcheck_definitely_not_here"));
+    assert!(
+        r.is_err(),
+        "门禁自证失效：analyze_errors 对没分析过的目录返回了 Ok，\
+         错误会被 unwrap 成「0 条 error」从而假通过；得到 {:?}",
+        r.ok()
     );
 }

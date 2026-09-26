@@ -28,6 +28,18 @@ parse never drifts. The Android variant runs the same assertions on an arm64
 **compressed-pointer** build produced by `flutter assemble` (it bypasses Gradle, whose first run
 stalls on dependency downloads).
 
+**The gates verify themselves.** A gate that can pass without measuring anything is worse than no
+gate — this repo has paid for that twice (a prologue-rate check replaced a "last instruction is a
+terminator" check that was happily counting x64 `int3` padding while the addresses were wrong).
+So both `dart analyze` gates cross-check their own parsing against the tool's exit code and its
+summary line (`No issues found!` / `N issues found.`): rc=0/1/2 must yield zero parsed errors and
+rc=3 must yield at least one, and the summary line must be present at all. `dart analyze` on a
+missing directory returns rc=64 with usage text containing no `error - ` lines, which the old
+parsers read as "0 errors" — a clean pass on output that was never analysed. Each gate now carries
+a `*_rejects_directory_it_never_analyzed` test that fails if that hole ever returns, and
+`dart_valid` additionally asserts every corpus produced files and functions, so "empty output"
+can no longer masquerade as "clean output".
+
 `tests/dart_valid.rs` shells out to `dart analyze` over the emitted `dart/` directory and counts
 `error -` lines. Warnings and infos (unused variable, unused import) are ignored — they do not
 affect whether the output compiles. The test skips itself when `dart` is not on `PATH`, so it
