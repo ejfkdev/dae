@@ -54,8 +54,12 @@ python3 testing/compare_aotopsy.py <libapp.so> [out_root]
 
 ## aotopsy 领先的地方
 
-- **动态字段名**：aotopsy 打印 `local_16.values_14b94 = 0;`——带偏移的**字段名**，来自全程序类型推断
-  （`typetrack`）；dae 是 `mem(local_16, 0x17)`。dae 有对象池的值（上面那条），但没有局部/参数类型。
+- **字段访问是重写而不是注解**：aotopsy 打印 `local_16.values_14b94 = 0;`——基址、点、字段名。
+  dae 现在用**同一个来源**恢复出同样的名字（读 `MintValues[HostOffset] × wordSize`，与 aotopsy 的
+  `class_layouts.go` 一模一样，另外补了隐式访问器名这条路），但挂成带归属的注释：
+  `mem(local_16, 0x17) /* _FutureListener.result (off 0x18) */`。要写成 `local_16.result` 得知道
+  基址的**类型**——aotopsy 靠全程序推断（`typetrack`），dae 还没有；没那一步就断言类型属于编造。
+  所以：名字一致、呈现不同，而 dae 这半边是诚实的。
 - **类型测试 stub 的命名**：aotopsy 把 176 个"无人认领的表项"全部命名
   （`TypeTestingStub__GrowableList@0150898`）；dae 只能证明性地命名其中 88 个分配 stub，
   另外 88 个类型测试 stub 留成裸地址。表里那 ~3.5pp 的命名差**全部**来自这里。

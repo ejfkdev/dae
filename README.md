@@ -73,6 +73,7 @@ export done -> /absolute/path/to/out:
 | `classes.txt` | class inventory (ref, cid, library, name; under `text/`) |
 | `functions.txt` | flat `Library.Class.method → offset` index (under `text/`) |
 | `arrays.txt` / `maps.txt` | every List / Map object with its contents (under `text/`) |
+| `text/fields.txt` | named fields recovered from the snapshot's Field cluster (`rec`) or implicit-accessor names (`accessor`), with byte offsets |
 | `text/call_edges.txt` | call edges: direct `bl`/`call` targets + indirect call sites; per-class allocation stubs are named from their prologue |
 | `callgraph.dot` | direct-call graph between named functions (Graphviz DOT) |
 | `dart/*.dart` | per-function pseudocode that passes `dart analyze` (with `--decompile`) |
@@ -123,6 +124,7 @@ dae libs      <binary> [pattern]              libraries (packages) with class/fu
 dae classes   <binary> [pattern] [--lib P]    classes
 dae functions <binary> [pattern] [--lib P]    functions (entry, size, owner)
 dae strings   <binary> [-f TEXT]              snapshot string table
+dae fields    <binary> [pattern]              named fields (source + byte offset)
 dae largest   <binary> [-n N]                 biggest functions by code size
 dae callers   <binary> <NAME|0xADDR>          who calls it (static direct-call edges)
 dae disasm    <binary> <CLASS[.method]>       raw disassembly (arm64 keeps the IL comments)
@@ -172,6 +174,14 @@ What it does today:
 - **Pool constants recovered**: `ldr x0, [PP, #0x17f8]` becomes `x0 = "Hello" /* pp+0x17f8 */`
   (string literals, immediates; non-string entries get a type comment). Verified against source
   on both arm64 and x64.
+- **Field names, where they can be proved**: AOT deletes almost all of them
+  (`Precompiler::DropFields`), so dae uses exactly two routes — the snapshot's surviving `Field`
+  objects (name + word index via the Mint cluster) and implicit getter/setter names, whose body
+  touches exactly one field. A name shows up attributed, without claiming the base's type:
+  `x0 = mem((local_0), 0x17); /* _FutureListener.result (off 0x18) */`. Coverage: 60 recovered
+  names / 218 annotated accesses on the arm64 sample, 367 / 438 on the Flutter app; the two
+  routes independently agree on 40 of 41 entries and 0 anywhere conflict. `dae fields` lists the
+  table, `text/fields.txt` carries it in the export.
 - Stack slots rendered as locals (`local_8`), frame save/restore and barriers kept as
   `// frame:` / `// barrier:` comments, and the raw disassembly kept above each function so
   the output stays checkable.
@@ -198,11 +208,13 @@ recovery (everything is `dynamic`, field access is `mem(base, disp)`). Unrecogni
 are emitted verbatim as `// unmapped:` rather than approximated, and the count is printed in the
 run summary — treat it as the quality dial.
 
-Gates run on every change: `tests/dart_valid.rs` (real `dart analyze`, zero errors) and
+Gates run on every change: `tests/dart_valid.rs` (real `dart analyze`, zero errors),
 `tests/decompiler_shape.rs` (braces must balance in every emitted file — an unbalanced file means
 a branch was silently dropped — every in-function statement must terminate, a structured-rate
 floor, and **address self-consistency**: function ends look like terminators and direct calls land
-on function entries). That last gate exists because an address-location bug on appended Mach-O
+on function entries) and `tests/field_names.rs` (the two field-name routes must agree, zero
+conflicts, and every annotation in the output must exist in the recovered table — that is the
+no-fabrication check). The address gate exists because an address-location bug on appended Mach-O
 snapshots once made the decompiler read the wrong bytes while every name-based metric stayed green.
 
 ## Known limitations

@@ -14,6 +14,7 @@ Two checks, both runnable from a fresh checkout:
 cargo test --release --test dart_valid              # gate: every available corpus, 0 errors expected
 cargo test --release --test dart_valid -- --ignored --nocapture   # full scorecard (all 25 SDK artifacts)
 cargo test --release --test decompiler_shape       # shape + address self-consistency gates
+cargo test --release --test field_names            # field-name recovery: cross-source agreement, zero conflicts
 ```
 
 `tests/dart_valid.rs` shells out to `dart analyze` over the emitted `dart/` directory and counts
@@ -134,6 +135,76 @@ Three things this needed, each found by a wrong result first:
 Non-string entries get a type comment (`mem(PP, 0x2d8) /* Field */`) rather than a value —
 they are not Dart expressions, and inventing one would be worse than saying nothing.
 
+## Field names: what survives, and the two ways to prove one
+
+AOT deletes almost every field name. `Precompiler::DropFields` keeps them only outside PRODUCT
+builds, so a release binary retains a **handful**: 60 on the 3.13 arm64 sample, 366 on a real
+Flutter app — against hundreds of classes and thousands of fields. Everything else is gone, and
+dae does not guess it back.
+
+Two provable sources remain, and they are independent of each other:
+
+1. **The Field cluster itself.** Each surviving `Field` object carries `name_`, `owner_`, and
+   `host_offset_or_field_id_`. The last one is a **Smi**, and Smis are merged into the *Mint*
+   cluster on serialization (`app_snapshot.cc`: "Smis are merged into the Mint cluster"), so its
+   value is recoverable as the Mint's integer. That integer is the field's **word index**
+   (word 0 = tags; first field is word 1, or word 2 in a generic class because word 1 holds the
+   type arguments), hence `byte offset = word × word_size`.
+2. **Accessor names.** An implicit getter/setter (`kind` 6/7) is named after its field — private
+   ones as `get:_items`, public ones as the field name itself. Their body touches exactly one
+   field, so "exactly one field-shaped access in the body" is a *provable* rule: the offset comes
+   from the machine-code displacement, the name from the symbol. Two or more accesses (or any
+   access whose shape cannot be read) means the function is dropped, not guessed at.
+   (`Color.a`, `Paint._data`, `_HitTestResponse.hasPlatformView` come from this route.)
+
+The two meet in the middle: on the 3.13 arm64 sample the accessor route independently reproduced
+**40 of 41** Field-record entries with the *same* name *and* the same offset, and 39 of 39 on the
+x64 build of the same SDK — **0 conflicts** anywhere. That agreement is the strongest evidence
+available without source: one side reads the snapshot's own field table, the other reads machine
+code plus a function symbol.
+
+The offset chain was pinned down before either route was wired in, from four independent angles:
+
+| What was checked | Evidence |
+|---|---|
+| `disp + 1 == word × word_size` | `_FutureListener.get_result` loads `[x1, #0x17]` (24 = word 3); `get_state` `[x2, #0x1f]` (word 4); `get_callback` `[x1, #0x27]` (word 5) — four fields, four exact hits |
+| Word index = declaration order | `_Uri.path` is the 5th declared field of a non-generic class → mint 5 → `0x28`; the x64 build's `_Uri._initializeText` reads `[rax + 0x27]` for `path` |
+| Generic classes shift by one word | `_FutureListener`/`_Future` are generic: `_nextListener` (declared first) is word 2, and the class's `fbm` (unboxed bitmap) is `0x10` = bit 4 = `state`, which *is* the field declared third |
+| The tagged adjustment | `Error.get:_stackTrace` loads `[r1, #7]` and `Error._stackTrace_assign` stores to `[r1, #7]` — word 1 minus the 1-bit heap-object tag |
+
+**How it shows up in the output.** A recovered name is attached as an attributed comment on the
+memory access, never by rewriting the access:
+
+```dart
+x0 = mem((local_0), 0x17); /* _FutureListener.result (off 0x18) */  // 0x483fb4
+```
+
+The wording is deliberate: the comment asserts what the *owner class* has at that offset, and
+says nothing about the base — dae does not track the base's type, and claiming `this.result`
+without knowing the base is the receiver would be a fabrication. aotopsy can write `base.field`
+because it runs whole-program type inference (`typetrack`); that is the route to closing
+the remaining gap, and it is listed in the backlog.
+
+Coverage, measured (all gates green, 0 `dart analyze` errors after the change):
+
+| Corpus | Field records | From accessors (new) | Cross-source agreement | Conflicts | Annotated accesses |
+|---|---|---|---|---|---|
+| `sample_arm64` (arm64, 3.13) | 60 | 1 | 40 | 0 | 218 |
+| `hello_3.13.0.aot` (x64, 3.13) | 60 | 0 | 39 | 0 | 152 |
+| `T4_blank/libapp.so` (x64, 2.12.4) | 34 | 0 | 5 | 0 | 43 |
+| Flutter `testing_app` (arm64, 3.13) | 366 | 1 | 83 | 0 | 438 |
+
+Where it is silent, it is silent on purpose: an app class whose fields were dropped *and* whose
+accessors were tree-shaken (e.g. `Favorites._items` in the Flutter sample) gets no name, because
+neither the snapshot nor the symbols contain one. `dae fields <binary>` lists exactly what was
+recovered and marks the source of each row (`rec` / `accessor`); `text/fields.txt` carries the
+same table in the export.
+
+`tests/field_names.rs` gates all of this: record/accessor floors per corpus, **zero conflicts**,
+named probes at exact offsets, and — the part that catches fabrication — every `/* class.field
+(off 0x..) */` in the emitted pseudocode must exist in the recovered table, with the offset
+aligned to `word_size`.
+
 ## Two more traps, both found by adding a corpus
 
 Adding an **arm64 ELF** artifact (`testing/variants/h212keep_linux_arm64.exe`, the one arch/container
@@ -173,9 +244,11 @@ corpora both tools read, 0 `dart analyze` errors vs ~70k — see [`COMPARISON.md
    lines**, the same league as the rest. What genuinely remains for them: `add`/`or`/`sub`/`inc`/
    `dec` with a memory destination (`add byte ptr [rax], 8`) and `.byte` runs where the table's
    code size cuts a function short of its last branch target.
-4. Type recovery is partial: pool **values** are resolved (above), but local/parameter types are
-   still `dynamic`, field accesses are `mem(obj, disp)` (the analyzer has `instance_fields`
-   per class, but the base register's class is not known), and locals are `local_m8`.
+4. Type recovery is partial: pool **values** are resolved and field names are attributed (both
+   above), but the **base's type** is not tracked, so an access renders as
+   `mem(base, disp) /* Class.field (off 0x..) */` rather than `base.field`. Closing that is the
+   same job as aotopsy's `typetrack`: whole-program propagation from call sites, pool entries and
+   the receiver slot. Locals and parameters are still `dynamic`.
 5. The preamble is per file and mechanical; a smarter version would only declare what is used
    and give the helpers real signatures.
 

@@ -109,6 +109,9 @@ pub struct Snapshot<'a> {
     pub classes: BTreeMap<u64, ClassRec>,
     pub libraries: BTreeMap<u64, LibraryRec>,
     pub functions: BTreeMap<u64, FunctionRec>,
+    /// Field 簇：ref → 记录。AOT 布局 = name/owner/type/initializer 4 refs
+    /// + kind_bits + host_offset_or_field_id（实例字段写成 `Smi::New(目标偏移)`）。
+    pub fields: BTreeMap<u64, FieldRec>,
     pub patch_classes: HashMap<u64, u64>,
     pub type_cids: HashMap<u64, u64>,
     pub instance_fields: BTreeMap<u64, (u64, Vec<FieldVal>)>,
@@ -148,6 +151,17 @@ pub struct LibraryRec {
     pub url_ref: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldRec {
+    pub name_ref: u64,
+    pub owner_ref: u64,
+    /// kind_bits 低位：1=static，2=final，4=const，8=unboxed …
+    pub kind_bits: i64,
+    /// 实例字段 = 目标偏移；static 字段 = field_id（kind_bits bit0 判定）。
+    /// 取的是 ref 槽的原始值 —— Smi 内联在 ref 流里，故此处即 Smi 负载。
+    pub offset_or_id: u64,
+}
+
 /// ObjectPool entry（pp.txt 用）：(bits, typ, value)
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolEntry {
@@ -176,6 +190,7 @@ impl<'a> Snapshot<'a> {
             classes: BTreeMap::new(),
             libraries: BTreeMap::new(),
             functions: BTreeMap::new(),
+            fields: BTreeMap::new(),
             patch_classes: HashMap::new(),
             type_cids: HashMap::new(),
             instance_fields: BTreeMap::new(),
@@ -241,6 +256,7 @@ impl<'a> Snapshot<'a> {
             classes: BTreeMap::new(),
             libraries: BTreeMap::new(),
             functions: BTreeMap::new(),
+            fields: BTreeMap::new(),
             patch_classes: HashMap::new(),
             type_cids: HashMap::new(),
             instance_fields: BTreeMap::new(),

@@ -182,10 +182,29 @@ fn progressive_cli() {
     assert_ne!(rc, 0, "没命中应非零退出");
     assert!(e2.contains("nothing matched"), "应说明没命中：{e2}");
 
+    // ---- fields：字段清单是 TSV（类 / 字段 / 来源 / 偏移），来源只有两种取值 ----
+    let (fl, _e, rc) = run(bin, &["fields", &sample_s, "-n", "100000"]);
+    assert_eq!(rc, 0, "fields 退出码");
+    let mut n_rows = 0usize;
+    for l in fl.lines().filter(|l| !l.is_empty()) {
+        let cols: Vec<&str> = l.split('\t').collect();
+        assert_eq!(cols.len(), 4, "fields 每行 4 列：{l}");
+        assert!(matches!(cols[2], "rec" | "accessor"), "来源列只该是 rec/accessor：{l}");
+        let off = cols[3].strip_prefix("0x").expect("偏移应是 0x..");
+        let off = u64::from_str_radix(off, 16).expect("偏移应是十六进制");
+        assert_eq!(off % 8, 0, "字对齐：{l}");
+        n_rows += 1;
+    }
+    assert!(n_rows > 0, "样本里应至少恢复出一个字段名");
+    assert!(fl.is_ascii(), "字段产物必须零非 ASCII");
+    // 导出产物里同一张表必须落在 text/fields.txt
+    let ft = std::fs::read_to_string(full.join("text/fields.txt")).expect("应有 text/fields.txt");
+    assert!(ft.lines().count() == n_rows, "fields 子命令与 text/fields.txt 行数应一致");
+
     // ---- help：列出子命令 ----
     let (h, _e, rc) = run(bin, &["help"]);
     assert_eq!(rc, 0);
-    for c in ["getclass", "getlib", "getmethod", "callers", "disasm"] {
+    for c in ["getclass", "getlib", "getmethod", "callers", "disasm", "fields"] {
         assert!(h.contains(c), "help 应列出 {c}");
     }
     let _ = std::fs::remove_dir_all(&full);

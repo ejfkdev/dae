@@ -50,7 +50,7 @@ $ dae demo out
 SDK profile: dart/3.13.0 (version-hash match)
 export done -> /绝对路径/to/out:
   ida_script/  r2_script/  frida.js  asm/
-  text/  pp.txt · objs.txt · strings.txt · libs.txt · classes.txt · functions.txt · arrays.txt · maps.txt
+  text/  pp.txt · objs.txt · strings.txt · libs.txt · classes.txt · functions.txt · arrays.txt · maps.txt · fields.txt
 ```
 
 - **IDA**——`File → Script file…` 选择 `ida_script/addNames.py`。函数名、边界与 `DartThread`/`DartObjectPool` 结构落入数据库（装载基址自动重定）。
@@ -73,6 +73,7 @@ export done -> /绝对路径/to/out:
 | `classes.txt` | 类清单（ref、cid、库、类名；在 `text/` 下） |
 | `functions.txt` | 平铺 `库.类.方法 → 偏移` 索引（在 `text/` 下） |
 | `arrays.txt` / `maps.txt` | 每个 List / Map 对象及其内容（在 `text/` 下） |
+| `text/fields.txt` | 恢复出的具名字段：来源（快照 Field 簇 `rec` / 隐式访问器名 `accessor`）+ 字节偏移 |
 | `text/call_edges.txt` | 调用边：直接 `bl`/`call` 目标 + 间接调用点；每类分配 stub 由序言解出名字 |
 | `callgraph.dot` | 已命名函数之间的直接调用图（Graphviz DOT） |
 | `dart/*.dart` | 每函数伪代码，**可过 `dart analyze`**（加 `--decompile`） |
@@ -123,6 +124,7 @@ dae libs      <binary> [pattern]              库（包）清单 + 类数/函数
 dae classes   <binary> [pattern] [--lib P]    类清单
 dae functions <binary> [pattern] [--lib P]    函数清单（入口 / 字节数 / 归属）
 dae strings   <binary> [-f TEXT]              快照字符串表检索
+dae fields    <binary> [pattern]              具名字段（来源 + 字节偏移）
 dae largest   <binary> [-n N]                 按代码字节数排前 N
 dae callers   <binary> <NAME|0xADDR>          谁调用了它（静态直接调用边）
 dae disasm    <binary> <CLASS[.method]>       原始反汇编（arm64 保留 IL 注释）
@@ -164,6 +166,12 @@ dae getlib    <binary> <LIB>                  只反编译这个库（包）
 - 直接调用目标带名字（`call router`）；没有名字的入口写成 `sub_0x...`
 - **还原对象池常量**：`ldr x0, [PP, #0x17f8]` 写成 `x0 = "Hello" /* pp+0x17f8 */`
   （字符串字面量与立即数；非字符串条目给类型注释）。arm64 与 x64 都做过源码对照
+- **字段名：只写可证的**。AOT 会删掉几乎全部字段名（`Precompiler::DropFields`），dae 只走两条路
+  ——快照里幸存的 `Field` 对象（名字 + 由 Mint 簇取回的字索引）、以及隐式 getter/setter 名
+  （函数体只碰一个字段）。名字以**归属注释**出现，且不声称基址的类型：
+  `x0 = mem((local_0), 0x17); /* _FutureListener.result (off 0x18) */`。覆盖：arm64 样本 60 个名字
+  / 218 处注解，Flutter 应用 367 / 438；两条路对 41 条中的 40 条独立得到同一结论，全语料 0 冲突。
+  `dae fields` 列这张表，导出产物落在 `text/fields.txt`
 - 栈槽渲染成局部变量（`local_8`）；帧保存/恢复与屏障保留为 `// frame:` / `// barrier:` 注释
 - 每个函数上方保留原始反汇编注释块（便于核对）
 
@@ -180,13 +188,16 @@ dae getlib    <binary> <LIB>                  只反编译这个库（包）
 循环头写成 `while`，跳出循环的分支写成 `break`/`continue`。门禁语料上 87–92% 的函数完全结构化；
 其余保留 `gotoLabel` 并在函数头打 `NOTE` 标记。
 
-**还没做的**：跨基本块的表达式合成（目前是块内若干层）、类型恢复（一切都是 `dynamic`，
-字段访问是 `mem(base, disp)`）。认不出的指令原样输出为 `// unmapped:`，不做近似；
+**还没做的**：跨基本块的表达式合成（目前是块内若干层）、**基址类型**的恢复（池值与字段名都有了，
+但基址寄存器属于哪个类没跟踪，所以访问写成 `mem(base, disp) /* 类.字段 */` 而不是 `base.field`；
+补法与 aotopsy 的 `typetrack` 同源）。认不出的指令原样输出为 `// unmapped:`，不做近似；
 运行摘要里会打印这个行数——可以把它当质量刻度看。
 
-每次改动都有门禁：`tests/dart_valid.rs`（真跑 `dart analyze`，要求零错误）与
+每次改动都有门禁：`tests/dart_valid.rs`（真跑 `dart analyze`，要求零错误）、
 `tests/decompiler_shape.rs`（产物文件花括号必须配平（不配平=静默丢分支）、函数体内语句必须正常
-结束、结构化率有下限、**地址必须自洽**（函数末尾像终止符、直接调用命中函数入口））。
+结束、结构化率有下限、**地址必须自洽**（函数末尾像终止符、直接调用命中函数入口））与
+`tests/field_names.rs`（两条字段名路径必须互相印证、零冲突，且产物里每个注解都要在恢复表里
+找得到——这就是零编造判据）。
 最后这条是本项目吃过亏补上的：Mach-O appended 快照的指令段定位曾经缺失，反编译器读的是
 **别的代码**，而所有基于名字的指标却全是绿的。
 

@@ -13,6 +13,21 @@ use dae::profile::{parse_platform, parse_sdk, PlatformProfile, SdkProfile};
 use std::path::Path;
 
 /// 把 `"..."`（含 `\` 转义）替换成 `""`，只留结构
+/// 去掉 `/* ... */` 块注释（产物里只出现在单行内；跨行块注释 dae 不产出）
+fn strip_block_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(a) = rest.find("/*") {
+        out.push_str(&rest[..a]);
+        match rest[a..].find("*/") {
+            Some(b) => rest = &rest[a + b + 2..],
+            None => return out, // 未闭合：交给别的检查去报
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn strip_literals(line: &str) -> String {
     let b: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
@@ -174,6 +189,9 @@ fn decompiler_shape() {
                 // 池里内联出来的字面量可能本身就是 `"//"` 或带 `;`（实测踩过），
                 // 不先屏蔽就会把 `x2 = "//" /* pp+0x.. */;` 误判成行没结束。
                 let code = strip_literals(t);
+                // 先剥块注释再剥行注释：dae 会在行尾地址注释前插一段
+                // `/* 类.字段 (off 0x..) */` 字段注解，剥了行注释还留着 `*/` 尾巴。
+                let code = strip_block_comments(&code);
                 let code = code.split("//").next().unwrap_or("").trim_end();
                 if in_fn
                     && depth > 0

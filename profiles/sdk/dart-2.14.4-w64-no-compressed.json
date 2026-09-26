@@ -410,11 +410,15 @@
       ]
     },
     "10": {
-      "_doc": "Field: 4 refs + kind_bits uint16 + host_offset_or_field_id (Smi ref)",
+      "_doc": "Field: 4 refs (name/owner/type/initializer) + kind_bits + host_offset_or_field_id(Smi)",
       "steps": [
         {
           "op": "refs",
-          "n": 4
+          "n": 4,
+          "aliases": [
+            "name_ref",
+            "owner_ref"
+          ]
         },
         {
           "op": "svarint",
@@ -422,7 +426,10 @@
         },
         {
           "op": "refs",
-          "n": 1
+          "n": 1,
+          "aliases": [
+            "offset_or_id"
+          ]
         },
         {
           "op": "cond",
@@ -433,6 +440,16 @@
               "op": "uvarint"
             }
           ]
+        },
+        {
+          "op": "emit",
+          "store": "fields",
+          "fields": {
+            "name_ref": "name_ref",
+            "owner_ref": "owner_ref",
+            "kind_bits": "kind_bits",
+            "offset_or_id": "offset_or_id"
+          }
         }
       ]
     },

@@ -13,6 +13,7 @@
 cargo test --release --test dart_valid              # 门禁：每个可用语料都要求 0 错误
 cargo test --release --test dart_valid -- --ignored --nocapture   # 全量基线（25 个 SDK 产物）
 cargo test --release --test decompiler_shape       # 形态门禁 + 地址自洽性门禁
+cargo test --release --test field_names            # 字段名恢复：两源一致 + 零冲突
 ```
 
 `tests/dart_valid.rs` 对产物目录调 `dart analyze`，只数 `error -` 行：警告与提示（未使用变量、
@@ -125,6 +126,63 @@ hello_3.13.0 556、hello_2.15.0 579、hello_2.13.4 448、hello_3.3.4 403。
 非字符串条目只给类型注释（`mem(PP, 0x2d8) /* Field */`），不给值——它们不是 Dart 表达式，
 硬造一个比什么都不说更糟。
 
+## 字段名：剩下什么，以及两条可证的恢复路径
+
+AOT 把字段名几乎全删了。`Precompiler::DropFields` 只在非 PRODUCT 构建保留字段名，所以发布产物里
+只剩**寥寥几十条**：3.13 arm64 样本里 60 条，真实 Flutter 应用里 366 条——而类有几百个、字段有几千个。
+其余的名字是真的没了，dae 不去猜。
+
+剩下两条**互相独立**的可证路径：
+
+1. **Field 簇本身**。存活的 `Field` 对象带 `name_`、`owner_` 和 `host_offset_or_field_id_`。最后一个是
+   **Smi**，而序列化时 Smis 被并进 *Mint* 簇（`app_snapshot.cc`："Smis are merged into the Mint
+   cluster"），所以它的值能从 Mint 的整数里取回来。那个整数就是字段的**字索引**（字 0 = tags；首字段是
+   字 1，泛型类里是字 2——字 1 被类型参数占着），于是 `字节偏移 = 字索引 × word_size`。
+2. **访问器名**。隐式 getter/setter（`kind` 6/7）的名字就是字段名——私有字段叫 `get:_items`，公开字段
+   就叫字段名本身。它们的函数体只碰一个字段，于是"函数体里恰好一处字段形访问"是**可证**条件：偏移来自
+   机器码位移、名字来自符号。两处以上访问、或有读不懂形状的访问，这个函数就整条放弃，不猜。
+   （`Color.a`、`Paint._data`、`_HitTestResponse.hasPlatformView` 都是这条路来的。）
+
+两条路在中间对上了：3.13 arm64 样本上，访问器路径独立复现了 **41 条中的 40 条** Field 记录，名字与偏移
+**全都一致**；同一 SDK 的 x64 产物上 39/39；全语料 **0 冲突**。这是没有源码时能拿到的最强证据——
+一侧读的是快照自己的字段表，另一侧读的是机器码加一个函数符号。
+
+偏移换算在接任何一条路之前就先钉死了，用了四个互不相干的角度：
+
+| 核对项 | 证据 |
+|---|---|
+| `disp + 1 == 字索引 × word_size` | `_FutureListener.get_result` 读 `[x1, #0x17]`（24 = 字 3）；`get_state` `[x2, #0x1f]`（字 4）；`get_callback` `[x1, #0x27]`（字 5）——四个字段四条全中 |
+| 字索引 = 声明顺序 | `_Uri.path` 是非泛型类的第 5 个声明字段 → mint 5 → `0x28`；x64 产物里 `_Uri._initializeText` 读 `[rax + 0x27]` 取 `path` |
+| 泛型类整体错开一个字 | `_FutureListener`/`_Future` 是泛型：声明在最前的 `_nextListener` 落在字 2；该类的 `fbm`（unboxed 位图）是 `0x10` = bit 4 = `state`，而 `state` 正是第三个声明的字段 |
+| tagged 折算 | `Error.get:_stackTrace` 读 `[r1, #7]`、`Error._stackTrace_assign` 写 `[r1, #7]`——字 1 减去 1 位堆对象 tag |
+
+**产物里长什么样。** 恢复出的名字挂在内存访问后面的**归属注释**里，绝不改写访问本身：
+
+```dart
+x0 = mem((local_0), 0x17); /* _FutureListener.result (off 0x18) */  // 0x483fb4
+```
+
+措辞是刻意选的：注释断言的是「**owner 类**在这个偏移上的字段是它」，对基址不作任何声称——
+dae 不跟踪基址的类型，在不知道基址就是接收者的情况下写成 `this.result` 就是编造。aotopsy 敢写
+`base.field`，是因为它做全程序类型推断（`typetrack`）；那条路是把差距补完的正解，列在优化清单里。
+
+实测覆盖（改完门禁全绿、`dart analyze` 错误 0）：
+
+| 语料 | Field 记录 | 访问器新增 | 两源一致 | 冲突 | 被注解的访问 |
+|---|---|---|---|---|---|
+| `sample_arm64`（arm64，3.13） | 60 | 1 | 40 | 0 | 218 |
+| `hello_3.13.0.aot`（x64，3.13） | 60 | 0 | 39 | 0 | 152 |
+| `T4_blank/libapp.so`（x64，2.12.4） | 34 | 0 | 5 | 0 | 43 |
+| Flutter `testing_app`（arm64，3.13） | 366 | 1 | 83 | 0 | 438 |
+
+该沉默的地方就是沉默：字段被删、访问器又被树摇掉的应用类（例如 Flutter 样本里的
+`Favorites._items`）拿不到名字，因为快照和符号里都没有。`dae fields <binary>` 只列真恢复出来的东西，
+并标出每行的来源（`rec` / `accessor`）；导出产物里同一张表落在 `text/fields.txt`。
+
+`tests/field_names.rs` 把这一切盯住：每条语料的记录/一致数下限、**零冲突**、探针字段必须落在确切偏移上，
+以及最能抓编造的一条——产物里出现的每个 `/* 类.字段 (off 0x..) */` 都必须在恢复表里有同名同偏移的条目，
+且偏移按 `word_size` 对齐。
+
 ## 又两个坑，都是加语料加出来的
 
 新增一条 **arm64 ELF** 语料（`testing/variants/h212keep_linux_arm64.exe`——门禁语料里唯一缺的
@@ -156,9 +214,10 @@ hello_3.13.0 556、hello_2.15.0 579、hello_2.13.4 448、hello_3.3.4 403。
    地址修好后它们稳在 **87–91% 结构化、21–231 行未映射**，与其它版本同一档。真正剩下的问题：
    **内存目的地的** `add`/`or`/`sub`/`inc`/`dec`（`add byte ptr [rax], 8`），以及表给的 code size
    把函数截在最后一个分支目标之前造成的 `.byte` 段。
-4. 类型恢复只做了一半：池**值**已经能还原（见上），但局部变量与参数仍是 `dynamic`，
-   字段访问仍是 `mem(obj, disp)`（分析器手里有每个类的 `instance_fields`，但基址寄存器的
-   类无从得知），局部变量是 `local_m8`。
+4. 类型恢复只做了一半：池**值**已解析、字段名也归了属（都在上面），但**基址的类型**没跟踪，
+   所以访问写成 `mem(base, disp) /* 类.字段 (off 0x..) */` 而不是 `base.field`。补这一步和
+   aotopsy 的 `typetrack` 是同一件事：从调用点、池条目和接收者槽做全程序传播。
+   局部变量与参数仍是 `dynamic`。
 5. 前导声明是每文件机械生成的；更聪明的做法是只声明用到的，并给占位函数真实签名。
 
 ## 加语料

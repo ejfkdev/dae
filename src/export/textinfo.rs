@@ -15,6 +15,8 @@ pub struct TextInfoCounts {
     pub functions: usize,
     pub arrays: usize,
     pub maps: usize,
+    /// 具名字段条数（Field 簇 + 访问器名推断；见 src/decompiler.rs）
+    pub fields: usize,
 }
 
 /// Tab / 换行 / 反斜杠转义，保证一行一条、可安全粘贴/检索。
@@ -123,6 +125,21 @@ fn write_maps(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
 }
 
 /// 写全部六类文本产物，返回各条数。
+/// 具名字段：类 \t 字段 \t 来源 \t 字节偏移。
+/// 来源两列：`rec` = 快照 Field 簇直接写着（偏移来自 Mint 值）；
+/// `accessor` = 隐式 getter/setter 名推断（偏移来自机器码位移）。都是可证的，
+/// 没解出来的字段不写占位行——AOT 丢掉了 97% 以上的字段名，凭空补名是编造。
+fn write_fields(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
+    let rows = analyzer.field_rows();
+    let mut of = String::with_capacity(rows.len() * 32);
+    for r in &rows {
+        let _ = writeln!(of, "{}\t{}\t{}\t{:#x}", r.class, r.name, r.source, r.off);
+    }
+    std::fs::write(out_dir.join("text").join("fields.txt"), of)
+        .map_err(|e| format!("写 fields.txt 失败: {e}"))?;
+    Ok(rows.len())
+}
+
 pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<TextInfoCounts, String> {
     let strings = write_strings(analyzer, out_dir)?;
     let libs_n = write_libs(analyzer, out_dir)?;
@@ -130,6 +147,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Te
     let functions = write_functions(libs, out_dir)?;
     let arrays = write_arrays(analyzer, out_dir)?;
     let maps = write_maps(analyzer, out_dir)?;
+    let fields = write_fields(analyzer, out_dir)?;
     Ok(TextInfoCounts {
         strings,
         libs: libs_n,
@@ -137,5 +155,6 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Te
         functions,
         arrays,
         maps,
+        fields,
     })
 }

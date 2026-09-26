@@ -10,7 +10,7 @@
 //! 逐对象执行时 ctx 为 Vec<Option<i64>>（无哈希、无字符串克隆）。
 
 use crate::engine::snapshot::{
-    ClassRec, ClusterMeta, FieldVal, FunctionRec, LibraryRec, PoolEntry, Snapshot,
+    ClassRec, ClusterMeta, FieldRec, FieldVal, FunctionRec, LibraryRec, PoolEntry, Snapshot,
 };
 use crate::engine::varint::Reader;
 use crate::profile::{LoopTimes, SdkProfile, Step};
@@ -343,6 +343,12 @@ enum CStore {
         name_ref: CField,
         url_ref: CField,
     },
+    Fields {
+        name_ref: CField,
+        owner_ref: CField,
+        kind_bits: CField,
+        offset_or_id: CField,
+    },
     PatchClass { wrapped: CField },
     TypeCid { type_cid: CField },
     MapData { data_ref: CField, used_ref: CField },
@@ -458,6 +464,12 @@ fn compile_steps<'a>(
                     "libraries" => CStore::Libraries {
                         name_ref: f("name_ref"),
                         url_ref: f("url_ref"),
+                    },
+                    "fields" => CStore::Fields {
+                        name_ref: f("name_ref"),
+                        owner_ref: f("owner_ref"),
+                        kind_bits: f("kind_bits"),
+                        offset_or_id: f("offset_or_id"),
                     },
                     "patch_classes" => CStore::PatchClass { wrapped: f("wrapped_class") },
                     "type_cids" => CStore::TypeCid { type_cid: f("type_cid") },
@@ -900,6 +912,22 @@ fn exec_compiled<'a>(
                         snap.libraries.insert(start_ref + k, LibraryRec {
                             name_ref: need(name_ref, "name_ref")? as u64,
                             url_ref: need(url_ref, "url_ref")? as u64,
+                        });
+                    }
+                    CStore::Fields { name_ref, owner_ref, kind_bits, offset_or_id } => {
+                        if std::env::var("DART_AOT_DEBUG_FIELDFILL").is_ok() && k < 200 {
+                            eprintln!(
+                                "[dbg-field] ref={} name_ref={} owner_ref={} kind={} off={}",
+                                start_ref + k, gv(ctx, name_ref).unwrap_or(-1),
+                                gv(ctx, owner_ref).unwrap_or(-1), gv(ctx, kind_bits).unwrap_or(-1),
+                                gv(ctx, offset_or_id).unwrap_or(-1),
+                            );
+                        }
+                        snap.fields.insert(start_ref + k, FieldRec {
+                            name_ref: need(name_ref, "name_ref")? as u64,
+                            owner_ref: need(owner_ref, "owner_ref")? as u64,
+                            kind_bits: need(kind_bits, "kind_bits")?,
+                            offset_or_id: need(offset_or_id, "offset_or_id")? as u64,
                         });
                     }
                     CStore::PatchClass { wrapped } => {

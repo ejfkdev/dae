@@ -8,7 +8,7 @@ use crate::engine::fill::fill_snapshot;
 use crate::engine::restore::{
     func_blutter_kind, get_function_name_4_ida, library_name, scrub_name,
 };
-use crate::engine::snapshot::{ClassRec, FieldVal, Snapshot};
+use crate::engine::snapshot::{ClassRec, FieldRec, FieldVal, Snapshot};
 use crate::platform::{load_container, locate_snapshots, ContainerInfo};
 use crate::profile::{PlatformProfile, SdkProfile};
 use std::collections::BTreeMap;
@@ -64,6 +64,36 @@ pub struct Analyzer<'a> {
     pub func_eps: BTreeMap<u64, (u64, usize)>,
     /// 解析期告警（drift/alloc mismatch 等）
     pub warnings: Vec<String>,
+    /// Field 簇恢复出的实例字段（AOT 只保留少量具名字段，见 docs/DECOMPILER.md）
+    pub fields_rec: Vec<RecoveredField>,
+    /// (类名, 字节偏移) → 字段名。只收「实例字段」——字索引落在 owner 类
+    /// nfo 区间内的那些；static 字段存的是 field_id（不在区间内），不入表。
+    pub field_by_class_off: BTreeMap<(String, u64), String>,
+}
+
+/// 具名字段的一行（CLI `dae fields` 与 `text/fields.txt` 共用同一份形状）。
+pub struct FieldRow {
+    pub class: String,
+    pub name: String,
+    /// "rec" = Field 簇直接写着；"accessor" = 隐式 getter/setter 名推断
+    pub source: &'static str,
+    pub off: u64,
+}
+
+/// Field 簇里的一条具名字段记录。
+///
+/// AOT 会丢掉绝大多数 Field 对象（`Precompiler::DropFields` 只在非 PRODUCT 构建
+/// 保留字段名），真机产物里通常只剩几十条（`@pragma("vm:entry-point")` 那些）。
+/// snapshot 里 Field 的 `host_offset_or_field_id` 是 **Smi**，而 Smis 被并进 Mint
+/// 簇（app_snapshot.cc: `Trace`："Smis are merged into the Mint cluster"），
+/// 所以 Mint 值 = 字索引：首字段在字 1（泛型类因类型参数槽在字 2），
+/// 字节偏移 = 字索引 × word_size；机器码里的位移 = 字节偏移 − 1（tagged 折算）。
+#[derive(Debug, Clone)]
+pub struct RecoveredField {
+    pub class: String,
+    pub name: String,
+    pub word: i64,
+    pub off: u64,
 }
 
 impl<'a> Analyzer<'a> {
@@ -210,7 +240,10 @@ impl<'a> Analyzer<'a> {
             payload_infos,
             func_eps: BTreeMap::new(),
             warnings,
+            fields_rec: Vec::new(),
+            field_by_class_off: BTreeMap::new(),
         };
+        a.build_fields();
 
         t("payload_infos", &mut since);
         a.build_name_by_ep();
@@ -274,7 +307,82 @@ impl<'a> Analyzer<'a> {
                 eprintln!("[dbg-func] ref={r} {name}");
             }
         }
+        if std::env::var("DART_AOT_DEBUG_FIELDS").is_ok() {
+            eprintln!("[dbg-fields] iso={} vm={} recovered={}",
+                a.iso.fields.len(), a.vm.fields.len(), a.fields_rec.len());
+            for f in &a.fields_rec {
+                eprintln!("[dbg-fields] {} word={} off={:#x} {}", f.class, f.word, f.off, f.name);
+            }
+        }
         Ok(a)
+    }
+
+    /// Field 簇 → 具名字段表。两个来源之一（另一个是访问器名推断，见 decompiler）：
+    /// 这是 snapshot 里**直接写着**的字段名，偏移由 Mint 值给出。
+    fn build_fields(&mut self) {
+        let ws = self.profile.word_size;
+        // 两个 isolate 都要看：SDK 字段多在 ISO，静态字段的 owner 在 VM 侧也出现
+        let mut items: Vec<(u64, FieldRec)> = Vec::new();
+        items.extend(self.vm.fields.iter().map(|(r, f)| (*r, *f)));
+        items.extend(self.iso.fields.iter().map(|(r, f)| (*r, *f)));
+        for (_, f) in items {
+            let Some(cls) = self.class_of(f.owner_ref) else { continue };
+            let class = scrub_name(self.sref_str(cls.name_ref));
+            if class.is_empty() {
+                continue; // 无名的伪类（`::`）：偏移无从对应，丢了不留假名
+            }
+            let name = scrub_name(self.sref_str(f.name_ref));
+            if name.is_empty() {
+                continue;
+            }
+            let mint = if f.offset_or_id <= self.num_base {
+                self.vm.mint_values.get(&f.offset_or_id).copied()
+            } else {
+                self.iso.mint_values.get(&f.offset_or_id).copied()
+            };
+            let Some(word) = mint else { continue };
+            // 字索引必须落在类的字段区（0 = tags 字，>= nfo = 越界）：
+            // static 字段存的是 field_id，越界即被挡掉，这正是我们要的甄别
+            if word < 1 || cls.next_field_off <= 0 || word >= cls.next_field_off {
+                continue;
+            }
+            let off = word as u64 * ws;
+            self.fields_rec.push(RecoveredField { class: class.clone(), name: name.clone(), word, off });
+            // 同一 (类,偏移) 出现两个名字（继承链上的遮蔽）时不写：宁可没有，不可写错
+            match self.field_by_class_off.get(&(class.clone(), off)) {
+                Some(prev) if prev != &name => {
+                    self.field_by_class_off.remove(&(class.clone(), off));
+                }
+                Some(_) => {}
+                None => {
+                    self.field_by_class_off.insert((class, off), name);
+                }
+            }
+        }
+        self.fields_rec.sort_by(|a, b| (a.class.as_str(), a.off).cmp(&(b.class.as_str(), b.off)));
+    }
+
+    /// 字段清单（只含 Field 簇的 `rec` 行）。
+    pub fn field_rows_basic(&self) -> Vec<FieldRow> {
+        let mut rows: Vec<FieldRow> = self
+            .fields_rec
+            .iter()
+            .map(|f| FieldRow { class: f.class.clone(), name: f.name.clone(), source: "rec", off: f.off })
+            .collect();
+        rows.sort_by(|a, b| (&a.class, a.off).cmp(&(&b.class, b.off)));
+        rows
+    }
+
+    /// 对外口径的字段清单：`asm` 特性下带上访问器名推断（`accessor`），否则只有记录行。
+    /// 推断失败（无 capstone / 反汇编初始化失败）时退回记录行，不报错也不编造。
+    pub fn field_rows(&self) -> Vec<FieldRow> {
+        #[cfg(feature = "asm")]
+        {
+            if let Ok(rec) = crate::decompiler::recover_fields(self) {
+                return crate::decompiler::field_rows_of(self, &rec);
+            }
+        }
+        self.field_rows_basic()
     }
 
     pub fn sref(&self, r: u64) -> Option<String> {

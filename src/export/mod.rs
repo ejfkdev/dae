@@ -220,6 +220,7 @@ pub fn run_with(
             functions: 0,
             arrays: 0,
             maps: 0,
+            fields: 0,
         }),
         callgraph: cg,
         stubs: stub_counts.map(|s| (s.total, s.named)),

@@ -31,6 +31,7 @@ pub const SUBCOMMANDS: &[&str] = &[
     "classes",
     "functions",
     "strings",
+    "fields",
     "largest",
     "callers",
     "disasm",
@@ -408,6 +409,7 @@ pub fn dispatch(args: &[String], lang: Lang, s: &Messages) -> i32 {
         "classes" => cmd_classes(rest, lang, s),
         "functions" => cmd_functions(rest, lang, s),
         "strings" => cmd_strings(rest, lang, s),
+        "fields" => cmd_fields(rest, lang, s),
         "largest" => cmd_largest(rest, lang, s),
         "callers" => cmd_callers(rest, lang, s),
         "disasm" => cmd_disasm(rest, lang, s),
@@ -629,6 +631,49 @@ fn cmd_classes(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> 
             )
         );
         emit(&o, &out, lang, "classes")
+    })
+}
+
+// ---- fields ----
+/// 字段清单：Field 簇里**直接写着**的字段名（AOT 会丢掉 97–99%，这里只列剩下的）。
+/// 偏移 = 字索引 × word_size；机器码里的位移比它小 1（tagged 折算）。
+fn cmd_fields(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
+    let o = parse_opts(args, "fields", lang)?;
+    let bin = o.bin("fields", lang)?;
+    let pat = o.rest.first().cloned();
+    with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
+        let rows = a.field_rows();
+        let mut out = String::new();
+        let mut n = 0usize;
+        let mut shown = 0usize;
+        for r in &rows {
+            if let Some(p) = &pat {
+                if !name_hit(p, &r.class, true) && !name_hit(p, &r.name, true) {
+                    continue;
+                }
+            }
+            shown += 1;
+            if n >= limit_of(&o, 200) {
+                continue;
+            }
+            n += 1;
+            let _ = writeln!(out, "{}\t{}\t{}\t{:#x}", r.class, r.name, r.source, r.off);
+        }
+        let n_rec = rows.iter().filter(|r| r.source == "rec").count();
+        let n_acc = rows.len() - n_rec;
+        eprintln!(
+            "{}",
+            tr(
+                lang,
+                &format!(
+                    "dae：命中 {shown} 条具名字段（snapshot 保留 {n_rec} 条 + 访问器名推断 {n_acc} 条）"
+                ),
+                &format!(
+                    "dae: {shown} named fields ({n_rec} from the snapshot + {n_acc} from accessor names)"
+                )
+            )
+        );
+        emit(&o, &out, lang, "fields")
     })
 }
 
@@ -1020,6 +1065,12 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             t("列：入口地址 \\t 字节数 \\t lib \\t 类 \\t 方法名", "columns: entry \\t bytes \\t lib \\t class \\t member"),
             t("pattern 可与方法名、Class.method 或类名匹配。", "pattern matches the member, Class.method or the class name.")
         ),
+        "fields" => format!(
+            "{}\n\n  dae fields <binary> [pattern] [-n N] [-o FILE]\n\n{}\n{}",
+            t("fields —— AOT 快照里保留下来的具名字段", "fields -- named fields the AOT snapshot keeps"),
+            t("列：类 \t 字段 \t 来源(rec/accessor) \t 字节偏移。", "columns: class \t field \t source(rec/accessor) \t byte offset"),
+            t("AOT 会丢掉绝大多数字段名（Precompiler::DropFields 只在非 PRODUCT 构建保留）。\n只列两条可证路径的结果：快照里的 Field 簇（rec）与隐式访问器名推断（accessor），不猜。", "AOT drops most field names (Precompiler::DropFields keeps them only in non-PRODUCT builds).\nLists only the two provable routes: the snapshot's own Field cluster (rec) and implicit-accessor names (accessor). Nothing is guessed.")
+        ),
         "strings" => format!(
             "{}\n\n  dae strings <binary> [-f TEXT] [-n N] [-o FILE]\n\n{}",
             t("strings —— 快照字符串表检索（大小写不敏感子串）", "strings -- snapshot string table search (case-insensitive substring)"),
@@ -1100,6 +1151,11 @@ pub fn help(lang: Lang) -> String {
         h,
         "  dae strings   <binary> [-f TEXT]              {}",
         t("字符串表检索", "string table search")
+    );
+    let _ = writeln!(
+        h,
+        "  dae fields    <binary> [pattern]              {}",
+        t("具名字段（来源 + 字节偏移）", "named fields (source + byte offset)")
     );
     let _ = writeln!(
         h,

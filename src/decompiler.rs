@@ -9,7 +9,8 @@
 //!
 //! 明确不做的事：不编造类型、不编造间接调用目标、不省略认不出的指令（`Other` 原样带出）。
 
-use crate::analyzer::{Analyzer, LibGroups};
+use crate::analyzer::{Analyzer, FieldRow, LibGroups};
+use crate::engine::restore::scrub_name;
 use capstone::arch;
 use capstone::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -319,6 +320,33 @@ struct Roles {
     sp: String,
     /// 平台 profile 的 register_aliases（寄存器名 → 框架名）
     aliases: std::collections::HashMap<String, String>,
+    /// 平台 profile 的 non_field_base：不可能持有对象基址的寄存器（blutter 口径）
+    non_field: BTreeSet<String>,
+}
+
+impl Roles {
+    /// 渲染后的寄存器名是否可能是对象基址。两边都要认：arm64 产物里写的是角色名
+    /// （PP/THR/BARRIER…），x64 产物里是裸寄存器名（r14/rsp/rbx…），而
+    /// non_field_base 记的是**裸名**。
+    fn obj_base(&self, name: &str) -> bool {
+        if self.non_field.contains(name) {
+            return false;
+        }
+        let role = self
+            .aliases
+            .get(name)
+            .map(|x| x.as_str())
+            .unwrap_or(name)
+            .to_ascii_uppercase();
+        if self.non_field.contains(&role) {
+            return false;
+        }
+        !matches!(
+            role.as_str(),
+            "PP" | "THR" | "SP" | "FP" | "HEAP" | "NULL" | "BARRIER" | "CODE_REG" | "LR"
+                | "XZR" | "WZR" | "DISPATCH" | "TMP" | "IC_DATA"
+        )
+    }
 }
 
 fn roles(analyzer: &Analyzer) -> Roles {
@@ -329,6 +357,7 @@ fn roles(analyzer: &Analyzer) -> Roles {
         thr: g("thr", "thr"),
         sp: g("sp", "sp"),
         aliases: analyzer.platform.register_aliases.clone(),
+        non_field: analyzer.platform.non_field_base.iter().cloned().collect(),
         pool: pool_map(analyzer),
     }
 }
@@ -1524,6 +1553,7 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
 // ---------------------------------------------------------------- emit
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_function(
     name: &str,
     blocks: &[Block],
@@ -1533,13 +1563,14 @@ fn emit_function(
     chunks: &[u64],
     structured: &mut usize,
     fallback: &mut usize,
+    fa: &FieldAnnot,
 ) {
     let mut s = Structurer::new(blocks, rl.clone());
     let nodes = s.seq(0, None, 0);
     let reason = s.reason.clone();
     let mut unstructured = s.unstructured;
     let mut body = String::new();
-    render_nodes(&nodes, 0, &mut body, &mut unstructured);
+    render_nodes(&nodes, 0, &mut body, &mut unstructured, fa);
     if unstructured {
         *fallback += 1;
         if std::env::var("DART_AOT_DEC_REASON").is_ok() {
@@ -1974,6 +2005,12 @@ pub fn render(
     let rl = roles(analyzer);
     let cs = build_cs(is_arm64)?;
 
+    // 字段名：Field 簇（直接写着）+ 访问器名推断（隐式 getter/setter 的名字）。
+    let fctx = {
+        let rec = recover_fields(analyzer)?;
+        FieldCtx { by_class_off: rec.by_class_off, word: analyzer.profile.word_size }
+    };
+
     let mut files: Vec<(String, String)> = Vec::new();
     let mut stats = DecompileStats {
         funcs: 0,
@@ -2138,6 +2175,10 @@ pub fn render(
                     eprintln!("[dbg-dec] emit ep={:#x} entry={entry:#x} csize={csize} name={name}", f.ep);
                 }
                 let before = of.len();
+                if std::env::var("DART_AOT_DEBUG_DEC").is_ok() && name.contains("get_result") {
+                    eprintln!("[dbg-dec] annotate name={name} cls={_cls:?} map_has={}", fctx.by_class_off.contains_key(&(_cls.to_string(), 0x18)));
+                }
+                let fa = FieldAnnot { class: _cls, ctx: &fctx, rl: &rl };
                 emit_function(
                     &name,
                     &blocks,
@@ -2147,6 +2188,7 @@ pub fn render(
                     &chunks,
                     &mut stats.structured,
                     &mut stats.fallback,
+                    &fa,
                 );
                 // 未映射行只数**发射出去的**：原来的口径统计所有基本块，
                 // 把永远走不到的块也算进去，产物一变就虚高（chunk 之后尤其明显）
@@ -2164,6 +2206,472 @@ pub fn render(
     }
     Ok((files, stats))
 }
+// ---------------------------------------------------------------- 字段名恢复
+//
+// AOT 把绝大多数 Field 对象丢了：`Precompiler::DropFields` 只在非 PRODUCT 构建保留
+// 字段名，真机产物里通常只剩几十条（`@pragma("vm:entry-point")` 的那些）。两条
+// **可证**的恢复路径，都不猜：
+//
+// 1. **Field 簇**（analyzer.fields_rec）：snapshot 直接写着名字，偏移由 Mint 值给出
+//    （Smis 被并进 Mint 簇，值即字索引；字节偏移 = 字索引 × word_size）；
+// 2. **访问器名**：`get:foo` / `set:foo` 的**访问器名里带字段名**（aotopsy 同法），
+//    而访问器函数体只碰一个字段——「函数体里恰好一处字段形访问」就是可证条件，
+//    两处以上直接放弃，不去猜哪一处是返回值。
+//
+// 注解只在**类内**成立：`mem(x1, #0x17)` 命名为 `_FutureListener.result`，说的是
+// 「owner 类的这个偏移是 result」，没有声称 x1 就是该类实例。机器码里位移比字节偏移
+// 小 1（tagged 折算），所以查表用 `disp + 1`。
+
+/// 字段注解表：(类名, 字节偏移) → 字段名；`word` = 指针宽度
+struct FieldCtx {
+    by_class_off: BTreeMap<(String, u64), String>,
+    word: u64,
+}
+
+impl FieldCtx {
+    /// 一条 `mem(base, 0xNN)` 的位移 → 字节偏移（tagged 折算 + 字对齐）。
+    /// 折不出来（负位移、非字对齐、0）就返回 None：宁可不注解。
+    fn offset_of(&self, disp: i64) -> Option<u64> {
+        if disp < 1 {
+            return None;
+        }
+        let off = (disp + 1) as u64;
+        if off % self.word != 0 {
+            return None;
+        }
+        Some(off)
+    }
+
+    fn name(&self, class: &str, off: u64) -> Option<&str> {
+        if class.is_empty() {
+            return None;
+        }
+        self.by_class_off.get(&(class.to_string(), off)).map(|s| s.as_str())
+    }
+}
+
+/// 字段名恢复结果（`dae fields` 与门禁共用这一份口径）。
+pub struct RecoveredFields {
+    /// (类名, 字节偏移) → 字段名
+    pub by_class_off: BTreeMap<(String, u64), String>,
+    /// 来自 Field 簇（snapshot 直接写着）的条数
+    pub from_records: usize,
+    /// 访问器名推断**新增**的条数（记录里已有的不重复计）
+    pub from_accessors: usize,
+    /// 两个来源**独立得到同一结论**的条数：访问器名与 Field 记录的 (类, 偏移, 名字)
+    /// 完全一致的次数。这是本模块最强的自证：名字来自访问器名、偏移来自机器码位移，
+    /// 与 snapshot 里直接写着的字段表逐条对上。掉下来就说明偏移换算或名字提取坏了。
+    pub agreements: usize,
+    /// 两个来源打架的条目：(类, 偏移, 记录名, 访问器名)。为空才健康。
+    pub conflicts: Vec<(String, u64, String, String)>,
+}
+
+/// 恢复结果 → 导出行（`dae fields` / `text/fields.txt`）。
+pub fn field_rows_of(analyzer: &Analyzer, rec: &RecoveredFields) -> Vec<FieldRow> {
+    let mut from: BTreeMap<(String, u64), &'static str> = BTreeMap::new();
+    for f in &analyzer.fields_rec {
+        from.insert((f.class.clone(), f.off), "rec");
+    }
+    let mut rows: Vec<FieldRow> = rec
+        .by_class_off
+        .iter()
+        .map(|((class, off), name)| FieldRow {
+            class: class.clone(),
+            name: name.clone(),
+            source: from.get(&(class.clone(), *off)).copied().unwrap_or("accessor"),
+            off: *off,
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.class, a.off).cmp(&(&b.class, b.off)));
+    rows
+}
+
+/// 字段名恢复：Field 簇 + 访问器名推断。
+/// 压缩指针模式下的位移折算未经实测，那种情况下只给记录、不跑访问器推断。
+pub fn recover_fields(analyzer: &Analyzer) -> Result<RecoveredFields, String> {
+    let is_arm64 = analyzer.platform.arch == "arm64";
+    let rl = roles(analyzer);
+    let cs = build_cs(is_arm64)?;
+    let word = analyzer.profile.word_size;
+    let mut by_class_off = analyzer.field_by_class_off.clone();
+    let from_records = by_class_off.len();
+    let mut from_accessors = 0usize;
+    let mut agreements = 0usize;
+    let mut conflicts: Vec<(String, u64, String, String)> = Vec::new();
+    if !analyzer.profile.compressed_pointers {
+        let probe = FieldCtx { by_class_off: BTreeMap::new(), word };
+        for (k, v) in accessor_fields(&cs, analyzer, &rl, &probe) {
+            match by_class_off.get(&k) {
+                Some(prev) if prev != &v => conflicts.push((k.0.clone(), k.1, prev.clone(), v)),
+                Some(_) => agreements += 1,
+                None => {
+                    from_accessors += 1;
+                    by_class_off.insert(k, v);
+                }
+            }
+        }
+    }
+    let rec = RecoveredFields { by_class_off, from_records, from_accessors, agreements, conflicts };
+    if std::env::var("DART_AOT_DEBUG_FIELDS").is_ok() {
+        eprintln!(
+            "[dbg-fields-total] 记录 {} 条 + 访问器新增 {} 条 = {} 条；两源一致 {} 条；冲突 {} 条",
+            rec.from_records, rec.from_accessors, rec.by_class_off.len(), rec.agreements,
+            rec.conflicts.len()
+        );
+        for (c, off, a, b) in &rec.conflicts {
+            eprintln!("[dbg-fields-total] 冲突 {c} off={off:#x}: 记录={a} 访问器={b}");
+        }
+    }
+    Ok(rec)
+}
+
+/// 内存操作数 → (基址, 位移原文)。两种写法都要认：
+/// * arm64：`[x1, #0x17]` —— 基址与位移是两个逗号分隔的操作数；
+/// * x64：`[rdi + 0x17]` —— 基址与位移挤在**一个**操作数里（`+` 分隔）。
+/// 三段式（`[base, index, lsl #3]`）返回 None：那是数组元素寻址，不是字段。
+fn base_disp(inner: &str) -> Option<(String, String)> {
+    // 顶层（括号深度 0）的最后一个 `+` 处切开——`(mem(FP - 8)) + 7` 要切在外层那个 `+`
+    let split_plus = |t: &str| -> Option<(String, String)> {
+        let b: Vec<char> = t.chars().collect();
+        let mut depth = 0i32;
+        let mut cut: Option<usize> = None;
+        for (i, c) in b.iter().enumerate() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '+' if depth == 0 => cut = Some(i),
+                _ => {}
+            }
+        }
+        let cut = cut?;
+        let byte = t.char_indices().nth(cut)?.0;
+        Some((t[..byte].to_string(), t[byte + 1..].to_string()))
+    };
+    // 基址归一：剥平衡外括号；剩下的要么是裸标识符，要么是嵌套的 `mem(...)`（本身会被递归注解）
+    let norm = |base: &str| -> Option<String> {
+        let mut b = base.trim();
+        while let Some(x) = b.strip_prefix('(').and_then(|y| y.strip_suffix(')')) {
+            b = x.trim();
+        }
+        if b.is_empty() || b.contains('+') || b.contains(',') {
+            return None;
+        }
+        if b.starts_with("mem(") && b.ends_with(')') {
+            return Some(b.to_string());
+        }
+        if b.contains('(') {
+            return None; // adrp 折叠式地址：不是对象基址
+        }
+        Some(b.to_string())
+    };
+    let top: Vec<String> = {
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(inner[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(inner[start..].to_string());
+        out.into_iter()
+            .map(|p| p.trim().trim_start_matches('#').trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    };
+    match top.len() {
+        // x64：基址与位移挤在一个操作数里（`rdi + 0x17` / `(mem(FP - 8)) + 7`）
+        1 => {
+            let (a, b) = split_plus(&top[0])?;
+            Some((norm(&a)?, b.trim().to_string()))
+        }
+        // arm64：两个逗号分隔的操作数
+        2 => Some((norm(&top[0])?, top[1].clone())),
+        _ => None,
+    }
+}
+
+/// 一次内存访问的分类：字段形 / 明确不是字段 / 形状看不懂。
+/// 「看不懂」也要单独一类——访问器体里出现看不懂的对象基址访问时必须放弃，
+/// 否则「唯一一处字段访问」可能只是「唯一一处**看得懂**的」。
+#[derive(PartialEq, Clone, Copy)]
+enum Acc {
+    Field(u64),
+    NotField,
+    Unknown,
+}
+
+/// 分类一条内存操作数：`[base, #disp]` 且 base 是对象寄存器（非 PP/THR/SP/FP/…）。
+/// `Field(off)` 里的 off 是字节偏移：机器码位移 = 字节偏移 − 1（tagged 折算）。
+/// 未对齐的位移一律 Unknown——unboxed 字段（double/int64）**不带** tagged 折算，
+/// 拿它当 tagged 字段会错位一格，必须挡掉。
+fn classify_access(rl: &Roles, ctx: &FieldCtx, operand: &str) -> Acc {
+    let m = mem_parts(operand);
+    if m.stack {
+        return Acc::NotField; // [FP/SP, …] 是栈槽
+    }
+    let inner = &m.parts.join(", ");
+    let Some((base, disp)) = base_disp(inner) else {
+        // 认不出形状：基址像对象时算「看不懂」，其余（池/线程/折叠地址）不是字段
+        let raw_base = m.parts.first().map(|x| x.as_str()).unwrap_or("");
+        let b = raw_base.split(&['+', ','][..]).next().unwrap_or("").trim();
+        return if !b.is_empty() && !b.starts_with('(') && rl.obj_base(b) {
+            Acc::Unknown
+        } else {
+            Acc::NotField
+        };
+    };
+    if !rl.obj_base(&base) {
+        return Acc::NotField; // PP/THR/SP/FP/NULL…：池、线程、栈
+    }
+    match parse_imm_i(&disp) {
+        Some(d) if d < 1 => Acc::NotField, // 负/零位移：头部或局部，不是字段
+        Some(d) => match ctx.offset_of(d) {
+            Some(off) => Acc::Field(off),
+            None => Acc::Unknown, // 未对齐：unboxed 字段或别的什么，不猜
+        },
+        None => Acc::Unknown, // 位移不是立即数
+    }
+}
+
+/// 一条 IR 里所有内存访问的分类
+fn op_accesses(rl: &Roles, ctx: &FieldCtx, op: &Op) -> Vec<Acc> {
+    match op {
+        Op::Assign { src: Expr::Mem(m), .. } => vec![classify_access(rl, ctx, m)],
+        Op::Store { target, .. } => vec![classify_access(rl, ctx, target)],
+        Op::PairLoad { .. } => vec![Acc::NotField],
+        Op::Call { callee, .. } => {
+            // 间接调用可能走字段（`call qword ptr [rbx+0x18]`）：算「看不懂」更稳
+            if callee.contains('[') {
+                vec![Acc::Unknown]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 访问器名推断：`get:X` / `set:X` 的函数体里**恰好一处**字段形访问 → (类, 偏移) → X。
+/// 同一 (类, 偏移) 被两个不同名字claim 时不写（母类遮蔽时宁可没有）。
+fn accessor_fields(
+    cs: &Capstone,
+    analyzer: &Analyzer,
+    rl: &Roles,
+    ctx: &FieldCtx,
+) -> BTreeMap<(String, u64), String> {
+    let names: BTreeMap<u64, String> = BTreeMap::new();
+    let is_arm64 = analyzer.platform.arch == "arm64";
+    let mut out: BTreeMap<(String, u64), String> = BTreeMap::new();
+    let mut conflict: Vec<(String, u64)> = Vec::new();
+    let mut seen_fn = 0usize;
+    let (mut n_raw, mut n_eps, mut n_cls, mut n_two) = (0usize, 0usize, 0usize, 0usize);
+    let dbg_on = std::env::var("DART_AOT_DEBUG_ACCESSOR").is_ok();
+    for (&ref_, f) in analyzer.iso.functions.iter() {
+        let Some((_ep, idx)) = analyzer.func_eps.get(&ref_).copied() else { continue };
+        n_eps += 1;
+        // 判据用**函数 kind**（3/6 = getter，4/7 = setter），不用名字前缀：
+        // 私有字段的访问器带 `get:`/`set:` 前缀，公开字段的访问器就叫字段名本身。
+        // kind 8（method extractor）名字也是方法名，排除。
+        let vk = f.kind_tag & 0x1F;
+        if !matches!(vk, 6 | 7) {
+            continue;
+        }
+        let raw = analyzer.sref_str(f.name_ref).unwrap_or("");
+        let fname = match raw.strip_prefix("get:").or_else(|| raw.strip_prefix("set:")) {
+            Some(rest) => scrub_name(Some(rest)),
+            None => scrub_name(Some(raw)),
+        };
+        // 操作符/合成名（`[]=`、`runtimeType`、`_set*`）不是字段名
+        if fname.is_empty()
+            || !fname.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || !fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '=')
+            || fname.starts_with("_set")
+            || fname == "runtimeType"
+            || fname.ends_with('=')
+        {
+            continue;
+        }
+        n_raw += 1;
+        let Some(cls) = analyzer.class_of(f.owner_ref) else { continue };
+        let class = scrub_name(analyzer.sref_str(cls.name_ref));
+        if class.is_empty() {
+            continue;
+        }
+        n_cls += 1;
+        let Some((entry, csize)) = analyzer.code_range(idx) else { continue };
+        let foff = entry + analyzer.slice_off;
+        let end = (foff as usize + csize as usize + 16).min(analyzer.data.len());
+        if foff as usize >= end {
+            continue;
+        }
+        let (stmts, _) = lift(cs, analyzer, &analyzer.data[foff as usize..end], entry, is_arm64, &names);
+        let limit = entry + csize;
+        let mut offs: BTreeSet<u64> = BTreeSet::new();
+        let mut unknown = 0usize;
+        for st in stmts.iter().filter(|s| s.addr < limit) {
+            for a in op_accesses(rl, ctx, &st.op) {
+                match a {
+                    Acc::Field(off) => {
+                        offs.insert(off);
+                    }
+                    Acc::Unknown => unknown += 1,
+                    Acc::NotField => {}
+                }
+            }
+        }
+        // 恰好一处字段访问、且没有看不懂的访问：getter 的返回值 / setter 的落点
+        // 都只能是它，无需猜
+        if offs.len() != 1 || unknown != 0 {
+            n_two += 1;
+            continue;
+        }
+        seen_fn += 1;
+        if dbg_on {
+            eprintln!("[dbg-accessor] {class}.{fname} @ off={:#x}", *offs.iter().next().unwrap());
+        }
+        let off = *offs.iter().next().unwrap();
+        match out.get(&(class.clone(), off)) {
+            Some(prev) if prev != &fname => {
+                if std::env::var("DART_AOT_DEBUG_FIELDS").is_ok() {
+                    eprintln!("[dbg-accessor] 同名冲突 {class} off={off:#x}: {prev} vs {fname}");
+                }
+                conflict.push((class, off))
+            }
+            Some(_) => {}
+            None => {
+                out.insert((class, off), fname);
+            }
+        }
+    }
+    for k in conflict {
+        out.remove(&k);
+    }
+    if std::env::var("DART_AOT_DEBUG_FIELDS").is_ok() {
+        eprintln!(
+            "[dbg-accessor] 采信 {} 条；raw={n_raw} eps={n_eps} cls={n_cls} 唯一={seen_fn} 多访问={n_two}",
+            out.len()
+        );
+    }
+    out
+}
+
+/// 单个函数的字段注解上下文（类名 + 全局字段表 + 寄存器角色）
+struct FieldAnnot<'a> {
+    class: &'a str,
+    ctx: &'a FieldCtx,
+    rl: &'a Roles,
+}
+
+/// 基址是否可能是「对象」：寄存器，或溢出到栈上的接收者/参数
+/// （`local_0`，x64 上常写成先 `rax = mem(FP - 8)` 再 `mem(rax + off)`——那一步
+/// 也会被下面的 `mem(<栈槽>)` 分支接住）。
+///
+/// **排除**：框架寄存器（PP/THR/SP/FP/BARRIER/NULL…）、池式折叠地址（adrp 那类带括号
+/// 加数的）、以及「从别的对象字段里取出来的对象」（`mem(x0, 0x10)` 当基址）——那种
+/// 基址的类完全未知，与其猜不如不注解，内层访问本身仍会被单独注解。
+fn field_base_ok(rl: &Roles, base: &str) -> bool {
+    let mut b = base.trim();
+    while let Some(inner) = b.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        b = inner.trim();
+    }
+    if b.is_empty() {
+        return false;
+    }
+    // `mem(<栈槽>)`：栈上的引用值（接收者/参数溢出）——只认栈槽，不认对象字段。
+    // 两种写法都要认：arm64 `[FP, #-8]`（基址是独立操作数）、x64 `[FP - 8]`（同一操作数）。
+    if let Some(inner) = b.strip_prefix("mem(").and_then(|x| x.strip_suffix(')')) {
+        if mem_parts(inner).stack {
+            return true;
+        }
+        let bt = inner.trim().split(['+', '-']).next().unwrap_or("").trim();
+        return matches!(bt, "FP" | "SP");
+    }
+    if b.contains('(') || b.contains('+') || b.contains(',') {
+        return false;
+    }
+    rl.obj_base(b)
+}
+
+/// 扫描一段文本里的 `mem(...)`（含嵌套），把能对上字段表的收集成注解。
+fn field_notes(text: &str, ctx: &FieldCtx, class: &str, rl: &Roles, out: &mut Vec<String>) {
+    let b: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i + 4 <= b.len() {
+        if b[i] == 'm' && b[i + 1] == 'e' && b[i + 2] == 'm' && b[i + 3] == '(' {
+            let mut depth = 1i32;
+            let mut j = i + 4;
+            while j < b.len() {
+                match b[j] {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let inner: String = b[i + 4..j.min(b.len())].iter().collect();
+            // 嵌套的先看（`mem(mem(x0, 0x10), 0x17)` 两个都是候选）
+            field_notes(&inner, ctx, class, rl, out);
+            if std::env::var("DART_AOT_DEBUG_NOTE").is_ok() {
+                eprintln!("[dbg-note] class={class} inner={inner:?} parsed={:?} base_ok={:?}",
+                    base_disp(&inner), base_disp(&inner).map(|(b,_)| field_base_ok(rl, &b)));
+            }
+            if let Some((base, disp)) = base_disp(&inner) {
+                if field_base_ok(rl, &base) {
+                    if let Some(d) = parse_imm_i(&disp) {
+                        if let Some(off) = ctx.offset_of(d) {
+                            if let Some(nm) = ctx.name(class, off) {
+                                let note = format!("/* {class}.{nm} (off {off:#x}) */");
+                                if !out.contains(&note) {
+                                    out.push(note);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// 在行尾地址注释**之前**插入字段注解：`x0 = mem(x1, 0x17); // 0x..`
+/// → `x0 = mem(x1, 0x17); /* _FutureListener.result (off 0x18) */ // 0x..`
+/// 注解是**类内**说法：说的是「owner 类在这个偏移上的字段是 X」，没有声称基址就是
+/// 该类的实例——所以基址只做「像不像对象」的排除，不做断言。
+fn annotate_line(line: &str, fa: &FieldAnnot) -> String {
+    // 先做一次子串预筛：绝大多数行没有内存访问，没必要为它们建 Vec<char>
+    if fa.class.is_empty() || !line.contains("mem(") {
+        return line.to_string();
+    }
+    if std::env::var("DART_AOT_NO_FIELD_NOTES").is_ok() {
+        return line.to_string(); // A/B 计量用：关掉注解
+    }
+    let mut notes: Vec<String> = Vec::new();
+    field_notes(line, fa.ctx, fa.class, fa.rl, &mut notes);
+    if notes.is_empty() {
+        return line.to_string();
+    }
+    let note = notes.join(" ");
+    match line.rfind(" // ") {
+        Some(p) => format!("{} {note} {}", &line[..p], &line[p..]),
+        None => format!("{line} {note}"),
+    }
+}
+
 // ---------------------------------------------------------------- 控制流结构化
 //
 // 目标：把「块 + goto」变成 if/else 与循环。做法是教科书式的两件套：
@@ -2688,33 +3196,39 @@ impl<'a> Structurer<'a> {
     }
 }
 
-fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &mut bool) {
+fn render_nodes(
+    nodes: &[Node],
+    indent: usize,
+    out: &mut String,
+    unstructured: &mut bool,
+    fa: &FieldAnnot,
+) {
     let pad = "  ".repeat(indent + 1);
     for n in nodes {
         match n {
             Node::Line(l) => {
                 // Node::Line 也绕过 render_op（结构化器的兜底分支直接拼了字符串），
                 // 所以这里再兜一次；对已清洗过的文本是幂等的。
-                let l = sanitize_regs(&sanitize_mem_refs(l));
+                let l = annotate_line(&sanitize_regs(&sanitize_mem_refs(l)), fa);
                 let _ = writeln!(out, "{pad}{l}");
             }
             Node::If { cond, then, els } => {
                 // 条件文本绕过 render_op（不经过那边的 sanitize），单独过一遍：
                 // x86 的 `qword ptr [THR + 0x40]` 直接进 `if (...)` 就是语法错误
-                let cond = sanitize_regs(&sanitize_mem_refs(cond));
+                let cond = annotate_line(&sanitize_regs(&sanitize_mem_refs(cond)), fa);
                 let _ = writeln!(out, "{pad}if ({cond}) {{");
-                render_nodes(then, indent + 1, out, unstructured);
+                render_nodes(then, indent + 1, out, unstructured, fa);
                 if els.is_empty() {
                     let _ = writeln!(out, "{pad}}}");
                 } else {
                     let _ = writeln!(out, "{pad}}} else {{");
-                    render_nodes(els, indent + 1, out, unstructured);
+                    render_nodes(els, indent + 1, out, unstructured, fa);
                     let _ = writeln!(out, "{pad}}}");
                 }
             }
             Node::While { cond, body: _ } => match cond {
                 Some(c) => {
-                    let c = sanitize_regs(&sanitize_mem_refs(c));
+                    let c = annotate_line(&sanitize_regs(&sanitize_mem_refs(c)), fa);
                     let _ = writeln!(out, "{pad}while ({c}) {{");
                 }
                 None => {
@@ -2735,7 +3249,7 @@ fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &
             }
         }
         if let Node::While { body, .. } = n {
-            render_nodes(body, indent + 1, out, unstructured);
+            render_nodes(body, indent + 1, out, unstructured, fa);
             let _ = writeln!(out, "{pad}}}");
         }
     }

@@ -62,9 +62,14 @@ Function counts are equal because of a fix this comparison produced (below); the
 
 ## Where aotopsy is ahead
 
-- **Dynamic field names.** aotopsy prints `local_16.values_14b94 = 0;` — a *field name* with its
-  offset, from whole-program type inference (`typetrack`). dae prints `mem(local_16, 0x17)`. dae
-  has the object-pool values (above) but not local/parameter types.
+- **Field accesses are rewritten, not annotated.** aotopsy prints
+  `local_16.values_14b94 = 0;` — the base, a dot, the field name. dae now recovers the same names
+  by the same *source* (it reads `MintValues[HostOffset] × wordSize`, exactly as aotopsy's
+  `class_layouts.go` does, and adds implicit-accessor names on top), but attaches them as an
+  attributed comment: `mem(local_16, 0x17) /* _FutureListener.result (off 0x18) */`. Writing
+  `local_16.result` requires knowing the base's **type**, which aotopsy gets from whole-program
+  inference (`typetrack`) and dae does not do yet — asserting it without that would be a
+  fabrication. So: same names, different rendering, and dae's is the honest half.
 - **Type-testing stub names.** aotopsy names all 176 unclaimed table entries
   (`TypeTestingStub__GrowableList@0150898`); dae names the 88 allocation stubs provably and leaves
   the 88 type-testing stubs as bare addresses. That is the entire ~3.5pp naming gap in the table.

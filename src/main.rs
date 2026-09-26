@@ -244,6 +244,9 @@ fn run(
     println!("  text/functions.txt        {} {}", summary.textinfo.functions, s.sum_funcs);
     println!("  text/arrays.txt           {} {}", summary.textinfo.arrays, s.sum_arrays);
     println!("  text/maps.txt             {} {}", summary.textinfo.maps, s.sum_maps);
+    if summary.textinfo.fields > 0 {
+        println!("  text/fields.txt           {} {}", summary.textinfo.fields, s.sum_fields);
+    }
     if let Some((total, named)) = summary.stubs {
         println!("  text/stubs.txt            {total} {}（{named} {}）", s.sum_stubs, s.sum_named);
     }
@@ -370,7 +373,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  -V, --version         show version");
         println!();
         println!("progressive (writes no full export): dae info | libs | classes | functions |");
-        println!("  strings | largest | callers | disasm | getclass | getmethod | getlib -- see `dae help`");
+        println!("  strings | fields | largest | callers | disasm | getclass | getmethod | getlib -- see `dae help`");
         println!();
         println!("outputs:");
         println!("  ida_script/    IDA naming script + struct header (addNames.py / ida_dart_struct.h)");
