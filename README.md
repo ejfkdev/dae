@@ -75,7 +75,7 @@ export done -> /absolute/path/to/out:
 | `arrays.txt` / `maps.txt` | every List / Map object with its contents (under `text/`) |
 | `text/call_edges.txt` | call edges: direct `bl`/`call` targets + indirect call sites; per-class allocation stubs are named from their prologue |
 | `callgraph.dot` | direct-call graph between named functions (Graphviz DOT) |
-| `dart/*.dart` | per-function pseudocode, with `--decompile` (experimental) |
+| `dart/*.dart` | per-function pseudocode that passes `dart analyze` (with `--decompile`) |
 
 Struct headers are generated **per target**: `DartThread` from a version × architecture layout table, `DartObjectPool` from the target's own object pool.
 
@@ -110,7 +110,7 @@ Three layers; the engine is version-invariant, versions add configuration only:
 | SDK profile | `profiles/sdk/*.json` | cid enums, field layouts (fill DSL), tagging, offsets |
 | Platform profile | `profiles/platform/*.json` | container parser, symbol names, register roles |
 
-Spec: [`docs/PROFILES.md`](docs/PROFILES.md)
+Spec: [`docs/PROFILES.md`](docs/PROFILES.md) · Decompiler baseline: [`docs/DECOMPILER.md`](docs/DECOMPILER.md)
 
 ## Progressive mode (list first, decompile one thing)
 
@@ -173,24 +173,34 @@ What it does today:
   `// frame:` / `// barrier:` comments, and the raw disassembly kept above each function so
   the output stays checkable.
 
+**The output is valid Dart.** It parses and passes `dart analyze` with zero errors — machine
+syntax is rewritten (`mem(base, disp)`, `memSet(...)`, `callIndirect(x8)`, `gotoLabel(0x..)`),
+names are sanitised into identifiers (mixin-application class names contain `&`, which is a Dart
+operator) and every file starts with a *pseudo-runtime* preamble declaring the machine-level
+concepts plus whatever registers and cross-library call targets the body uses. That preamble is
+not pretending the code compiles: it writes down where the machine layer ends and Dart begins.
+Baseline: **680,515 → 0** errors on a 412-file / 10,245-function Flutter app, and 0 across all
+27 corpora — see [`docs/DECOMPILER.md`](docs/DECOMPILER.md) for the table, the fix history and
+the per-sample scores.
+
 Control flow is **structured**: dominators give the natural loops (back edge = header
 dominates its tail), then each region is emitted recursively — a conditional branch whose two
 arms rejoin becomes `if/else`, `join == region end` counts as a valid diamond, an arm that
 returns becomes `if (c) { return ... }`, a loop header becomes `while`, and an arm that leaves
 the loop becomes `break`/`continue`. 87–92% of functions come out fully structured on the
-corpora we gate on; the rest keep a `goto` and are marked with a `NOTE` header, so a reader
-knows which files are pseudocode rather than Dart.
+corpora we gate on; the rest keep a `gotoLabel` and are marked with a `NOTE` header.
 
 What it does **not** do yet: cross-block expression composition beyond a few levels, and type
-recovery. Unrecognised instructions are emitted verbatim as `// unmapped:` rather than
-approximated, and the count is printed in the run summary — treat it as the quality dial.
+recovery (everything is `dynamic`, field access is `mem(base, disp)`). Unrecognised instructions
+are emitted verbatim as `// unmapped:` rather than approximated, and the count is printed in the
+run summary — treat it as the quality dial.
 
-A gate runs on every change (`tests/decompiler_shape.rs`): braces must balance in every
-emitted file — an unbalanced file means a branch was silently dropped — every in-function
-statement must terminate, the structured rate has a floor, and **addresses must be
-self-consistent** (function ends look like terminators, direct calls land on function
-entries). That last gate exists because an address-location bug on appended Mach-O snapshots
-once made the decompiler read the wrong bytes while every name-based metric stayed green.
+Gates run on every change: `tests/dart_valid.rs` (real `dart analyze`, zero errors) and
+`tests/decompiler_shape.rs` (braces must balance in every emitted file — an unbalanced file means
+a branch was silently dropped — every in-function statement must terminate, a structured-rate
+floor, and **address self-consistency**: function ends look like terminators and direct calls land
+on function entries). That last gate exists because an address-location bug on appended Mach-O
+snapshots once made the decompiler read the wrong bytes while every name-based metric stayed green.
 
 ## Known limitations
 

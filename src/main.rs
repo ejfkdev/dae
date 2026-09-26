@@ -250,15 +250,20 @@ fn run(
         {
             let st = dae::decompiler::write(&analyzer, &filtered_libs, &out_abs)?;
             println!(
-                "  dart/                     {} {}（{} 基本块 / {} 语句；{} 已结构化，{} 未结构化；{} {} 行；{} {}，{} {}）",
+                "  dart/                     {} {} ({} {} / {} {}; {} {}, {} {}; {} {} {}; {} {}, {} {})",
                 st.funcs,
                 s.sum_dart,
                 st.blocks,
+                s.sum_blocks,
                 st.stmts,
+                s.sum_stmts,
                 st.structured,
+                s.sum_structured,
                 st.fallback,
+                s.sum_unstructured,
                 st.unmapped,
                 s.sum_unmapped,
+                s.sum_lines,
                 st.calls,
                 s.sum_calls,
                 st.calls_named,

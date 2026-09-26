@@ -96,6 +96,12 @@ pub struct Messages {
     pub sum_cg_r: &'static str,
     pub sum_dart: &'static str,
     pub sum_unmapped: &'static str,
+    /// 摘要行里的单位词（原来是硬编码中文，英文语系下也照印——顺手修掉）
+    pub sum_blocks: &'static str,
+    pub sum_stmts: &'static str,
+    pub sum_structured: &'static str,
+    pub sum_unstructured: &'static str,
+    pub sum_lines: &'static str,
     pub sum_calls: &'static str,
     pub sum_named: &'static str,
     /// 筛选（--lib/--class/--func）后一个都没命中
@@ -164,6 +170,11 @@ pub fn messages(lang: Lang) -> Messages {
         sum_cg_r: p("条解析到名字", "resolved"),
         sum_dart: p("个函数伪代码", "function pseudocode blocks"),
         sum_unmapped: p("未映射", "unmapped"),
+        sum_blocks: p("基本块", "blocks"),
+        sum_stmts: p("语句", "statements"),
+        sum_structured: p("已结构化", "structured"),
+        sum_unstructured: p("未结构化", "unstructured"),
+        sum_lines: p("行", "lines"),
         sum_calls: p("个直接调用", "direct calls"),
         sum_named: p("已命名", "named"),
         err_no_match: p(

@@ -134,7 +134,8 @@ pub fn detect_or_default(
             } else {
                 s.detect_basis_low
             };
-            println!("{}: {}（{basis}）", s.sdk_profile_label, p.abi);
+            // stderr：stdout 是数据通道（渐进式子命令可管道），诊断一律不进去
+            eprintln!("{}: {}（{basis}）", s.sdk_profile_label, p.abi);
             p
         }
         None => {

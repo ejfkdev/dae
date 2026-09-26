@@ -75,7 +75,7 @@ export done -> /绝对路径/to/out:
 | `arrays.txt` / `maps.txt` | 每个 List / Map 对象及其内容（在 `text/` 下） |
 | `text/call_edges.txt` | 调用边：直接 `bl`/`call` 目标 + 间接调用点；每类分配 stub 由序言解出名字 |
 | `callgraph.dot` | 已命名函数之间的直接调用图（Graphviz DOT） |
-| `dart/*.dart` | 每函数伪代码（加 `--decompile`，实验性） |
+| `dart/*.dart` | 每函数伪代码，**可过 `dart analyze`**（加 `--decompile`） |
 
 结构头按目标生成：`DartThread` 取自「版本 × 架构」布局表，`DartObjectPool` 由目标自身对象池生成。
 
@@ -110,7 +110,7 @@ export done -> /绝对路径/to/out:
 | SDK profile | `profiles/sdk/*.json` | cid 枚举、字段布局（fill DSL）、tagging、偏移 |
 | 平台 profile | `profiles/platform/*.json` | 容器解析、符号名、寄存器角色 |
 
-规范见 [`docs/PROFILES.md`](docs/PROFILES.md)。
+规范见 [`docs/PROFILES.zh.md`](docs/PROFILES.zh.md) · 反编译基线见 [`docs/DECOMPILER.zh.md`](docs/DECOMPILER.zh.md)。
 
 ## 渐进式（先查清单，再定点反编译）
 
@@ -165,17 +165,27 @@ dae getlib    <binary> <LIB>                  只反编译这个库（包）
 - 栈槽渲染成局部变量（`local_8`）；帧保存/恢复与屏障保留为 `// frame:` / `// barrier:` 注释
 - 每个函数上方保留原始反汇编注释块（便于核对）
 
+**产物是合法 Dart**：能解析，能过 `dart analyze` 且零错误——机器写法被改写成
+`mem(base, disp)`/`memSet(...)`/`callIndirect(x8)`/`gotoLabel(0x..)`，名字收敛成合法标识符
+（mixin application 的类名里带 `&`，而 `&` 在 Dart 里是运算符），每个文件顶部还有一段
+*伪运行时*前导，声明机器层概念以及正文用到的寄存器与跨库调用目标。这段声明不是"假装编译得过"，
+它把「机器层到哪里为止、Dart 语义从哪里开始」显式写了出来。
+基线：真实 Flutter 应用（412 文件 / 10 245 函数）**680 515 → 0** 个错误，27 个语料全部 0；
+表、修复过程与逐样本分数见 [`docs/DECOMPILER.zh.md`](docs/DECOMPILER.zh.md)。
+
 **控制流已结构化**：支配树找出自然循环（回边 = 头支配尾），再按区域递归发射——两分支汇合的
 写成 `if/else`（汇合点正好是区域终点也算合法菱形），一支返回的写成 `if (c) { return ... }`，
 循环头写成 `while`，跳出循环的分支写成 `break`/`continue`。门禁语料上 87–92% 的函数完全结构化；
-其余保留 `goto` 并在函数头打 `NOTE` 标记，读者能一眼看出哪些文件是伪代码而非 Dart。
+其余保留 `gotoLabel` 并在函数头打 `NOTE` 标记。
 
-**还没做的**：跨基本块的表达式合成（目前是块内若干层）、类型恢复。认不出的指令原样输出为
-`// unmapped:`，不做近似；运行摘要里会打印这个行数——可以把它当质量刻度看。
+**还没做的**：跨基本块的表达式合成（目前是块内若干层）、类型恢复（一切都是 `dynamic`，
+字段访问是 `mem(base, disp)`）。认不出的指令原样输出为 `// unmapped:`，不做近似；
+运行摘要里会打印这个行数——可以把它当质量刻度看。
 
-每次改动都有门禁（`tests/decompiler_shape.rs`）：产物文件花括号必须配平（不配平=静默丢分支）、
-函数体内语句必须正常结束、结构化率有下限、**地址必须自洽**（函数末尾像终止符、直接调用命中函数
-入口）。最后这条是本项目吃过亏补上的：Mach-O appended 快照的指令段定位曾经缺失，反编译器读的是
+每次改动都有门禁：`tests/dart_valid.rs`（真跑 `dart analyze`，要求零错误）与
+`tests/decompiler_shape.rs`（产物文件花括号必须配平（不配平=静默丢分支）、函数体内语句必须正常
+结束、结构化率有下限、**地址必须自洽**（函数末尾像终止符、直接调用命中函数入口））。
+最后这条是本项目吃过亏补上的：Mach-O appended 快照的指令段定位曾经缺失，反编译器读的是
 **别的代码**，而所有基于名字的指标却全是绿的。
 
 ## 已知限制

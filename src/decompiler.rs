@@ -52,7 +52,7 @@ impl Expr {
             Expr::Reg(r) => r.clone(),
             Expr::Imm(v) => format!("{v}"),
             Expr::Pool(i) => format!("pp[0x{i:x}]"),
-            Expr::Mem(m) => pretty_mem(m),
+            Expr::Mem(m) => mem_read(m),
             Expr::Text(x) => x.clone(),
         }
     }
@@ -78,6 +78,9 @@ enum Op {
     Abort(i64),
     /// `cmp`/`tst`：只为保留地址占用一个语句位，不渲染（条件已并入紧随的分支）
     Cmp,
+    /// 成对读（`ldp d1, d2, [base, disp]`）：Dart 没有元组赋值（`a, b = mem(...)` 不是
+    /// 合法语法），渲染成 `memRead2(base, disp, d1, d2);`——语义是"读两个字进这两个寄存器"。
+    PairLoad { base: String, disp: String, d1: String, d2: String },
     /// 认不出来的指令：原文保留
     Other(String),
     /// **认得出来**但无语义信息的指令：帧保存/恢复（stp/ldp 到栈）、屏障（dmb/isb）。
@@ -115,9 +118,13 @@ fn lift(
     };
     for ins in insns.iter() {
         let mnem = ins.mnemonic().unwrap_or("").to_string();
-        let ops = mask_regs(&rl, ins.op_str().unwrap_or(""));
+        let ops_masked = mask_regs(&rl, ins.op_str().unwrap_or(""));
         let addr = ins.address();
-        let _ = writeln!(raw, "  {addr:#x}: {mnem} {ops}");
+        let _ = writeln!(raw, "  {addr:#x}: {mnem} {ops_masked}");
+        // IR 用**去掉 `#`** 的操作数：`#` 只是汇编的立即数标记，`mem(x2, #0x3f)`、
+        // `SP - #8`、`1 << #0` 这类残留会让 Dart 解析器报 expected_token。
+        // 反汇编注释块（raw）保留原样，便于与 asm/ 产物逐字对照。
+        let ops = ops_masked.replace('#', "");
         if matches!(mnem.as_str(), "cmp" | "cmn" | "tst" | "test" | "fcmp" | "fcmpe") {
             let mut it = ops.split(',');
             let a = it.next().unwrap_or("").trim().to_string();
@@ -449,22 +456,22 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         // 池地址全错。这里把修饰折进操作数。
         let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 3 && is_reg(parts[0]) {
-            let idx = if is_reg(parts[1]) { 2 } else { 1 };
-            let rhs = shift_operand(parts[idx], parts.get(idx + 1).copied())
-                .unwrap_or_else(|| parts[idx].to_string());
+            // 三操作数：dst = a op b。**不能**用"第二操作数是不是寄存器"来判定——
+            // x86 的 `imul ecx, [rax], 0x48` 第二操作数是内存，旧写法会把第三段
+            // 当成移位修饰，渲染出 `ecx * (mem(rax) 0x48)`（语法错误）。
+            let rhs = shift_operand(parts[2], parts.get(3).copied())
+                .unwrap_or_else(|| parts[2].to_string());
             return Op::Assign {
                 dst: reg_name(parts[0]),
-                src: Expr::Text(format!("{} {op} {rhs}", parts[idx - 1])),
+                src: Expr::Text(format!("{} {op} {rhs}", parts[1])),
             };
         }
-        if parts.len() == 2
-            && is_reg(parts[0])
-            && (is_reg(parts[1]) || parse_imm_i(parts[1]).is_some())
-        {
-            // `add x0, x1` 这种两操作数形式：等于 x0 += x1
+        if parts.len() == 2 && is_reg(parts[0]) {
+            // 两操作数：`add x0, x1` / `add rax, [rbx]` 都是 dst op= src
+            let rhs = shift_operand(parts[1], None).unwrap_or_else(|| parts[1].to_string());
             return Op::Assign {
                 dst: reg_name(parts[0]),
-                src: Expr::Text(format!("{} {op} {}", reg_name(parts[0]), parts[1])),
+                src: Expr::Text(format!("{} {op} {rhs}", reg_name(parts[0]))),
             };
         }
     }
@@ -516,7 +523,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         if parts.len() >= 3 && is_reg(parts[0]) {
             return Op::Assign {
                 dst: reg_name(parts[0]),
-                src: Expr::Text(format!("{} {op} {} (float)", parts[1], parts[2])),
+                src: Expr::Text(format!("({} {op} {}) /* float */", parts[1], parts[2])),
             };
         }
     }
@@ -528,13 +535,13 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             "fneg" => Some("-"),
             "fabs" => Some("abs"),
             "fsqrt" => Some("sqrt"),
-            "fcvt" => Some("to-double"),
-            "fcvtn" => Some("to-float"),
-            "scvtf" => Some("float"),
-            "ucvtf" => Some("float(unsigned)"),
-            "fcvtzs" => Some("int"),
-            "fcvtzu" => Some("int(unsigned)"),
-            "scvtfw" | "scvtfx" => Some("float"),
+            "fcvt" => Some("toDouble"),
+            "fcvtn" => Some("toFloat"),
+            "scvtf" => Some("toFloat"),
+            "ucvtf" => Some("toFloatUnsigned"),
+            "fcvtzs" => Some("toInt"),
+            "fcvtzu" => Some("toIntUnsigned"),
+            "scvtfw" | "scvtfx" => Some("toFloat"),
             _ => None,
         };
         if let Some(k) = unary {
@@ -570,7 +577,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         if mnem == "fmov" && parts.len() >= 2 && is_reg(d) {
             return Op::Assign {
                 dst: reg_name(d),
-                src: Expr::Text(format!("{} (bits)", parts[1])),
+                src: Expr::Text(format!("{} /* bits */", parts[1])),
             };
         }
         // 符号/零扩展与位段插入
@@ -605,10 +612,15 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             };
         }
         // adr：把它当「取本地址」——x64/arm64 都用于取常量标签
-        if (mnem == "adr" || mnem == "adrp" || mnem == "lea") && parts.len() >= 2 && is_reg(d) {
+        if (mnem == "adr" || mnem == "adrp" || mnem == "lea") && is_reg(d) {
+            // 操作数拆不出地址就别硬造 `addr()`（占位函数要 1 个参数）
+            if parts.len() < 2 || parts[1].trim().is_empty() {
+                return Op::Other(format!("{mnem} {ops}"));
+            }
+            let arg = parts[1].trim().trim_start_matches('#').to_string();
             return Op::Assign {
                 dst: reg_name(d),
-                src: Expr::Text(format!("&{}", parts[1])),
+                src: Expr::Text(format!("addr({arg})")),
             };
         }
     }
@@ -647,9 +659,24 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
                 value: regs,
             };
         }
-        return Op::Assign {
-            dst: regs,
-            src: Expr::Mem(mem),
+        // ldp：拆成 memRead2(base, disp, d1, d2)
+        let mp = mem_parts(&mem);
+        let (base, disp) = (
+            mp.parts.first().cloned().unwrap_or_default(),
+            mp.parts.get(1).cloned().unwrap_or_else(|| "0".into()),
+        );
+        let (d1, d2) = match (parts.first(), parts.get(1)) {
+            (Some(a), Some(b)) => (
+                reg_name(a.trim()).to_string(),
+                reg_name(b.trim()).to_string(),
+            ),
+            _ => return Op::Other(format!("{mnem} {ops}")),
+        };
+        return Op::PairLoad {
+            base: base.trim_start_matches('#').to_string(),
+            disp: disp.trim_start_matches('#').to_string(),
+            d1,
+            d2,
         };
     }
     // ---- x64 帧簿记：push/pop（含 push rbp 的序言、pop rbp 的收尾）与对齐填充 ----
@@ -756,11 +783,14 @@ fn shift_operand(operand: &str, modifier: Option<&str>) -> Option<String> {
             };
             Some(format!("({operand} {sym} {n})"))
         }
+        // 扩展修饰（零/符号扩展）不建模成表达式——写成注释，别编造语义
         ("uxtw" | "sxtw" | "uxtb" | "sxtb" | "uxth" | "sxth", amt) => {
-            let tail = amt.map(|n| format!(" #{n}")).unwrap_or_default();
-            Some(format!("({operand} {kind}{tail})"))
+            let tail = amt.map(|n| format!(" {n}")).unwrap_or_default();
+            Some(format!("({operand} /* {kind}{tail} */)"))
         }
-        _ => Some(format!("({operand} {m})")),
+        // 认不出的第 4 段（例如 x86 三操作数的第二个值）**不能**塞进括号里：
+        // `(mem(rax) 0x48)` 是语法错误。只有确认是移位/扩展关键字才折叠。
+        _ => Some(operand.to_string()),
     }
 }
 
@@ -787,23 +817,168 @@ fn negate_cond(c: &str) -> String {
     format!("!({t})")
 }
 
-/// 栈基址内存操作数 → `local_<offset>`：`[FP, #-8]`/`[SP, #0x10]` 是帧内局部槽，
-/// 用 `mem([FP, #-8])` 表达读起来像指针解引用，实际是**局部变量**。
-/// 非栈基址（`[x0, #7]` = 堆对象字段）保持原样——不猜语义。
-fn pretty_mem(operand: &str) -> String {
+/// 内存操作数 → **合法 Dart 表达式**。
+///
+/// 机器语法（`[x2, #0x3f]`、`[SP, #-0x10]!`）进不了 Dart：`[` 开头是列表字面量、
+/// `#` 后必须是标识符、`!` 也不是后缀运算符。实测一个真实应用里有 14 万条
+/// `expected_token` 就是这些字符带来的。所以：
+/// * 栈基址（`[FP, #-8]`/`[SP, #0x10]`）→ `local_m8`（帧内局部槽，`m` 前缀表示负偏移）；
+/// * 其它基址（`[x2, #0x3f]` = 堆对象字段）→ `mem(x2, 0x3f)`，读作「这段内存」——
+///   语义仍是"不猜"，只是把机器写法换成能解析的函数调用。
+fn mem_parts(operand: &str) -> MemOperand {
     let t = operand.trim();
-    if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
-        let inner = inner.trim_end_matches('!').trim();
-        let parts = split_operands(inner);
-        let base = parts.first().map(|x| x.trim()).unwrap_or("");
-        if (base == "FP" || base == "SP") && parts.len() == 2 {
-            let off = parts[1].trim().trim_start_matches('#');
-            let sign = if off.starts_with('-') { "" } else { "+" };
-            let mag = off.trim_start_matches('-').trim_start_matches("0x");
-            return format!("local_{sign}{mag}");
+    // 取第一个 `[` 到最后一个 `]` 之间的内容：x86 的写法带尺寸前缀
+    // （`qword ptr [rbx + 0x18]`），只 strip_prefix('[') 会整段落空，
+    // 于是 `qword ptr [...]` 被当成一个参数塞进 mem()，再被后置清洗包一层 → `mem(mem(..))`。
+    let inner = match (t.find('['), t.rfind(']')) {
+        (Some(a), Some(b)) if b > a => &t[a + 1..b],
+        _ => t,
+    };
+    let inner = inner.trim();
+    let parts: Vec<String> = split_operands(inner)
+        .iter()
+        .map(|x| x.trim().trim_end_matches('!').trim().to_string())
+        .collect();
+    let stack = matches!(
+        parts.first().map(|s| s.as_str()).unwrap_or(""),
+        "FP" | "SP"
+    );
+    // raw 只在「地址都拆不出来」的兜底分支里用（见 mem_write）
+    let _ = &parts;
+    MemOperand { parts, stack, raw: t.to_string() }
+}
+
+struct MemOperand {
+    parts: Vec<String>,
+    stack: bool,
+    raw: String,
+}
+
+impl MemOperand {
+    /// 栈槽 → `local_m8`（Dart 合法标识符）；否则 None
+    fn local_name(&self) -> Option<String> {
+        if !self.stack {
+            return None;
         }
+        let off = self.parts.get(1).map(|s| s.as_str()).unwrap_or("0");
+        Some(local_ident(off))
     }
-    format!("mem({t})")
+    /// 参数列表（丢掉 `#`），并把 arm64 的寻址修饰折进表达式：
+    /// `[x21, x0, lsl #3]` → `x21, (x0 << 3)`；`[x0, w1, uxtw #2]` → `x0, w1 /* uxtw 2 */`
+    /// （`lsl 3` 这种尾巴原样留在参数里会被 Dart 当成语法错误）。
+    fn args(&self) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < self.parts.len() {
+            let p = self.parts[i].trim().trim_start_matches('#').to_string();
+            let mut it = p.split_whitespace();
+            let kind = it.next().unwrap_or("");
+            let amt = it.next().map(|x| x.trim_start_matches('#').to_string());
+            let is_mod = matches!(
+                kind,
+                "lsl" | "lsr" | "asr" | "uxtw" | "sxtw" | "uxtb" | "sxtb" | "uxth" | "sxth"
+            );
+            if is_mod && i > 0 {
+                let prev = out.pop().unwrap_or_default();
+                let sym = match kind {
+                    "lsl" => "<<",
+                    "lsr" | "asr" => ">>",
+                    _ => "",
+                };
+                if !sym.is_empty() {
+                    match &amt {
+                        Some(a) => out.push(format!("({prev} {sym} {a})")),
+                        None => out.push(prev),
+                    }
+                } else {
+                    // 扩展类修饰：数值折叠不了，保留成注释（Dart 里 `/* .. */` 可放在实参位置）
+                    match &amt {
+                        Some(a) => out.push(format!("{prev} /* {kind} {a} */")),
+                        None => out.push(prev),
+                    }
+                }
+            } else {
+                out.push(p);
+            }
+            i += 1;
+        }
+        out.join(", ")
+    }
+}
+
+/// 名字 → Dart 合法标识符。Dart 的类名里会有 `&`（mixin application，如
+/// `Set&_LinkedHashBase&SetMixin`）与 `<`/`>`（泛型实参），这些字符在 Dart 源码里是
+/// **运算符**——`Set&_X_while()` 会解析成 `Set & _X_while()`，直接编译错误。
+/// 产物里把非法字符统一换成 `_`，并把数字开头补 `_` 前缀。
+/// 注意：functions.txt / asm/ 等**数据产物保持原始名字**，只有 dart/ 需要合法标识符。
+pub(crate) fn dart_ident(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // 连续下划线收敛成一个（`_anon` + `&` 之类会叠出很多）
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true) {
+        out.insert(0, '_');
+    }
+    // 名字本身是保留字时要让开：`dynamic rethrow() { .. }` 连解析都过不去
+    if is_dart_keyword(&out) {
+        out.push('_');
+    }
+    // 也不能撞上文件顶部那段伪运行时的声明（否则 duplicate_definition）
+    if PSEUDO_FUNCS.iter().any(|(n, _)| *n == out) || WIDTH_NAMES.contains(&out.as_str()) {
+        out.push('_');
+    }
+    out
+}
+
+/// `#-0x10` / `-8` / `0x10` → `local_m10` / `local_m8` / `local_10`
+fn local_ident(off: &str) -> String {
+    let o = off.trim().trim_start_matches('#');
+    let neg = o.starts_with('-');
+    let mag = o.trim_start_matches('-').trim_start_matches("0x");
+    if neg {
+        format!("local_m{mag}")
+    } else {
+        format!("local_{mag}")
+    }
+}
+
+/// 读内存 → 合法表达式
+fn mem_read(operand: &str) -> String {
+    let m = mem_parts(operand);
+    if let Some(l) = m.local_name() {
+        return l;
+    }
+    format!("mem({})", m.args())
+}
+
+/// 写内存 → 合法语句（返回 `lvalue = value;` 或 `memSet(...);`）
+fn mem_write(operand: &str, value: &str) -> String {
+    let m = mem_parts(operand);
+    if let Some(l) = m.local_name() {
+        // 成对写（`stp x8, x1, [FP, #-0x50]`）的值是两个寄存器，不能写成
+        // `local_m50 = x8, x1;`（Dart 没有逗号表达式）→ 走占位函数。
+        if value.contains(',') {
+            return format!("memSet({l}, {value});");
+        }
+        return format!("{l} = {value};");
+    }
+    if m.args().is_empty() {
+        format!("memSet({value}); // {}\n", m.raw)
+            .trim_end()
+            .to_string()
+    } else {
+        format!("memSet({}, {value});", m.args())
+    }
 }
 
 /// 取内存操作数的基址寄存器：`[SP, #0x10]!` → `SP`；`x0` → None。
@@ -986,13 +1161,23 @@ fn emit_function(
     for st in blocks.iter().flat_map(|b| b.stmts.iter()) {
         match &st.op {
             Op::Assign { dst, .. } => {
+                let dst = sanitize_regs(dst);
                 if declared.insert(dst.clone()) {
                     let _ = writeln!(out, "  dynamic {dst};");
                 }
             }
             Op::Call { dst: Some(d), .. } => {
+                let d = sanitize_regs(d);
                 if declared.insert(d.clone()) {
                     let _ = writeln!(out, "  dynamic {d};");
+                }
+            }
+            Op::PairLoad { d1, d2, .. } => {
+                for d in [d1, d2] {
+                    let d = sanitize_regs(d);
+                    if declared.insert(d.clone()) {
+                        let _ = writeln!(out, "  dynamic {d};");
+                    }
                 }
             }
             _ => {}
@@ -1032,6 +1217,181 @@ pub fn disasm_text(
         let _ = writeln!(out, "  // 无法反汇编（{csize} 字节）");
     }
     Ok(out)
+}
+
+/// 取出正文里用到的标识符（跳过 `//` 行注释与 `/* */` 块注释、字符串字面量）。
+/// 用途：给「用到但本文件没定义」的名字补声明，让产物能过 `dart analyze`。
+fn identifiers(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // 注释
+        if c == '/' && bytes.get(i + 1) == Some(&'/') {
+            while i < bytes.len() && bytes[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == '*' && bytes[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        // 字符串字面量
+        if c == '\'' || c == '"' {
+            let q = c;
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                if bytes[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // 数字字面量要整段吃掉：`0x5b30` 里的 `x` 会被误当成标识符开头
+        // （曾收出 `x5b30`/`x838` 这类幽灵名字塞进声明表）
+        if c.is_ascii_digit() {
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '.' || bytes[i] == '_')
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
+            let mut id = String::new();
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '_' || bytes[i] == '$')
+            {
+                id.push(bytes[i]);
+                i += 1;
+            }
+            out.insert(id);
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Dart **保留字**：既不能出现在 `dynamic <name>;` 的声明列表里，也不能当函数名。
+/// 注意不要把 `print`/`Object`/`String`/`List` 这类**内建标识符**混进来——它们可以
+/// 当变量名用（实测 `dynamic print; dynamic Object, List;` 过分析），把它们排除在外
+/// 反而会让 `print()` 撞上 dart:core 里那个要 1 个参数的 print（实测每份产物都报）。
+fn is_dart_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "abstract" | "as" | "assert" | "async" | "await" | "base" | "break" | "case" | "catch"
+            | "class" | "const" | "continue" | "covariant" | "default" | "deferred" | "do"
+            | "dynamic" | "else" | "enum" | "export" | "extends" | "extension" | "external"
+            | "factory" | "false" | "final" | "finally" | "for" | "get" | "hide" | "if"
+            | "implements" | "import" | "in" | "interface" | "is" | "late" | "library" | "mixin"
+            | "new" | "null" | "of" | "on" | "operator" | "part" | "required" | "rethrow"
+            | "return" | "sealed" | "set" | "show" | "static" | "super" | "switch" | "sync"
+            | "this" | "throw" | "true" | "try" | "typedef" | "var" | "void" | "when" | "while"
+            | "with" | "yield"
+    )
+}
+
+/// 伪运行时：把机器层概念写成可解析的 Dart 占位
+const PSEUDO_FUNCS: &[(&str, &str)] = &[
+    ("mem", "dynamic mem(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
+    ("memSet", "dynamic memSet(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
+    ("memRead2", "dynamic memRead2(dynamic a, [dynamic b, dynamic c, dynamic d]) => null;"),
+    ("callIndirect", "dynamic callIndirect(dynamic a) => null;"),
+    ("gotoLabel", "dynamic gotoLabel(dynamic a) => null;"),
+    ("addr", "dynamic addr(dynamic a) => null;"),
+    ("abort", "dynamic abort([dynamic a]) => null;"),
+    ("sqrt", "dynamic sqrt(dynamic a) => null;"),
+    ("abs", "dynamic abs(dynamic a) => null;"),
+    ("max", "dynamic max(dynamic a, dynamic b) => null;"),
+    ("min", "dynamic min(dynamic a, dynamic b) => null;"),
+    ("toFloat", "dynamic toFloat(dynamic a) => null;"),
+    ("toFloatUnsigned", "dynamic toFloatUnsigned(dynamic a) => null;"),
+    ("toInt", "dynamic toInt(dynamic a) => null;"),
+    ("toIntUnsigned", "dynamic toIntUnsigned(dynamic a) => null;"),
+    ("toDouble", "dynamic toDouble(dynamic a) => null;"),
+];
+
+/// 位宽/扩展名（`as u8`、`as sxtw` 里的类型位）→ `typedef ... = int;`
+const WIDTH_NAMES: &[&str] = &[
+    "u8", "u16", "u32", "i8", "i16", "i32", "sxtb", "sxth", "sxtw", "uxtb", "uxth", "uxtw",
+];
+
+/// 文件前导：伪运行时 + 用到但本文件没定义的标识符声明。
+/// 这一步是「产物能过 `dart analyze`」的关键：寄存器（x0/PP/THR）、跨库调用目标、
+/// 机器层占位函数都不是 Dart 内建名字，不声明就是几万条 undefined_identifier。
+fn dart_preamble(body: &str, defined: &BTreeSet<String>) -> String {
+    let used = identifiers(body);
+    let mut vars: Vec<&String> = used
+        .iter()
+        .filter(|id| {
+            !defined.contains(*id)
+                && !is_dart_keyword(id)
+                && !PSEUDO_FUNCS.iter().any(|(n, _)| n == id)
+                && !WIDTH_NAMES.contains(&id.as_str())
+        })
+        .collect();
+    vars.sort();
+    let mut out = String::with_capacity(256 + vars.len() * 12);
+    let _ = writeln!(
+        out,
+        "// ---------------------------------------------------------------------------"
+    );
+    let _ = writeln!(
+        out,
+        "// Pseudo-runtime declarations. dae output is pseudocode, but it must also parse"
+    );
+    let _ = writeln!(
+        out,
+        "// and analyse as Dart: these names stand in for the machine-level concepts"
+    );
+    let _ = writeln!(
+        out,
+        "// (memory access, indirect calls, unwinding) and for the registers the code"
+    );
+    let _ = writeln!(
+        out,
+        "// touches, which are not Dart built-ins."
+    );
+    let _ = writeln!(
+        out,
+        "// ---------------------------------------------------------------------------"
+    );
+    for (_, decl) in PSEUDO_FUNCS {
+        let _ = writeln!(out, "{decl}");
+    }
+    for w in WIDTH_NAMES {
+        let _ = writeln!(out, "typedef {w} = int;");
+    }
+    if !vars.is_empty() {
+        let _ = writeln!(out);
+        // 每行都必须是**完整的**声明：`dynamic a, b, c;`。换行后只写裸名字
+        // （早期写法）会让整块变成语法错误。
+        let mut group: Vec<&str> = Vec::new();
+        let mut width = 0usize;
+        for v in vars.iter() {
+            if width + v.len() + 2 > 88 && !group.is_empty() {
+                let _ = writeln!(out, "dynamic {};", group.join(", "));
+                group.clear();
+                width = 0;
+            }
+            group.push(v.as_str());
+            width += v.len() + 2;
+        }
+        if !group.is_empty() {
+            let _ = writeln!(out, "dynamic {};", group.join(", "));
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// 建 capstone 实例。**开 skipdata**：遇到非指令字节（函数入口前的 0 填充、对齐
@@ -1106,9 +1466,14 @@ pub fn render(
                 if f.ep == 0 || names.contains_key(&f.ep) {
                     continue;
                 }
-                let n = format!("{}_{}", _cls.replace(['.', ':'], "_"), f.mangled)
-                    .trim_start_matches('_')
-                    .to_string();
+                let n = dart_ident(
+                    &format!(
+                        "{}_{}",
+                        _cls.replace(['.', ':', '&', '<', '>'], "_"),
+                        f.mangled
+                    )
+                    .trim_start_matches('_'),
+                );
                 names.insert(f.ep, n);
             }
         }
@@ -1143,20 +1508,20 @@ pub fn render(
             }
         };
         let mut of = String::new();
-        let _ = writeln!(
-            of,
-            "// dae decompiler output -- pseudocode, not compilable Dart"
-        );
+        let _ = writeln!(of, "// dae decompiler output -- pseudocode that parses as Dart");
         let _ = writeln!(of, "// library: {lib_name}");
         let _ = writeln!(
             of,
-            "// control flow is structured (if/else + loops) where possible; functions that keep a"
+            "// control flow is structured (if/else + loops) where possible; functions whose"
         );
         let _ = writeln!(
             of,
-            "// `goto` carry a NOTE header, since Dart has no goto."
+            "// control flow could not be structured keep a NOTE header and emit gotoLabel()."
         );
         let mut cnt = 0usize;
+        // 同一文件内函数名去重：两个不同入口可能算出同一个名字（同一类的多个匿名闭包），
+        // 而 Dart 里同名定义是编译错误（duplicate_definition）。
+        let mut defined: BTreeSet<String> = BTreeSet::new();
         for (_cls, funcs) in cls_map {
             for f in funcs {
                 if f.ep == 0 || !seen.insert(f.ep) {
@@ -1200,9 +1565,21 @@ pub fn render(
                         }
                     }
                 }
-                let name = format!("{}_{}", _cls.replace(['.', ':'], "_"), f.mangled)
-                    .trim_start_matches('_')
-                    .to_string();
+                let base = dart_ident(
+                    &format!(
+                        "{}_{}",
+                        _cls.replace(['.', ':', '&', '<', '>'], "_"),
+                        f.mangled
+                    )
+                    .trim_start_matches('_'),
+                );
+                let mut name = base.clone();
+                let mut k = 2usize;
+                while defined.contains(&name) {
+                    name = format!("{base}_{k}");
+                    k += 1;
+                }
+                defined.insert(name.clone());
                 if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
                     eprintln!("[dbg-dec] emit ep={:#x} entry={entry:#x} csize={csize} name={name}", f.ep);
                 }
@@ -1219,7 +1596,12 @@ pub fn render(
             }
         }
         stats.funcs += cnt;
-        files.push((fname, of));
+        // 前导声明要在正文全部渲染完之后算（要知道用到哪些标识符、定义了哪些函数）
+        let preamble = dart_preamble(&of, &defined);
+        let mut full = String::with_capacity(of.len() + preamble.len());
+        full.push_str(&preamble);
+        full.push_str(&of);
+        files.push((fname, full));
     }
     Ok((files, stats))
 }
@@ -1247,6 +1629,10 @@ struct Structurer<'a> {
     loops: BTreeMap<usize, (usize, usize)>, // header idx → (body 入口, 出口)
     in_loop: BTreeMap<usize, usize>,    // block idx → 所属循环头 idx
     done: BTreeSet<usize>,
+    /// 发射期当前所在的循环头栈：静态 in_loop 只说明"这个块属于某个循环"，
+    /// 但该循环体可能已经在别处发完了；此时再发 `continue` 就跑到循环外面去了
+    /// （实测一个 10k 函数应用里有 1 例，dart analyze 报 continue_outside_of_loop）。
+    loop_stack: Vec<usize>,
     unstructured: bool,
     /// 未结构化的**首个**原因（诊断用；一旦置位不再改写，便于归因统计）
     reason: String,
@@ -1352,6 +1738,7 @@ impl<'a> Structurer<'a> {
             loops,
             in_loop,
             done: BTreeSet::new(),
+            loop_stack: Vec::new(),
             unstructured: false,
             reason: String::new(),
         }
@@ -1468,7 +1855,9 @@ impl<'a> Structurer<'a> {
             if let Some(&(_, exit)) = self.loops.get(&b) {
                 let (cond, body_entry) = self.loop_shape(b);
                 let mut body = self.body_lines(b);
+                self.loop_stack.push(b);
                 body.extend(self.seq(body_entry, Some(b)));
+                self.loop_stack.pop();
                 out.push(Node::While { cond, body });
                 cur = Some(exit);
                 continue;
@@ -1490,7 +1879,7 @@ impl<'a> Structurer<'a> {
                     let t = self.idx.get(&target).copied();
                     let f = self.succ(b, 1);
                     // 循环内：出口边 → break；回边 → continue
-                    let in_l = self.in_loop.get(&b).copied();
+                    let in_l = self.in_loop.get(&b).copied().filter(|h| self.loop_stack.contains(h));
                     if let Some(h) = in_l {
                         let t_out = t.map(|x| self.in_loop.get(&x).copied() != Some(h)).unwrap_or(true);
                         if t_out {
@@ -1581,8 +1970,13 @@ impl<'a> Structurer<'a> {
                     if t == stop {
                         break;
                     }
-                    if let Some(h) = self.in_loop.get(&b) {
-                        if self.loops.contains_key(&h) && t == Some(*h) {
+                    if let Some(h) = self
+                        .in_loop
+                        .get(&b)
+                        .copied()
+                        .filter(|h| self.loop_stack.contains(h))
+                    {
+                        if self.loops.contains_key(&h) && t == Some(h) {
                             out.push(Node::Continue);
                             break;
                         }
@@ -1637,9 +2031,15 @@ fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &
     for n in nodes {
         match n {
             Node::Line(l) => {
+                // Node::Line 也绕过 render_op（结构化器的兜底分支直接拼了字符串），
+                // 所以这里再兜一次；对已清洗过的文本是幂等的。
+                let l = sanitize_regs(&sanitize_mem_refs(l));
                 let _ = writeln!(out, "{pad}{l}");
             }
             Node::If { cond, then, els } => {
+                // 条件文本绕过 render_op（不经过那边的 sanitize），单独过一遍：
+                // x86 的 `qword ptr [THR + 0x40]` 直接进 `if (...)` 就是语法错误
+                let cond = sanitize_regs(&sanitize_mem_refs(cond));
                 let _ = writeln!(out, "{pad}if ({cond}) {{");
                 render_nodes(then, indent + 1, out, unstructured);
                 if els.is_empty() {
@@ -1652,6 +2052,7 @@ fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &
             }
             Node::While { cond, body: _ } => match cond {
                 Some(c) => {
+                    let c = sanitize_regs(&sanitize_mem_refs(c));
                     let _ = writeln!(out, "{pad}while ({c}) {{");
                 }
                 None => {
@@ -1666,7 +2067,9 @@ fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &
             }
             Node::Goto(a) => {
                 *unstructured = true;
-                let _ = writeln!(out, "{pad}goto L{a:x};");
+                // Dart 没有 goto（`goto L40a8;` 连解析都过不去）：写成占位调用，
+                // 明确「控制权转去 0x40a8」，函数头的 NOTE 也仍然标着伪代码。
+                let _ = writeln!(out, "{pad}gotoLabel(0x{a:x});");
             }
         }
         if let Node::While { body, .. } = n {
@@ -1676,11 +2079,102 @@ fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &
     }
 }
 
+/// x86 的内存写法 → Dart：`qword ptr [THR + 0x40]` → `mem(THR + 0x40)`。
+/// 产物里不该出现任何 `[`（Dart 的 `[` 只在列表/索引处合法），所以这里把每个
+/// 方括号段整体换成 `mem(...)`，并吃掉 `byte/word/dword/qword ptr` 尺寸前缀。
+fn sanitize_mem_refs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let b: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '[' {
+            let mut depth = 1i32;
+            let mut j = i + 1;
+            while j < b.len() && depth > 0 {
+                match b[j] {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let inner: String = b[i + 1..j.saturating_sub(1)].iter().collect();
+            out.push_str(&format!("mem({})", inner.trim()));
+            i = j;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    // 尺寸前缀去掉（它是 x86 语法，Dart 里是未定义标识符）。
+    // **长的先替**：`word ptr ` 是 `qword ptr ` 的子串，短名先替会把 `qword ptr [..]`
+    // 削成 `qmem(...)`（实测 2.13/2.14/3.3 三个版本的产物里各有上百条）。
+    let mut t = out;
+    // 段前缀（`ds:`/`fs:`）同样是 x86 语法
+    for seg in ["cs:", "ds:", "es:", "fs:", "gs:", "ss:"] {
+        while t.contains(seg) {
+            t = t.replace(seg, "");
+        }
+    }
+    for pre in ["qword ptr ", "dword ptr ", "xword ptr ", "byte ptr ", "word ptr ", "ptr "] {
+        while t.contains(pre) {
+            t = t.replace(pre, "");
+        }
+    }
+    t
+}
+
+/// 寄存器名里的 `.` 会让 Dart 把它读成成员访问：`v2.2d = min(v9.2d, v5.2d);`
+/// 会解析成 `v2 . 2d = ...`。arm64 的 SIMD 车道写法统一收敛成 `v2_2d`。
+fn sanitize_regs(text: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        // 命中 `v<数字>.<数字><字母>`（车道）才替换点号
+        if (b[i] == 'v' || b[i] == 'q' || b[i] == 'd' || b[i] == 's')
+            && b.get(i + 1).map(|c| c.is_ascii_digit()).unwrap_or(false)
+        {
+            let start = i;
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if b.get(j) == Some(&'.')
+                && b.get(j + 1).map(|c| c.is_ascii_digit()).unwrap_or(false)
+            {
+                let mut k = j + 1;
+                while k < b.len() && b[k].is_ascii_digit() {
+                    k += 1;
+                }
+                if b.get(k).map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+                    out.extend(b[start..j].iter());
+                    out.push('_');
+                    out.extend(b[j + 1..k + 1].iter());
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 /// 单条 IR → 伪代码行（None = 不产出，如无跳转意义的指令）
 fn render_op(op: &Op, addr: u64) -> Option<String> {
+    let line = render_op_inner(op, addr)?;
+    Some(sanitize_regs(&sanitize_mem_refs(&line)))
+}
+
+fn render_op_inner(op: &Op, addr: u64) -> Option<String> {
     match op {
         Op::Assign { dst, src } => Some(format!("{dst} = {}; // {addr:#x}", src.text())),
         Op::Cmp => None,
+        Op::PairLoad { base, disp, d1, d2 } => {
+            Some(format!("memRead2({base}, {disp}, {d1}, {d2}); // {addr:#x}"))
+        }
         Op::Note(t) => Some(format!("// {t} // {addr:#x}")),
         Op::Abort(n) => Some(format!("abort(); // brk #{n:#x} @ {addr:#x}")),
         Op::Call {
@@ -1689,13 +2183,13 @@ fn render_op(op: &Op, addr: u64) -> Option<String> {
             callee,
             resolved,
         } => {
+            // `call foo` 不是 Dart（两个标识符连写）；渲染成真正的调用表达式 `foo()`。
+            // 目标有名字写名字（可读性关键），没名字写 `sub_0x...`（合法标识符：不以数字开头）。
             let call = match target {
-                // 目标有名字就写名字（这是可读性的关键）；没名字的照实写地址
                 Some(t) => match resolved {
-                    // 名字本身就是地址（sub_0x...）时不再叠一遍注释
-                    Some(n) if n.as_str() == format!("sub_{t:#x}") => format!("call {n}"),
-                    Some(n) => format!("call {n} /* 0x{t:x} */"),
-                    None => format!("call 0x{t:x}"),
+                    Some(n) if n.as_str() == format!("sub_{t:#x}") => format!("{n}()"),
+                    Some(n) => format!("{n}() /* 0x{t:x} */"),
+                    None => format!("sub_{t:#x}()"),
                 },
                 None => format!("callIndirect({callee})"),
             };
@@ -1705,7 +2199,7 @@ fn render_op(op: &Op, addr: u64) -> Option<String> {
             })
         }
         Op::Store { target, value } => {
-            Some(format!("{} = {value}; // {addr:#x}", pretty_mem(target)))
+            Some(format!("{} // {addr:#x}", mem_write(target, value)))
         }
         Op::Branch { .. } | Op::Return { .. } => None,
         Op::Other(t) => Some(format!("// unmapped: {t} // {addr:#x}")),
@@ -1742,7 +2236,7 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
     };
     for st in stmts {
         match &st.op {
-            Op::Note(_) | Op::Abort(_) | Op::Other(_) | Op::Cmp => {
+            Op::Note(_) | Op::Abort(_) | Op::Other(_) | Op::Cmp | Op::PairLoad { .. } => {
                 out.push(Stmt { addr: st.addr, op: st.op.clone() });
                 pending.clear();
                 continue;
@@ -1758,9 +2252,9 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                     Expr::Mem(m) => {
                         let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
                         if d < NEST_MAX_DEPTH {
-                            pretty_mem(&subst_regs(m, &pending, rl))
+                            mem_read(&subst_regs(m, &pending, rl))
                         } else {
-                            pretty_mem(m)
+                            mem_read(m)
                         }
                     }
                     Expr::Text(x) => x.clone(),
