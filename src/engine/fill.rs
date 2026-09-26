@@ -37,6 +37,7 @@ pub fn fill_snapshot<'a>(
         let cid = meta.cid;
         let count = meta.count;
         let start_ref = meta.start_ref;
+        let cluster_fill_start = r.pos;
 
         // 字符串：**rodata 形态**的 fill 为空，按 alloc 期记下的镜像偏移解码。
         // 2.15+ 集中在 string_cid 一个簇（对象 tags 区分单/双字节）；
@@ -189,6 +190,55 @@ pub fn fill_snapshot<'a>(
             .map_err(|e| format!("cluster cid {} kind {} 对象#{k}: {e}", meta.cid, meta.kind))?;
             if std::env::var("DART_AOT_OBJ_STEPS").is_ok() && k < 5 {
                 eprintln!("[dbg-obj] cid={} k={} pos={}", meta.cid, k, r.pos);
+            }
+        }
+
+        // var/string 簇首长度对账：alloc 已记下每对象长度，fill 起点处 peek 第一个
+        // varint 与 lengths[0] 比对。最后一个「吻合」与第一个「不吻合」之间的簇即漂移源。
+        // 只 peek（用副本 Reader），不动真流。
+        if std::env::var("DART_AOT_DEBUG_FILLCHECK").is_ok() && !meta.lengths.is_empty() {
+            let mut peek = Reader { data: r.data, pos: cluster_fill_start };
+            if let Ok(v) = read_unsigned(&mut peek) {
+                let agree = v == meta.lengths[0];
+                eprintln!(
+                    "[dbg-fillcheck] 簇首对账 #{m_idx} cid={cid} kind={} count={count}                      fill_start={cluster_fill_start:#x} 首值={v} alloc首值={} => {}",
+                    meta.kind,
+                    meta.lengths[0],
+                    if agree { "吻合" } else { "**不吻合**" }
+                );
+            }
+        }
+
+        // 字符串簇精确对账：alloc 阶段已读到每条串的 `encoded=(len<<1)|two_byte`，
+        // 所以「fill 应消费多少字节」是可精确算出的（Σ varint(encoded) + 载荷），
+        // 不必靠相邻簇起点做差（那种差值跨快照边界时不可靠）。
+        // 第一个 actual≠expected 的簇就是漂移源。
+        if std::env::var("DART_AOT_DEBUG_FILLCHECK").is_ok() && meta.kind == "string" {
+            let uleb = |mut v: u64| -> u64 {
+                let mut n = 1;
+                while v >= 0x80 {
+                    v >>= 7;
+                    n += 1;
+                }
+                n
+            };
+            let mut expected: u64 = 0;
+            for &enc in &meta.lengths {
+                let len = enc >> 1;
+                expected += uleb(enc) + if enc & 1 == 1 { len * 2 } else { len };
+            }
+            let actual = r.pos.saturating_sub(cluster_fill_start) as u64;
+            if actual != expected {
+                eprintln!(
+                    "[dbg-fillcheck] 字符串簇对账不符：cid={cid} 条数={} 实消费={actual}                      应消费={expected} 差={}",
+                    meta.lengths.len(),
+                    actual as i64 - expected as i64
+                );
+            } else {
+                eprintln!(
+                    "[dbg-fillcheck] 字符串簇对账一致：cid={cid} 条数={} 字节={actual}",
+                    meta.lengths.len()
+                );
             }
         }
     }
@@ -733,18 +783,173 @@ fn exec_compiled<'a>(
                 if std::env::var("DART_AOT_DEBUG_FILL").is_ok() {
                     eprintln!("[dbg-pool] ln={ln} pos={:#x}", r.pos);
                 }
+                // alloc 阶段独立读过同一个长度（var 簇的两趟都会写它）。两趟一致 ⇒
+                // fill 起点没被前面的簇读偏，这个值就是真值——**此时绝不允许重同步**。
+                // 飞书 3.6.1（25.6 MB）的对象池真有 105 214 条，超过了下面那个为
+                // 2.10–2.14 漂移样本设的 100 000 阈值，旧逻辑把正确值当垃圾、
+                // 猜成 5 640 条，于是后续每个簇全漂（Reqable 84 964 条恰好在阈值下才幸免）。
+                let alloc_len = meta.lengths.get(k as usize).copied();
+                let alloc_agrees = alloc_len == Some(ln);
                 if std::env::var("DART_AOT_DEBUG_FILLCHECK").is_ok() {
-                    if let Some(al) = meta.lengths.get(k as usize) {
-                        if *al != ln {
+                    if let Some(al) = alloc_len {
+                        if al != ln {
                             eprintln!(
                                 "[dbg-fillcheck] 不一致：cid={} 对象#{} fill_len={ln} alloc_len={al} \
                                  （fill 起点已被前面的簇读偏）",
                                 meta.cid, k
                             );
+                            // 只读诊断：在附近反查 alloc 真值的 varint 编码，量出漂移字节数。
+                            // 漂移量往往直接指向病因（差一个对象 / 差一个簇 / 差固定几字节）。
+                            // Dart 的 WriteUnsigned：续字节高位=0，**终止字节高位=1**
+                            // （datastream.h: kEndUnsignedByteMarker = 255-127 = 0x80），
+                            // 与标准 ULEB128 相反。用错方向会搜到假命中并误判漂移量。
+                            let mut enc = Vec::new();
+                            let mut v = al;
+                            while v > 0x7f {
+                                enc.push((v & 0x7f) as u8);
+                                v >>= 7;
+                            }
+                            enc.push((v + 0x80) as u8);
+                            let start = r.pos.saturating_sub(1);
+                            let lo = start.saturating_sub(4_000_000);
+                            let hi = (start + 4_000_000).min(r.data.len());
+                            let mut hits = Vec::new();
+                            let mut p = lo;
+                            while p + enc.len() <= hi {
+                                if r.data[p..p + enc.len()] == enc[..] {
+                                    hits.push(p as i64 - start as i64);
+                                    if hits.len() >= 6 {
+                                        break;
+                                    }
+                                }
+                                p += 1;
+                            }
+                            eprintln!(
+                                "[dbg-fillcheck] 反查 alloc_len={al} 的 varint {:02x?}：\
+                                 当前 varint 起点={start:#x}，附近相对命中(字节)={hits:?}",
+                                enc
+                            );
+                            // 强校验：候选位置必须能用本解码器真解出 al 条池条目，
+                            // 且紧随其后的 varint 等于**下一簇** alloc 记下的长度序列。
+                            // 五值连中几乎不可能巧合，这才是可信的漂移量。
+                            let pre33_pool = profile.format.objectpool_type_low7;
+                            {
+                                for rel in &hits {
+                                    let cand = (start as i64 + rel) as usize;
+                                    let mut q = Reader { data: r.data, pos: cand };
+                                    let got_len = match read_unsigned(&mut q) {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    if got_len != al {
+                                        continue;
+                                    }
+                                    let mut ok = true;
+                                    for _ in 0..al {
+                                        let bits = match q.read_u8() {
+                                            Ok(b) => b,
+                                            Err(_) => { ok = false; break; }
+                                        };
+                                        let t = if pre33_pool { bits & 0x7F } else { bits & 0xF };
+                                        let stub = !pre33_pool && (2..=4).contains(&((bits >> 5) & 7));
+                                        if stub { continue; }
+                                        let r2 = match t {
+                                            0 if pre33_pool => read_ref_codec(codec, &mut q).map(|_| ()),
+                                            1 if pre33_pool => read_signed(&mut q).map(|_| ()),
+                                            1 if !pre33_pool => read_ref_codec(codec, &mut q).map(|_| ()),
+                                            0 if !pre33_pool => read_signed(&mut q).map(|_| ()),
+                                            _ => Ok(()),
+                                        };
+                                        if r2.is_err() { ok = false; break; }
+                                    }
+                                    if !ok { continue; }
+                                    // 真解通全部 al 条池条目已是极强校验（随机位置几乎不可能）；
+                                    // 再打印其后 5 个 varint，与下一簇 alloc 记下的长度序列人工对照。
+                                    let mut got: Vec<u64> = Vec::new();
+                                    for _ in 0..5 {
+                                        match read_unsigned(&mut q) {
+                                            Ok(v) => got.push(v),
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[dbg-fillcheck] **候选 rel={rel} 通过全池解码**（{al} 条），\
+                                         池尾位置={:#x}，其后 5 个 varint={got:?}",
+                                        q.pos
+                                    );
+                                }
+                            }
                         }
                     }
                 }
-                if ln > 100000 {
+                let pre33_locate = profile.format.objectpool_type_low7;
+                // 【临时实验，env 门控】alloc 与 fill 长度不一致 ⇒ fill 起点必然错位。
+                // alloc 长度是权威的（WriteAlloc/WriteFill 写同一个值），据此在整段数据里
+                // 反查能通过「全池解码」的位置并重定位，用于端到端确认漂移量。
+                if std::env::var("DAE_POOL_RELOCATE").is_ok()
+                    && alloc_len.is_some()
+                    && !alloc_agrees
+                {
+                    let al = alloc_len.unwrap();
+                    let mut enc = Vec::new();
+                    let mut v = al;
+                    while v > 0x7f {
+                        enc.push((v & 0x7f) as u8);
+                        v >>= 7;
+                    }
+                    enc.push((v + 0x80) as u8);
+                    let cur = r.pos.saturating_sub(enc.len().min(5));
+                    let mut found: Option<usize> = None;
+                    let mut p = 0usize;
+                    while p + enc.len() <= r.data.len() {
+                        if r.data[p..p + enc.len()] == enc[..] {
+                            let mut q = Reader { data: r.data, pos: p + enc.len() };
+                            let mut ok = true;
+                            for _ in 0..al {
+                                let bits = match q.read_u8() {
+                                    Ok(b) => b,
+                                    Err(_) => { ok = false; break; }
+                                };
+                                let res = if pre33_locate {
+                                    match bits & 0x7F {
+                                        0 => read_ref_codec(codec, &mut q).map(|_| ()),
+                                        1 => read_signed(&mut q).map(|_| ()),
+                                        _ => Ok(()),
+                                    }
+                                } else if (2..=4).contains(&((bits >> 5) & 7)) {
+                                    Ok(())
+                                } else {
+                                    match bits & 0xF {
+                                        1 => read_ref_codec(codec, &mut q).map(|_| ()),
+                                        0 => read_signed(&mut q).map(|_| ()),
+                                        _ => Ok(()),
+                                    }
+                                };
+                                if res.is_err() { ok = false; break; }
+                            }
+                            if ok {
+                                // 取离当前错位点最近的那个（绝对差最小）
+                                let d = (p as i64 - cur as i64).abs();
+                                if found.map_or(true, |f| (f as i64 - cur as i64).abs() > d) {
+                                    found = Some(p);
+                                }
+                            }
+                        }
+                        p += 1;
+                    }
+                    if let Some(np) = found {
+                        eprintln!(
+                            "[dbg-relocate] ObjectPool 重定位：{:#x} → {np:#x}（漂移 {:+}），len={al}",
+                            r.pos.saturating_sub(1),
+                            np as i64 - cur as i64
+                        );
+                        r.pos = np + enc.len();
+                        ln = al;
+                    } else {
+                        eprintln!("[dbg-relocate] 未找到可校验的池起点（alloc_len={al}）");
+                    }
+                }
+                if ln > 100000 && !alloc_agrees {
                     let mut np = None;
                     for delta in 0..=64usize {
                         let p = r.pos + delta;
@@ -795,6 +1000,9 @@ fn exec_compiled<'a>(
                     }
                 }
                 let entries = snap.objectpool_entries.get_or_insert_with(Vec::new);
+                let hist_dbg = std::env::var("DART_AOT_DEBUG_POOLHIST").is_ok();
+                let pool_pos0 = r.pos;
+                let entries0 = entries.len();
                 let legacy = profile.format.objectpool_legacy;
                 // 2.10–3.1：entry 位域 = TypeBits 位0-6（0=TaggedObject/1=Immediate/
                 // 2+=Native）+ 位7 Patchable；3.3+ 才改为 SnapshotBehavior 位5-7。
@@ -871,6 +1079,18 @@ fn exec_compiled<'a>(
                     } else {
                         entries.push(PoolEntry { bits: bits as u64, typ: "native".into(), value: None });
                     }
+                }
+                if hist_dbg {
+                    let c = |t: &str| entries[entries0..].iter().filter(|e| e.typ == t).count();
+                    let (n_obj, n_imm, n_stub, n_nat) =
+                        (c("obj"), c("imm"), c("stub"), c("native"));
+                    eprintln!(
+                        "[dbg-poolhist] cid={} 对象#{} 声明条目={ln} 实解={} obj={n_obj} imm={n_imm}                          stub={n_stub} native={n_nat} 消费字节={}",
+                        meta.cid,
+                        k,
+                        entries.len() - entries0,
+                        r.pos - pool_pos0
+                    );
                 }
             }
             CStep::InstanceFields => {

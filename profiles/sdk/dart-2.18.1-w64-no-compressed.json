@@ -585,7 +585,6 @@
       ]
     },
     "47": {
-      "_doc": "Type: 3 refs + flags(ReadUnsigned)，type_class_id=(flags>>4)&cid_tag_mask",
       "steps": [
         {
           "op": "refs",
@@ -593,14 +592,16 @@
         },
         {
           "op": "uvarint",
-          "alias": "flags",
-          "transform": "shr4_and_mask"
+          "alias": "type_cid"
+        },
+        {
+          "op": "byte"
         },
         {
           "op": "emit",
           "store": "type_cids",
           "fields": {
-            "type_cid": "flags"
+            "type_cid": "type_cid"
           }
         }
       ]
@@ -624,17 +625,20 @@
       ]
     },
     "54": {
-      "_doc": "TypeParameter: 3 refs + base int16 + index int16 + flags uint8",
       "steps": [
         {
           "op": "refs",
           "n": 3
         },
         {
-          "op": "svarint"
+          "op": "svarint",
+          "alias": "pcid"
         },
         {
-          "op": "svarint"
+          "op": "byte"
+        },
+        {
+          "op": "byte"
         },
         {
           "op": "byte"

@@ -687,11 +687,14 @@
       ]
     },
     "52": {
-      "_doc": "TypeParameter: 3 refs + base int16 + index int16 + flags uint8",
       "steps": [
         {
           "op": "refs",
           "n": 3
+        },
+        {
+          "op": "svarint",
+          "alias": "pcid"
         },
         {
           "op": "svarint"

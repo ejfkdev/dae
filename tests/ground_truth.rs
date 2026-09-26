@@ -37,6 +37,9 @@ fn corpus() -> Vec<(&'static str, PathBuf, &'static str, &'static str)> {
         ("T4_blank", root.join("testing/variants/T4_blank/libapp.so"), "dart-2.12.4-w64-no-compressed.json", "elf-x64.json"),
         ("hello_2.15.0", root.join("dart/dart_samples/artifacts/hello_2.15.0.aot"), "dart-2.15.0-w64-no-compressed.json", "elf-x64.json"),
         ("hello_2.16.2", root.join("dart/dart_samples/artifacts/hello_2.16.2.aot"), "dart-2.16.2-w64-no-compressed.json", "elf-x64.json"),
+        // 2.19.6 自带 .symtab（1 619 个符号），是 TypeParameter fill 布局按版本分段
+        // 这条改动的独立真值——regress 存档是 dae 自己产的，无法裁决自身对错。
+        ("hello_2.19.6", root.join("dart/dart_samples/artifacts/hello_2.19.6.aot"), "dart-2.19.6-w64-no-compressed.json", "elf-x64.json"),
     ]
 }
 
