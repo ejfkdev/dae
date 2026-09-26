@@ -72,11 +72,9 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                 if f.ep == 0 || !seen.insert(f.ep) {
                     continue;
                 }
-                let csize = analyzer.code_size(f.idx);
-                if csize == 0 {
+                let Some((payload, csize)) = analyzer.code_range(f.idx) else {
                     continue;
-                }
-                let payload = analyzer.instr_base + analyzer.pc_offsets[f.idx];
+                };
                 let foff = payload + analyzer.slice_off;
                 if foff as usize + csize as usize > analyzer.data.len() {
                     continue;
@@ -140,39 +138,14 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                     let mut of = String::with_capacity(job.est);
                     of.push_str(&job.header);
                     for p in &job.plan {
-                        let code =
-                            &analyzer.data[p.foff as usize..(p.foff + p.csize) as usize];
-                        let insns_all = match cs.disasm_all(code, p.payload) {
-                            Ok(v) => v,
+                        match render_one(analyzer, &cs, &p.mangled, p.ep, p.csize, p.foff, p.payload)
+                        {
+                            Ok(text) => of.push_str(&text),
                             Err(e) => {
-                                *err.lock().unwrap() =
-                                    Some(format!("capstone disassembly failed: {e}"));
+                                *err.lock().unwrap() = Some(e);
                                 return;
                             }
-                        };
-                        let insns: Vec<Ins> = insns_all
-                            .iter()
-                            .map(|i| {
-                                let mnem = i.mnemonic().unwrap_or("").to_string();
-                                let ops = normalize_branch_ops(&mnem, i.op_str().unwrap_or(""));
-                                Ins { addr: i.address(), mnem, ops }
-                            })
-                            .collect();
-                        let _ = write!(of, "\n  {}() {{\n", p.mangled);
-                        let _ = write!(of, "    // ** addr: 0x{:x}, size: 0x{:x}\n", p.ep, p.csize);
-                        for (il, grp) in il_pass(analyzer, &insns) {
-                            if !il.is_empty() {
-                                let _ = write!(of, "    // 0x{:x}: {}\n", grp[0].addr, il);
-                            }
-                            for insn in grp {
-                                let _ = write!(
-                                    of,
-                                    "    //     0x{:x}: {:<12} {}\n",
-                                    insn.addr, insn.mnem, rewrite_ops(analyzer, &insn.ops)
-                                );
-                            }
                         }
-                        of.push_str("  }\n");
                     }
                     if let Err(e) = std::fs::write(&job.path, of) {
                         *err.lock().unwrap() =
@@ -199,6 +172,66 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
 // ---------------------------------------------------------------- 工具
 
 /// `\w+` 首词
+/// 单函数反汇编 + IL 分组注释（与 asm/ 产物逐字节同形）。
+/// `disasm` 子命令复用它——arm64 才有 IL 分组（x64 走 decompiler::disasm_text）。
+pub fn render_one(
+    analyzer: &Analyzer,
+    cs: &Capstone,
+    mangled: &str,
+    ep: u64,
+    csize: u64,
+    foff: u64,
+    payload: u64,
+) -> Result<String, String> {
+    if foff as usize + csize as usize > analyzer.data.len() {
+        return Err("函数字节超出文件范围".to_string());
+    }
+    let code = &analyzer.data[foff as usize..(foff + csize) as usize];
+    let insns_all = cs
+        .disasm_all(code, payload)
+        .map_err(|e| format!("capstone disassembly failed: {e}"))?;
+    let insns: Vec<Ins> = insns_all
+        .iter()
+        .map(|i| {
+            let mnem = i.mnemonic().unwrap_or("").to_string();
+            let ops = normalize_branch_ops(&mnem, i.op_str().unwrap_or(""));
+            Ins { addr: i.address(), mnem, ops }
+        })
+        .collect();
+    let mut of = String::with_capacity(insns.len() * 64 + 96);
+    let _ = write!(of, "\n  {mangled}() {{\n");
+    let _ = write!(of, "    // ** addr: 0x{ep:x}, size: 0x{csize:x}\n");
+    for (il, grp) in il_pass(analyzer, &insns) {
+        if !il.is_empty() {
+            let _ = write!(of, "    // 0x{:x}: {}\n", grp[0].addr, il);
+        }
+        for insn in grp {
+            let _ = write!(
+                of,
+                "    //     0x{:x}: {:<12} {}\n",
+                insn.addr,
+                insn.mnem,
+                rewrite_ops(analyzer, &insn.ops)
+            );
+        }
+    }
+    of.push_str("  }\n");
+    Ok(of)
+}
+
+/// disasm/as 子命令共用：arm64 capstone（开 skipdata）
+pub fn build_cs() -> Result<Capstone, String> {
+    let mut c = Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
+        .build()
+        .map_err(|e| format!("capstone 初始化失败: {e}"))?;
+    c.set_skipdata(true)
+        .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
+    Ok(c)
+}
+
 fn first_word(s: &str) -> Option<&str> {
     let end = s
         .char_indices()

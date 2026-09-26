@@ -22,6 +22,11 @@ pub struct DecompileStats {
     pub stmts: usize,
     pub structured: usize,
     pub fallback: usize,
+    /// lift 认不出的指令行数（`// unmapped:`）——**质量主轴**：越小越好
+    pub unmapped: usize,
+    /// 直接调用总数 / 其中解析出名字的个数
+    pub calls: usize,
+    pub calls_named: usize,
 }
 
 // ---------------------------------------------------------------- lift
@@ -47,7 +52,7 @@ impl Expr {
             Expr::Reg(r) => r.clone(),
             Expr::Imm(v) => format!("{v}"),
             Expr::Pool(i) => format!("pp[0x{i:x}]"),
-            Expr::Mem(m) => format!("mem({m})"),
+            Expr::Mem(m) => pretty_mem(m),
             Expr::Text(x) => x.clone(),
         }
     }
@@ -56,15 +61,29 @@ impl Expr {
 #[derive(Clone, Debug)]
 enum Op {
     Assign { dst: String, src: Expr },
-    /// 直接调用（target = 目标地址）；间接调用 target = None、callee 为操作数原文
-    Call { dst: Option<String>, target: Option<u64>, callee: String },
+    /// 直接调用（target = 目标地址）；间接调用 target = None、callee 为操作数原文。
+    /// `resolved` = 目标地址对应的函数名（来自 Code 对象的库/类/方法名）。
+    Call {
+        dst: Option<String>,
+        target: Option<u64>,
+        callee: String,
+        resolved: Option<String>,
+    },
     /// cond = None 表示无条件跳转
     Branch { cond: Option<String>, target: u64 },
     Return { value: Option<String> },
     /// 写内存：`mem(target) = value`
     Store { target: String, value: String },
+    /// `brk #n`：陷阱/不可达（终止符）
+    Abort(i64),
+    /// `cmp`/`tst`：只为保留地址占用一个语句位，不渲染（条件已并入紧随的分支）
+    Cmp,
     /// 认不出来的指令：原文保留
     Other(String),
+    /// **认得出来**但无语义信息的指令：帧保存/恢复（stp/ldp 到栈）、屏障（dmb/isb）。
+    /// 与 Other 的区别是它不降低可读性指标——产物里以 `// frame:` / `// barrier:`
+    /// 注释形式保留原文，可 grep、但不冒充数据流语句。
+    Note(String),
 }
 
 #[derive(Clone, Debug)]
@@ -79,7 +98,14 @@ struct Stmt {
 /// 1. `cmp`/`test` 的结果喂给紧随的条件跳转，拼成真条件（`if (rdx < 2)` 而不是 `if (jl)`）；
 ///    没有可比对象时如实退回 mnemonic——不编条件。
 /// 2. 寄存器名统一替换成框架名（FP/SP/THR/PP…），内存操作数内部也替换。
-fn lift(cs: &Capstone, analyzer: &Analyzer, code: &[u8], base: u64, is_arm64: bool) -> (Vec<Stmt>, String) {
+fn lift(
+    cs: &Capstone,
+    analyzer: &Analyzer,
+    code: &[u8],
+    base: u64,
+    is_arm64: bool,
+    names: &BTreeMap<u64, String>,
+) -> (Vec<Stmt>, String) {
     let rl = roles(analyzer);
     let mut out = Vec::new();
     let mut raw = String::new();
@@ -92,21 +118,45 @@ fn lift(cs: &Capstone, analyzer: &Analyzer, code: &[u8], base: u64, is_arm64: bo
         let ops = mask_regs(&rl, ins.op_str().unwrap_or(""));
         let addr = ins.address();
         let _ = writeln!(raw, "  {addr:#x}: {mnem} {ops}");
-        if matches!(mnem.as_str(), "cmp" | "cmn" | "tst" | "test") {
+        if matches!(mnem.as_str(), "cmp" | "cmn" | "tst" | "test" | "fcmp" | "fcmpe") {
             let mut it = ops.split(',');
             let a = it.next().unwrap_or("").trim().to_string();
             let b = it.next().unwrap_or("").trim().to_string();
             // test/tst 的两个操作数相同 ⇒ 与 0 比较（x86 `test al,al`、arm64 `tst x,x`）
             let b = if matches!(mnem.as_str(), "test" | "tst") && b == a { "0".to_string() } else { b };
             last_cmp = Some((a, b));
-            // 比较本身不单独出行：紧随的条件分支已经把它表达成 `if (a op b)`
+            // 比较不单独出**语句行**（紧随的条件分支已经把它表达成 `if (a op b)`），
+            // 但必须保留下**地址**：`tbz ...; cmp; b.eq` 这类代码的分支目标常常正落在
+            // 比较指令上，丢掉它的地址就没有块起点，分支解析不了（曾使 895 个函数
+            // 退化成不可结构化）。render_op 对 Cmp 返回 None，故产物里仍不出现。
+            out.push(Stmt { addr, op: Op::Cmp });
             continue;
         }
         let s = match lift_one(&rl, is_arm64, &mnem, &ops, addr) {
-            Op::Branch { cond: Some(c), target } => Op::Branch {
-                cond: Some(fold_cond(&c, &last_cmp)),
-                target,
+            Op::Branch { cond: Some(c), target } => {
+                // 条件已被这次分支消费：不清空的话，隔着若干条不设标志位的指令后
+                // 再来一个 `b.eq` 会错误复用**上一条**比较（拼出假条件）。
+                let cond = Some(fold_cond(&c, &last_cmp));
+                last_cmp = None;
+                Op::Branch { cond, target }
+            }
+            // 直接调用：用函数名表把目标地址换成名字（可读性的关键一步）
+            Op::Call { dst, target: Some(t), callee, resolved: None } => Op::Call {
+                dst,
+                target: Some(t),
+                callee,
+                resolved: names.get(&t).cloned(),
             },
+            // 设标志位的算术指令会作废先前的比较结果
+            Op::Assign { .. }
+                if matches!(
+                    mnem.as_str(),
+                    "adds" | "subs" | "ands" | "bics" | "negs" | "adcs" | "sbcs"
+                ) =>
+            {
+                last_cmp = None;
+                lift_one(&rl, is_arm64, &mnem, &ops, addr)
+            }
             other => other,
         };
         out.push(Stmt { addr, op: s });
@@ -153,19 +203,19 @@ fn fold_cond(mnem: &str, last: &Option<(String, String)>) -> String {
 /// 把寄存器名替换成框架名（PP/THR/SP/FP/LR），内存操作数内部同样替换。
 fn mask_regs(rl: &Roles, ops: &str) -> String {
     let mut s = ops.to_string();
-    // 长的先换，避免 `r14` 命中 `r1`
-    let mut pairs: Vec<(String, &str)> = vec![
-        (rl.pp.clone(), "PP"),
-        (rl.thr.clone(), "THR"),
-        ("x29".into(), "FP"),
-        ("x30".into(), "LR"),
-    ];
-    for (k, v) in &pairs {
-        s = replace_word(&s, k, v);
-    }
-    pairs.clear();
-    let _ = pairs;
+    // 先按平台 profile 的 register_aliases 换（x15→SP、x29→FP、x26→THR…），
+    // 再补一组与平台无关的通用别名。**别名表按 key 长度倒序**：短名先换会把
+    // `x15` 里的 `x1` 之类误伤（历史上 arm64 的 `sp` 因此显示成裸 `x15`）。
+    let mut pairs: Vec<(String, String)> = rl
+        .aliases
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pairs.push((rl.pp.clone(), "PP".into()));
+    pairs.push((rl.thr.clone(), "THR".into()));
     for (k, v) in [
+        ("x29", "FP"),
+        ("x30", "LR"),
         ("rbp", "FP"),
         ("rsp", "SP"),
         ("esp", "SP"),
@@ -175,6 +225,10 @@ fn mask_regs(rl: &Roles, ops: &str) -> String {
         ("fp", "FP"),
         ("lr", "LR"),
     ] {
+        pairs.push((k.to_string(), v.to_string()));
+    }
+    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (k, v) in &pairs {
         s = replace_word(&s, k, v);
     }
     s
@@ -207,6 +261,11 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
 struct Roles {
     pp: String,
     thr: String,
+    /// Dart 代码里的栈指针寄存器名（arm64 是 x15 —— SDK constants_arm64.h 的
+    /// `R15 = 15; // SP in Dart code.`；x64 是 rsp）
+    sp: String,
+    /// 平台 profile 的 register_aliases（寄存器名 → 框架名）
+    aliases: std::collections::HashMap<String, String>,
 }
 
 fn roles(analyzer: &Analyzer) -> Roles {
@@ -215,6 +274,8 @@ fn roles(analyzer: &Analyzer) -> Roles {
     Roles {
         pp: g("pp", "pp"),
         thr: g("thr", "thr"),
+        sp: g("sp", "sp"),
+        aliases: analyzer.platform.register_aliases.clone(),
     }
 }
 
@@ -264,6 +325,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             dst: None,
             target: t,
             callee: ops.trim().to_string(),
+            resolved: None, // 由 lift 用函数名表回填
         };
     }
     if mnem == "blr" {
@@ -271,6 +333,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             dst: None,
             target: None,
             callee: reg_name(ops.trim()),
+            resolved: None,
         };
     }
     // 条件/无条件跳转
@@ -330,8 +393,13 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             };
         }
     }
-    // 加载：ldr/ldur/movzx 等 → 目标寄存器 + 内存表达式原文
-    if is_reg(&first) && (mnem.starts_with("ldr") || mnem.starts_with("ldur") || mnem.starts_with("ld")) && is_arm64
+    // 加载：ldr/ldur 等 → 目标寄存器 + 内存表达式原文。
+    // **排除 ldp/ldpsw**：成对加载是「两寄存器 + 一个地址」，落到这里会把第二个
+    // 寄存器当地址渲染成 `FP = mem(LR, [SP], #0x10)`（实测真实 app 的收尾指令）。
+    if is_reg(&first)
+        && !mnem.starts_with("ldp")
+        && (mnem.starts_with("ldr") || mnem.starts_with("ldur") || mnem.starts_with("ld"))
+        && is_arm64
     {
         return Op::Assign {
             dst: reg_name(&first),
@@ -376,15 +444,23 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         _ => None,
     };
     if let Some(op) = binop {
-        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        // 顶层逗号切分：`add x8, PP, #0xa, lsl #12` 的第 4 段是**移位修饰**，
+        // 用 split(',') 会把它连同 shift 一起丢掉——`(PP + #0xa)` 少了 <<12，
+        // 池地址全错。这里把修饰折进操作数。
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 3 && is_reg(parts[0]) {
             let idx = if is_reg(parts[1]) { 2 } else { 1 };
+            let rhs = shift_operand(parts[idx], parts.get(idx + 1).copied())
+                .unwrap_or_else(|| parts[idx].to_string());
             return Op::Assign {
                 dst: reg_name(parts[0]),
-                src: Expr::Text(format!("{} {op} {}", parts[idx - 1], parts[idx])),
+                src: Expr::Text(format!("{} {op} {rhs}", parts[idx - 1])),
             };
         }
-        if parts.len() == 2 && is_reg(parts[0]) && is_reg(parts[1]) {
+        if parts.len() == 2
+            && is_reg(parts[0])
+            && (is_reg(parts[1]) || parse_imm_i(parts[1]).is_some())
+        {
             // `add x0, x1` 这种两操作数形式：等于 x0 += x1
             return Op::Assign {
                 dst: reg_name(parts[0]),
@@ -436,7 +512,7 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         _ => None,
     };
     if let Some(op) = fbin {
-        let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
         if parts.len() >= 3 && is_reg(parts[0]) {
             return Op::Assign {
                 dst: reg_name(parts[0]),
@@ -444,9 +520,152 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             };
         }
     }
+    // ---- 浮点一元/最值/转换：只标注读法，不猜类型 ----
+    {
+        let parts: Vec<&str> = split_operands(&ops).iter().map(|s| s.trim()).collect();
+        let d = parts.first().copied().unwrap_or("");
+        let unary = match mnem {
+            "fneg" => Some("-"),
+            "fabs" => Some("abs"),
+            "fsqrt" => Some("sqrt"),
+            "fcvt" => Some("to-double"),
+            "fcvtn" => Some("to-float"),
+            "scvtf" => Some("float"),
+            "ucvtf" => Some("float(unsigned)"),
+            "fcvtzs" => Some("int"),
+            "fcvtzu" => Some("int(unsigned)"),
+            "scvtfw" | "scvtfx" => Some("float"),
+            _ => None,
+        };
+        if let Some(k) = unary {
+            if is_reg(d) && parts.len() >= 2 && is_reg(parts[1]) {
+                let src = match mnem {
+                    "fneg" => format!("-{}", parts[1]),
+                    "fabs" => format!("({}).abs()", parts[1]),
+                    "fsqrt" => format!("({}).sqrt()", parts[1]),
+                    "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" | "fcvt" | "fcvtn" => {
+                        format!("{k}({})", parts[1])
+                    }
+                    _ => format!("{k}({})", parts[1]),
+                };
+                return Op::Assign {
+                    dst: reg_name(d),
+                    src: Expr::Text(src),
+                };
+            }
+        }
+        // fmax/fmin：三操作数时第三段是条件，忽略（不猜），只表达最值
+        if (mnem == "fmax" || mnem == "fmaxnm" || mnem == "fmin" || mnem == "fminnm")
+            && parts.len() >= 3
+            && is_reg(d)
+        {
+            let f = if mnem.starts_with("fmax") { "max" } else { "min" };
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!("{f}({}, {})", parts[1], parts[2])),
+            };
+        }
+        // fmov 在两个寄存器之间搬运：整数/浮点寄存器互转（位模式不变），
+        // 也用于常量池加载 `fmov d0, #1.0` —— 后者操作数是立即数，不伪造数值
+        if mnem == "fmov" && parts.len() >= 2 && is_reg(d) {
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!("{} (bits)", parts[1])),
+            };
+        }
+        // 符号/零扩展与位段插入
+        if (mnem == "sxtw" || mnem == "sxtb" || mnem == "sxth" || mnem == "uxtw"
+            || mnem == "uxtb" || mnem == "uxth")
+            && parts.len() >= 2
+            && is_reg(d)
+            && is_reg(parts[1])
+        {
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!("({} as {})", parts[1], mnem)),
+            };
+        }
+        if mnem == "ubfiz" && parts.len() >= 4 && is_reg(d) {
+            let lsb = parse_imm_i(parts[2]).unwrap_or(0);
+            let w = parse_imm_i(parts[3]).unwrap_or(0);
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!(
+                    "(({} & {mask:#x}) << {lsb})",
+                    parts[1]
+                )),
+            };
+        }
+        // cset dst, cond：条件成立取 1
+        if (mnem == "cset" || mnem == "csetm") && parts.len() >= 2 && is_reg(d) {
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!("({}) ? {} : 0", parts[1], if mnem == "csetm" { "-1" } else { "1" })),
+            };
+        }
+        // adr：把它当「取本地址」——x64/arm64 都用于取常量标签
+        if (mnem == "adr" || mnem == "adrp" || mnem == "lea") && parts.len() >= 2 && is_reg(d) {
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!("&{}", parts[1])),
+            };
+        }
+    }
     if mnem == "brk" {
-        let n = parse_imm_i(ops).unwrap_or(0);
-        return Op::Other(format!("abort({n})"));
+        // Dart AOT 的 `brk #n` = 不可达/断言失败路径；它是**终止符**（不落入下一条），
+        // 把它当普通语句会造出一条假的落空边（结构化器因此误判汇合点）。
+        return Op::Abort(parse_imm_i(ops).unwrap_or(0));
+    }
+    // ---- 成对读写 stp/ldp：**栈基址**才是帧保存/恢复（纯簿记，合成注释）；
+    //      其它基址是真实的对象字段读写，照常出语句。----
+    if mnem == "stp" || mnem == "ldp" {
+        let base = mem_base(&ops);
+        let is_stack = matches!(base, Some(b) if b == rl.sp.as_str() || b == "SP" || b == "sp");
+        if is_stack {
+            return Op::Note(format!("frame: {ops}"));
+        }
+        // 3 段 = 两个寄存器 + 一个地址（`ldp x0, x1, [x19, #0x10]`）
+        let parts: Vec<&str> = split_operands(&ops);
+        let (regs, mem) = if parts.len() >= 3 {
+            (
+                format!("{}, {}", reg_name(parts[0].trim()), reg_name(parts[1].trim())),
+                parts[2].trim().to_string(),
+            )
+        } else if parts.len() == 2 {
+            // 少见的两段形式：目标寄存器列表已经在方括号里（`ldp x0, [x1], #16` 的后变址）
+            (
+                reg_name(parts[0].trim()),
+                parts[1].trim().to_string(),
+            )
+        } else {
+            return Op::Other(format!("{mnem} {ops}"));
+        };
+        if mnem.starts_with("stp") {
+            return Op::Store {
+                target: mem,
+                value: regs,
+            };
+        }
+        return Op::Assign {
+            dst: regs,
+            src: Expr::Mem(mem),
+        };
+    }
+    // ---- x64 帧簿记：push/pop（含 push rbp 的序言、pop rbp 的收尾）与对齐填充 ----
+    if matches!(mnem, "push" | "pop" | "int3" | "nop" | "endbr64" | "endbr32") {
+        return Op::Note(format!("frame/align: {mnem} {ops}").trim().to_string());
+    }
+    // ---- 屏障 ----
+    if mnem == "dmb" || mnem == "dsb" || mnem == "isb" {
+        return Op::Note(format!("barrier: {mnem} {ops}"));
+    }
+    // ---- 栈帧指针搬运：mov FP, SP / add FP, SP, #n 之外的 sp 调整 ----
+    if mnem == "sub" && ops.trim_start().starts_with("SP,") {
+        return Op::Note(format!("frame: {ops}"));
+    }
+    if mnem == "add" && ops.trim_start().starts_with("SP,") {
+        return Op::Note(format!("frame: {ops}"));
     }
     // ---- 负号/取反 ----
     if mnem == "neg" || mnem == "mvn" {
@@ -456,6 +675,35 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
                 src: Expr::Text(format!("-{}", reg_name(&rest))),
             };
         }
+    }
+    // ---- x64 零/符号扩展：movzx dst, byte ptr [..] 等 ----
+    if mnem.starts_with("movzx") || mnem.starts_with("movsx") {
+        let signed = mnem.starts_with("movsx");
+        let width = if ops.contains("byte") {
+            "u8"
+        } else if ops.contains("word") {
+            "u16"
+        } else {
+            "u32"
+        };
+        let w = if signed { width.replace('u', "i") } else { width.to_string() };
+        return Op::Assign {
+            dst: reg_name(&first),
+            src: Expr::Text(format!("({} as {w})", rest)),
+        };
+    }
+    // ---- movups/movdqu：与 mov 同形（向量寄存器搬运）----
+    if mnem.starts_with("movup") || mnem.starts_with("movdq") || mnem.starts_with("movap") {
+        if first.contains('[') {
+            return Op::Store {
+                target: first.clone(),
+                value: rest.trim().to_string(),
+            };
+        }
+        return Op::Assign {
+            dst: reg_name(&first),
+            src: Expr::Reg(reg_name(&rest)),
+        };
     }
     // ---- 写内存：arm64 str*/stur*，x64 mov [..], reg ----
     if (mnem.starts_with("str") || mnem.starts_with("stur")) && is_arm64 {
@@ -473,6 +721,119 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     }
     let _ = addr;
     Op::Other(format!("{mnem} {ops}").trim().to_string())
+}
+
+
+/// 把 arm64 的移位/扩展修饰折进操作数。
+/// `#0xa` + `lsl #12` → `0xa000`（两个都是立即数时直接算出来）；
+/// `x1` + `lsl #2` → `(x1 << 2)`；认不出的修饰原样保留成一个括注（不猜语义）。
+fn shift_operand(operand: &str, modifier: Option<&str>) -> Option<String> {
+    let Some(m) = modifier else {
+        return Some(operand.to_string());
+    };
+    let m = m.trim();
+    if m.is_empty() {
+        return Some(operand.to_string());
+    }
+    let mut it = m.split_whitespace();
+    let kind = it.next().unwrap_or("");
+    let amount = it.next().and_then(parse_imm_i);
+    match (kind, amount) {
+        ("lsl", Some(n)) | ("lsr", Some(n)) | ("asr", Some(n)) => {
+            if let Some(v) = parse_imm_i(operand) {
+                // 立即数 + 常量移位：直接给出折叠后的值（硬件语义是精确的）
+                let folded = match kind {
+                    "lsl" => v.wrapping_shl(n as u32),
+                    "lsr" => ((v as u64) >> n) as i64,
+                    _ => v >> n,
+                };
+                return Some(format!("{folded:#x}"));
+            }
+            let sym = match kind {
+                "lsl" => "<<",
+                "lsr" => ">>",
+                _ => ">>" ,
+            };
+            Some(format!("({operand} {sym} {n})"))
+        }
+        ("uxtw" | "sxtw" | "uxtb" | "sxtb" | "uxth" | "sxth", amt) => {
+            let tail = amt.map(|n| format!(" #{n}")).unwrap_or_default();
+            Some(format!("({operand} {kind}{tail})"))
+        }
+        _ => Some(format!("({operand} {m})")),
+    }
+}
+
+/// 条件取反：只翻转**认得出的比较关系**，其余用 `!(...)` 包裹（不猜语义）。
+fn negate_cond(c: &str) -> String {
+    // 两字符关系先判，避免 `<=` 被 `<` 抢先匹配
+    const NEG: &[(&str, &str)] = &[
+        (" == ", " != "),
+        (" != ", " == "),
+        (" <= ", " > "),
+        (" >= ", " < "),
+        (" < ", " >= "),
+        (" > ", " <= "),
+    ];
+    let t = c.trim();
+    if let Some(inner) = t.strip_prefix("!(").and_then(|x| x.strip_suffix(')')) {
+        return inner.to_string();
+    }
+    for (a, b) in NEG {
+        if t.contains(a) {
+            return t.replacen(a, b, 1);
+        }
+    }
+    format!("!({t})")
+}
+
+/// 栈基址内存操作数 → `local_<offset>`：`[FP, #-8]`/`[SP, #0x10]` 是帧内局部槽，
+/// 用 `mem([FP, #-8])` 表达读起来像指针解引用，实际是**局部变量**。
+/// 非栈基址（`[x0, #7]` = 堆对象字段）保持原样——不猜语义。
+fn pretty_mem(operand: &str) -> String {
+    let t = operand.trim();
+    if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        let inner = inner.trim_end_matches('!').trim();
+        let parts = split_operands(inner);
+        let base = parts.first().map(|x| x.trim()).unwrap_or("");
+        if (base == "FP" || base == "SP") && parts.len() == 2 {
+            let off = parts[1].trim().trim_start_matches('#');
+            let sign = if off.starts_with('-') { "" } else { "+" };
+            let mag = off.trim_start_matches('-').trim_start_matches("0x");
+            return format!("local_{sign}{mag}");
+        }
+    }
+    format!("mem({t})")
+}
+
+/// 取内存操作数的基址寄存器：`[SP, #0x10]!` → `SP`；`x0` → None。
+fn mem_base(ops: &str) -> Option<&str> {
+    let l = ops.find('[')?;
+    let rest = &ops[l + 1..];
+    let end = rest
+        .find(|c| c == ',' || c == ']')
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+/// 按顶层逗号切操作数，**不切方括号内**的逗号（`stp x0, x1, [SP, #0x10]` → 3 段）。
+fn split_operands(ops: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in ops.char_indices() {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&ops[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&ops[start..]);
+    out
 }
 
 /// 立即数（`#1` / `#-0x10` / `0x20` / 十进制都认）。**只解析，不猜类型。**
@@ -566,7 +927,9 @@ fn build_blocks(stmts: Vec<Stmt>) -> Vec<Block> {
                     }
                 }
             }
-            Some(Op::Return { .. }) => {}
+            Some(Op::Return { .. }) | Some(Op::Abort(_)) => {}
+            // brk 也是终止符：不再造落空边（否则结构化器会把它当普通语句，
+            // 并为「陷阱之后的字节」连出一条不存在的后续）
             _ => {
                 if let Some(nx) = next {
                     blocks[i].succs.push((None, nx));
@@ -590,11 +953,19 @@ fn emit_function(
 ) {
     let mut s = Structurer::new(blocks, rl.clone());
     let nodes = s.seq(0, None);
+    let reason = s.reason.clone();
     let mut unstructured = s.unstructured;
     let mut body = String::new();
     render_nodes(&nodes, 0, &mut body, &mut unstructured);
     if unstructured {
         *fallback += 1;
+        if std::env::var("DART_AOT_DEC_REASON").is_ok() {
+            eprintln!(
+                "[dec-reason] {} {}",
+                if reason.is_empty() { "goto-emitted" } else { &reason },
+                name
+            );
+        }
     } else {
         *structured += 1;
     }
@@ -607,7 +978,7 @@ fn emit_function(
     if unstructured {
         let _ = writeln!(
             out,
-            "// NOTE: control flow was not fully structured (goto kept) — pseudocode only."
+            "// NOTE: control flow was not fully structured (goto kept) -- pseudocode only."
         );
     }
     let _ = writeln!(out, "dynamic {name}() {{");
@@ -631,6 +1002,37 @@ fn emit_function(
     out.push_str("}\n");
 }
 
+
+/// 单个函数的原始反汇编文本（寄存器已按框架名替换、分支目标归一化）。
+/// `disasm` 子命令在非 arm64 平台用它（arm64 走 asm.rs 的带 IL 分组版本）。
+pub fn disasm_text(
+    analyzer: &Analyzer,
+    entry: u64,
+    csize: u64,
+    foff: u64,
+) -> Result<String, String> {
+    let is_arm64 = analyzer.platform.arch == "arm64";
+    let rl = roles(analyzer);
+    let cs = build_cs(is_arm64)?;
+    if foff as usize + csize as usize > analyzer.data.len() {
+        return Err("函数字节超出文件范围".to_string());
+    }
+    let code = &analyzer.data[foff as usize..(foff + csize) as usize];
+    let insns = cs
+        .disasm_all(code, entry)
+        .map_err(|e| format!("反汇编失败: {e}"))?;
+    let mut out = String::with_capacity(insns.len() * 48);
+    for ins in insns.iter() {
+        let mnem = ins.mnemonic().unwrap_or("");
+        let ops = mask_regs(&rl, ins.op_str().unwrap_or(""));
+        let _ = writeln!(out, "  {:#x}: {mnem:<12} {ops}", ins.address());
+    }
+    if out.is_empty() {
+        // 一个字节都解不出来时如实说明（例如整段都是填充）
+        let _ = writeln!(out, "  // 无法反汇编（{csize} 字节）");
+    }
+    Ok(out)
+}
 
 /// 建 capstone 实例。**开 skipdata**：遇到非指令字节（函数入口前的 0 填充、对齐
 /// padding）不中断整段反汇编，而是还原成 `.byte ..` 继续走——否则一个坏字节会让
@@ -664,21 +1066,61 @@ pub fn write(
     libs: &LibGroups,
     out_dir: &Path,
 ) -> Result<DecompileStats, String> {
+    let (files, stats) = render(analyzer, libs)?;
     let dir = out_dir.join("dart");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 dart 目录失败: {e}"))?;
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).map_err(|e| format!("写 dart 文件失败: {e}"))?;
+    }
+    Ok(stats)
+}
+
+/// 渲染但不落盘：返回 (文件名, 正文) 列表 + 统计。
+/// 子命令要往 stdout 出伪代码，落盘版本只是它的一层包装。
+pub fn render(
+    analyzer: &Analyzer,
+    libs: &LibGroups,
+) -> Result<(Vec<(String, String)>, DecompileStats), String> {
     let is_arm64 = analyzer.platform.arch == "arm64";
     let rl = roles(analyzer);
     let cs = build_cs(is_arm64)?;
 
+    let mut files: Vec<(String, String)> = Vec::new();
     let mut stats = DecompileStats {
         funcs: 0,
         blocks: 0,
         stmts: 0,
         structured: 0,
         fallback: 0,
+        unmapped: 0,
+        calls: 0,
+        calls_named: 0,
     };
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut used: BTreeMap<String, u32> = BTreeMap::new();
+    // 入口地址 → 显示名（与产物里的函数标题一致，首见生效），供 `bl` 目标命名
+    let mut names: BTreeMap<u64, String> = BTreeMap::new();
+    for (_lib, cls_map) in libs {
+        for (_cls, funcs) in cls_map {
+            for f in funcs {
+                if f.ep == 0 || names.contains_key(&f.ep) {
+                    continue;
+                }
+                let n = format!("{}_{}", _cls.replace(['.', ':'], "_"), f.mangled)
+                    .trim_start_matches('_')
+                    .to_string();
+                names.insert(f.ep, n);
+            }
+        }
+    }
+    // 指令表里所有入口都补一个名字：有 Code 对象但没解析出名字的（匿名闭包等）
+    // 用 `sub_0x...` 占位——`call 0x171018` 这种裸地址读起来无从下手，
+    // 而 `call sub_0x171018` 至少表明「这是一个函数入口，只是没有名字」。
+    for idx in 0..analyzer.pc_offsets.len() {
+        if let Some((ep, _)) = analyzer.code_range(idx) {
+            names.entry(ep).or_insert_with(|| format!("sub_{ep:#x}"));
+        }
+    }
     for (lib_name, cls_map) in libs {
         let mut file = if lib_name.is_empty() {
             "app".to_string()
@@ -703,7 +1145,7 @@ pub fn write(
         let mut of = String::new();
         let _ = writeln!(
             of,
-            "// dae decompiler output — pseudocode, not compilable Dart"
+            "// dae decompiler output -- pseudocode, not compilable Dart"
         );
         let _ = writeln!(of, "// library: {lib_name}");
         let _ = writeln!(
@@ -720,37 +1162,49 @@ pub fn write(
                 if f.ep == 0 || !seen.insert(f.ep) {
                     continue;
                 }
-                let csize = analyzer.code_size(f.idx);
-                if csize == 0 || f.idx >= analyzer.pc_offsets.len() {
+                let Some((entry, csize)) = analyzer.code_range(f.idx) else {
                     if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
                         eprintln!(
-                            "[dbg-dec] skip ep={:#x} cls={:?} m={} idx={} csize={}",
-                            f.ep, _cls, f.mangled, f.idx, csize
+                            "[dbg-dec] skip ep={:#x} cls={:?} m={} idx={}",
+                            f.ep, _cls, f.mangled, f.idx
                         );
                     }
                     continue;
-                }
-                let payload = analyzer.instr_base + analyzer.pc_offsets[f.idx];
-                let foff = payload + analyzer.slice_off;
+                };
+                let foff = entry + analyzer.slice_off;
                 if foff as usize + csize as usize > analyzer.data.len() {
                     continue;
                 }
                 let code = &analyzer.data[foff as usize..(foff + csize) as usize];
-                let (stmts, raw) = lift(&cs, analyzer, code, payload, is_arm64);
+                let (stmts, raw) = lift(&cs, analyzer, code, entry, is_arm64, &names);
                 if stmts.is_empty() {
                     if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
-                        eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} payload={payload:#x} csize={csize}", f.mangled, f.ep);
+                        eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} entry={entry:#x} csize={csize}", f.mangled, f.ep);
                     }
                     continue;
                 }
                 let blocks = build_blocks(stmts);
                 stats.stmts += blocks.iter().map(|b| b.stmts.len()).sum::<usize>();
                 stats.blocks += blocks.len();
+                for b in &blocks {
+                    for st in &b.stmts {
+                        match &st.op {
+                            Op::Other(_) => stats.unmapped += 1,
+                            Op::Call { target: Some(_), resolved, .. } => {
+                                stats.calls += 1;
+                                if resolved.is_some() {
+                                    stats.calls_named += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let name = format!("{}_{}", _cls.replace(['.', ':'], "_"), f.mangled)
                     .trim_start_matches('_')
                     .to_string();
                 if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
-                    eprintln!("[dbg-dec] emit ep={:#x} name={name}", f.ep);
+                    eprintln!("[dbg-dec] emit ep={:#x} entry={entry:#x} csize={csize} name={name}", f.ep);
                 }
                 emit_function(
                     &name,
@@ -765,9 +1219,9 @@ pub fn write(
             }
         }
         stats.funcs += cnt;
-        std::fs::write(dir.join(fname), of).map_err(|e| format!("写 dart 文件失败: {e}"))?;
+        files.push((fname, of));
     }
-    Ok(stats)
+    Ok((files, stats))
 }
 // ---------------------------------------------------------------- 控制流结构化
 //
@@ -794,6 +1248,18 @@ struct Structurer<'a> {
     in_loop: BTreeMap<usize, usize>,    // block idx → 所属循环头 idx
     done: BTreeSet<usize>,
     unstructured: bool,
+    /// 未结构化的**首个**原因（诊断用；一旦置位不再改写，便于归因统计）
+    reason: String,
+}
+
+impl Structurer<'_> {
+    /// 标记未结构化并记下首个原因
+    fn bail(&mut self, reason: &'static str) {
+        self.unstructured = true;
+        if self.reason.is_empty() {
+            self.reason = reason.to_string();
+        }
+    }
 }
 
 /// Cooper–Harvey–Kennedy 支配集迭代
@@ -887,6 +1353,7 @@ impl<'a> Structurer<'a> {
             in_loop,
             done: BTreeSet::new(),
             unstructured: false,
+            reason: String::new(),
         }
     }
 
@@ -906,7 +1373,7 @@ impl<'a> Structurer<'a> {
         let n = blk.stmts.len();
         let cut = matches!(
             self.term(b),
-            Some(Op::Branch { .. }) | Some(Op::Return { .. })
+            Some(Op::Branch { .. }) | Some(Op::Return { .. }) | Some(Op::Abort(_))
         ) as usize;
         let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], &self.rl);
         for s in &nested {
@@ -915,6 +1382,26 @@ impl<'a> Structurer<'a> {
             }
         }
         v
+    }
+
+    /// 该分支是否「自身终止」（沿路只走单后继、最终遇到 return/brk/区域外跳转）。
+    /// 用于 if-return 形状：`if (c) { return x; } <继续走另一支>`
+    fn terminates(&self, mut b: usize) -> bool {
+        for _ in 0..64 {
+            match self.term(b) {
+                Some(Op::Return { .. }) | Some(Op::Abort(_)) => return true,
+                Some(Op::Branch { cond: Some(_), .. }) => return false,
+                Some(Op::Branch { cond: None, target }) => match self.idx.get(&target) {
+                    Some(&t) if t != b => b = t,
+                    _ => return true, // 跳到函数外/自环：视为不落在区域内
+                },
+                _ => match self.succ(b, 0) {
+                    Some(n) if n != b => b = n,
+                    _ => return true,
+                },
+            }
+        }
+        false
     }
 
     /// 两个分支的最近公共汇合点（BFS 交替推进，遇到同一结点即汇合）
@@ -995,6 +1482,10 @@ impl<'a> Structurer<'a> {
                     }));
                     break;
                 }
+                Some(Op::Abort(n)) => {
+                    out.push(Node::Line(format!("abort(); // brk #{n:#x}")));
+                    break;
+                }
                 Some(Op::Branch { cond: Some(c), target }) => {
                     let t = self.idx.get(&target).copied();
                     let f = self.succ(b, 1);
@@ -1023,7 +1514,10 @@ impl<'a> Structurer<'a> {
                     }
                     match (t, f) {
                         (Some(ti), Some(fi)) => {
-                            if let Some(j) = self.find_join(ti, fi).filter(|j| Some(*j) != stop) {
+                            // 汇合点 == 区域终点也算合法菱形：两支各自走到区域末尾，
+                            // 只是不再有「汇合之后」的语句（历史实现把它排除掉，
+                            // 白白让 1/4 的 if/else 退回 goto）。
+                            if let Some(j) = self.find_join(ti, fi) {
                                 let then = self.seq(ti, Some(j));
                                 let els = self.seq(fi, Some(j));
                                 out.push(Node::If {
@@ -1031,10 +1525,32 @@ impl<'a> Structurer<'a> {
                                     then,
                                     els,
                                 });
+                                if Some(j) == stop {
+                                    break;
+                                }
                                 cur = Some(j);
+                            } else if self.terminates(ti) {
+                                // if-return 形状：true 支自身终止（return/brk/跳出区域），
+                                // 另一支继续——直接发射 `if (c) { 支 }` 并顺着 else 支走。
+                                let then = self.seq(ti, stop);
+                                out.push(Node::If {
+                                    cond: c.clone(),
+                                    then,
+                                    els: vec![],
+                                });
+                                cur = Some(fi);
+                            } else if self.terminates(fi) {
+                                // 镜像形状：else 支终止 → 取反后作为 then 发射
+                                let els = self.seq(fi, stop);
+                                out.push(Node::If {
+                                    cond: negate_cond(&c),
+                                    then: els,
+                                    els: vec![],
+                                });
+                                cur = Some(ti);
                             } else {
-                                // 汇合不了：只保留 true 支，其余退回 goto
-                                self.unstructured = true;
+                                // 真正不可归约：只保留 true 支，其余如实退回 goto
+                                self.bail("no-join:irreducible");
                                 out.push(Node::If {
                                     cond: c.clone(),
                                     then: self.seq(ti, stop),
@@ -1045,8 +1561,17 @@ impl<'a> Structurer<'a> {
                             }
                         }
                         _ => {
+                            if self.reason.is_empty() {
+                                self.reason = format!(
+                                    "target-out-of-function blk={:#x} target={target:#x} lo={:#x} hi={:#x} delta={}",
+                                    self.blocks[b].start,
+                                    self.blocks[0].start,
+                                    self.blocks.last().map(|x| x.start).unwrap_or(0),
+                                    target as i64 - self.blocks[0].start as i64
+                                );
+                            }
                             self.unstructured = true;
-                            out.push(Node::Line(format!("if ({c}) {{ /* 目标越界 */ }}")));
+                            out.push(Node::Line(format!("if ({c}) {{ /* target outside this function */ }}")));
                             break;
                         }
                     }
@@ -1068,8 +1593,13 @@ impl<'a> Structurer<'a> {
                         Some(ti) if !self.done.contains(&ti) => {
                             cur = Some(ti);
                         }
-                        _ => {
-                            self.unstructured = true;
+                        Some(_) => {
+                            self.bail("branch-to-done-block");
+                            out.push(Node::Goto(target));
+                            break;
+                        }
+                        None => {
+                            self.bail("branch-outside-function");
                             out.push(Node::Goto(target));
                             break;
                         }
@@ -1150,11 +1680,23 @@ fn render_nodes(nodes: &[Node], indent: usize, out: &mut String, unstructured: &
 fn render_op(op: &Op, addr: u64) -> Option<String> {
     match op {
         Op::Assign { dst, src } => Some(format!("{dst} = {}; // {addr:#x}", src.text())),
+        Op::Cmp => None,
+        Op::Note(t) => Some(format!("// {t} // {addr:#x}")),
+        Op::Abort(n) => Some(format!("abort(); // brk #{n:#x} @ {addr:#x}")),
         Op::Call {
-            dst, target, callee, ..
+            dst,
+            target,
+            callee,
+            resolved,
         } => {
             let call = match target {
-                Some(t) => format!("call 0x{t:x}"),
+                // 目标有名字就写名字（这是可读性的关键）；没名字的照实写地址
+                Some(t) => match resolved {
+                    // 名字本身就是地址（sub_0x...）时不再叠一遍注释
+                    Some(n) if n.as_str() == format!("sub_{t:#x}") => format!("call {n}"),
+                    Some(n) => format!("call {n} /* 0x{t:x} */"),
+                    None => format!("call 0x{t:x}"),
+                },
                 None => format!("callIndirect({callee})"),
             };
             Some(match dst {
@@ -1163,7 +1705,7 @@ fn render_op(op: &Op, addr: u64) -> Option<String> {
             })
         }
         Op::Store { target, value } => {
-            Some(format!("mem({}) = {value}; // {addr:#x}", target.trim()))
+            Some(format!("{} = {value}; // {addr:#x}", pretty_mem(target)))
         }
         Op::Branch { .. } | Op::Return { .. } => None,
         Op::Other(t) => Some(format!("// unmapped: {t} // {addr:#x}")),
@@ -1200,6 +1742,11 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
     };
     for st in stmts {
         match &st.op {
+            Op::Note(_) | Op::Abort(_) | Op::Other(_) | Op::Cmp => {
+                out.push(Stmt { addr: st.addr, op: st.op.clone() });
+                pending.clear();
+                continue;
+            }
             Op::Assign { dst, src } => {
                 let text = match src {
                     Expr::Reg(r) => pending
@@ -1211,9 +1758,9 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                     Expr::Mem(m) => {
                         let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
                         if d < NEST_MAX_DEPTH {
-                            format!("mem({})", subst_regs(m, &pending, rl))
+                            pretty_mem(&subst_regs(m, &pending, rl))
                         } else {
-                            format!("mem({m})")
+                            pretty_mem(m)
                         }
                     }
                     Expr::Text(x) => x.clone(),
@@ -1251,7 +1798,6 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                 flush(&mut pending, &mut out, st.addr);
                 out.push(st.clone());
             }
-            Op::Other(_) => out.push(st.clone()),
         }
     }
     flush(&mut pending, &mut out, stmts.last().map(|s| s.addr).unwrap_or(0));

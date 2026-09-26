@@ -49,7 +49,19 @@ fn t(name: &str, since: &mut std::time::Instant) {
     }
 }
 
+/// 全量导出（等价于空筛选的 `run_with`）
 pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String> {
+    run_with(analyzer, out_dir, &crate::selection::Selection::default())
+}
+
+/// 带筛选的导出：函数维度的产物（functions.txt / asm / dart / call_edges / callgraph.dot）
+/// 只保留命中项；对象层产物（pp/objs/strings/libs/classes/arrays/maps）是全局索引，始终完整
+/// —— 它们是「看有哪些东西」的依据，被筛掉反而没用。
+pub fn run_with(
+    analyzer: &Analyzer,
+    out_dir: &Path,
+    sel: &crate::selection::Selection,
+) -> Result<ExportSummary, String> {
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("无法创建输出目录 {}: {e}", out_dir.display()))?;
     std::fs::create_dir_all(out_dir.join("text"))
@@ -58,10 +70,10 @@ pub fn run(analyzer: &Analyzer, out_dir: &Path) -> Result<ExportSummary, String>
     let mut since = std::time::Instant::now();
     // r2 全量（含 dart: 内部库，保证反编译工具里 SDK 函数也有还原名）；
     // asm 聚焦应用代码（跳过 dart: 内部库，控制产物规模）。
-    let libs_r2 = analyzer.build_functions(true);
+    let libs_r2 = crate::selection::filter_libs(&analyzer.build_functions(true), sel);
     // asm 聚焦应用代码（跳过 dart: 内部库）；无 asm 特性时不需要这份
     #[cfg(feature = "asm")]
-    let libs_asm = analyzer.build_functions(false);
+    let libs_asm = crate::selection::filter_libs(&analyzer.build_functions(false), sel);
     let libs_ref = &libs_r2;
     #[cfg(feature = "asm")]
     let libs_asm_ref = &libs_asm;

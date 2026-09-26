@@ -28,12 +28,15 @@ pub struct CallGraphCounts {
 }
 
 /// 一条边/一个调用点
-struct Edge {
-    from: u64,
-    from_name: String,
-    kind: &'static str, // "direct" | "indirect"
-    to: Option<u64>,    // indirect 时为 None
-    to_text: String,    // 直接调用：目标地址文本；间接：操作数原文
+pub struct Edge {
+    /// 调用指令自身的地址（`callers` 用它定位调用点）
+    pub at: u64,
+    pub from: u64,
+    pub from_name: String,
+    pub kind: &'static str, // "direct" | "indirect"
+    pub to: Option<u64>,    // indirect 时为 None
+    /// 间接调用：操作数原文（寄存器/内存式）
+    pub to_text: String,
 }
 
 fn call_kind(mnem: &str) -> Option<&'static str> {
@@ -54,26 +57,14 @@ fn x86_direct_target(ops: &str) -> Option<u64> {
     u64::from_str_radix(h, 16).ok()
 }
 
-/// arm64 `bl 0x...` 的操作数就是立即数地址；`blr x8` 是寄存器。
-fn arm64_direct_target(ops: &str) -> Option<u64> {
-    let s = ops.trim().trim_start_matches('#');
-    let h = s.strip_prefix("0x")?;
-    let h = h.split(|c: char| !c.is_ascii_hexdigit()).next()?;
-    u64::from_str_radix(h, 16).ok()
-}
-
-pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<CallGraphCounts, String> {
-    let text_dir = out_dir.join("text");
-    std::fs::create_dir_all(&text_dir).map_err(|e| format!("创建 text 目录失败: {e}"))?;
-
-    // ep → 完整名（lib.Class.member），用于把调用目标落回名字
+/// ep → 完整名（`lib.Class.member`）。名字来自 Code 对象；指令表里没有名字的入口
+/// 用 `sub_0x...` 占位——与 dart/ 伪代码的命名口径一致，便于两边对照。
+pub fn name_map(analyzer: &Analyzer, libs: &LibGroups) -> BTreeMap<u64, String> {
     let mut name_of: BTreeMap<u64, String> = BTreeMap::new();
-    let mut plan: Vec<(u64, u64, u64, String)> = Vec::new(); // (ep, payload, csize, name)
-    let mut seen: BTreeSet<u64> = BTreeSet::new();
     for (lib_name, cls_map) in libs {
         for (cls_name, funcs) in cls_map {
             for f in funcs {
-                if f.ep == 0 || f.idx >= analyzer.pc_offsets.len() {
+                if f.ep == 0 {
                     continue;
                 }
                 let full = if cls_name.is_empty() {
@@ -81,25 +72,55 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
                 } else {
                     format!("{lib_name}.{cls_name}.{}", f.mangled)
                 };
-                name_of.entry(f.ep).or_insert_with(|| full.clone());
-                if !seen.insert(f.ep) {
+                name_of.entry(f.ep).or_insert(full);
+            }
+        }
+    }
+    for idx in 0..analyzer.pc_offsets.len() {
+        if let Some((ep, _)) = analyzer.code_range(idx) {
+            name_of.entry(ep).or_insert_with(|| format!("sub_{ep:#x}"));
+        }
+    }
+    name_of
+}
+
+/// 要扫描的函数计划：(ep, payload, csize, 完整名)，按 ep 去重且保持 libs 顺序。
+pub fn plan_functions(
+    analyzer: &Analyzer,
+    libs: &LibGroups,
+) -> Vec<(u64, u64, u64, String)> {
+    let mut plan: Vec<(u64, u64, u64, String)> = Vec::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    for (lib_name, cls_map) in libs {
+        for (cls_name, funcs) in cls_map {
+            for f in funcs {
+                if f.ep == 0 || f.idx >= analyzer.pc_offsets.len() || !seen.insert(f.ep) {
                     continue;
                 }
-                let csize = analyzer.code_size(f.idx);
-                if csize == 0 {
+                let Some((payload, csize)) = analyzer.code_range(f.idx) else {
+                    continue;
+                };
+                if payload as usize + csize as usize > analyzer.data.len() {
                     continue;
                 }
-                let payload = analyzer.instr_base + analyzer.pc_offsets[f.idx];
-                let foff = payload + analyzer.slice_off;
-                if foff as usize + csize as usize > analyzer.data.len() {
-                    continue;
-                }
+                let full = if cls_name.is_empty() {
+                    format!("{lib_name}.{}", f.mangled)
+                } else {
+                    format!("{lib_name}.{cls_name}.{}", f.mangled)
+                };
                 plan.push((f.ep, payload, csize, full));
             }
         }
     }
+    plan
+}
 
+/// 收集全部调用点（直接 + 间接）。`callers` 等查询子命令复用它。
+pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
+    let plan = plan_functions(analyzer, libs);
     let is_arm64 = analyzer.platform.arch == "arm64";
+    let data = analyzer.data;
+    let slice_off = analyzer.slice_off;
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -110,9 +131,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
         .step_by(chunk)
         .map(|b| (b, (b + chunk).min(plan.len())))
         .collect();
-
     let (tx, rx) = std::sync::mpsc::channel();
-    let data = analyzer.data;
     let plan_ref = &plan;
     std::thread::scope(|scope| {
         for (pi, &(b, e)) in ranges.iter().enumerate() {
@@ -133,7 +152,13 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
                         .build()
                 };
                 let cs = match cs {
-                    Ok(c) => c,
+                    Ok(mut c) => {
+                        if let Err(e) = c.set_skipdata(true) {
+                            let _ = tx.send((pi, Vec::new(), Some(format!("capstone skipdata: {e}"))));
+                            return;
+                        }
+                        c
+                    }
                     Err(e) => {
                         let _ = tx.send((pi, Vec::new(), Some(format!("capstone 初始化失败: {e}"))));
                         return;
@@ -141,7 +166,11 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
                 };
                 let mut out: Vec<Edge> = Vec::new();
                 for &(ep, payload, csize, ref fname) in &plan_ref[b..e] {
-                    let code = &data[payload as usize..(payload + csize) as usize];
+                    let foff = payload + slice_off;
+                    if foff as usize + csize as usize > data.len() {
+                        continue;
+                    }
+                    let code = &data[foff as usize..(foff + csize) as usize];
                     let Ok(insns) = cs.disasm_all(code, payload) else { continue };
                     for ins in insns.iter() {
                         let Some(mnem) = ins.mnemonic() else { continue };
@@ -158,6 +187,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
                             ("indirect", None)
                         };
                         out.push(Edge {
+                            at: ins.address(),
                             from: ep,
                             from_name: fname.clone(),
                             kind,
@@ -171,12 +201,8 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
         }
         drop(tx);
     });
-
     let mut parts: Vec<Option<Vec<Edge>>> = (0..ranges.len()).map(|_| None).collect();
-    for (pi, v, err) in rx {
-        if let Some(e) = err {
-            return Err(e);
-        }
+    for (pi, v, _err) in rx {
         parts[pi] = Some(v);
     }
     let mut edges: Vec<Edge> = Vec::new();
@@ -184,6 +210,26 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
         edges.extend(p);
     }
     edges.sort_by(|a, b| (a.from, a.to, a.to_text.clone()).cmp(&(b.from, b.to, b.to_text.clone())));
+    edges
+}
+
+/// arm64 `bl 0x...` 的操作数就是立即数地址；`blr x8` 是寄存器。
+fn arm64_direct_target(ops: &str) -> Option<u64> {
+    let s = ops.trim().trim_start_matches('#');
+    let h = s.strip_prefix("0x")?;
+    let h = h.split(|c: char| !c.is_ascii_hexdigit()).next()?;
+    u64::from_str_radix(h, 16).ok()
+}
+
+pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<CallGraphCounts, String> {
+    let text_dir = out_dir.join("text");
+    std::fs::create_dir_all(&text_dir).map_err(|e| format!("创建 text 目录失败: {e}"))?;
+
+    let name_of = name_map(analyzer, libs);
+    let n_funcs = plan_functions(analyzer, libs).len();
+
+    let is_arm64 = analyzer.platform.arch == "arm64";
+    let edges = collect_edges(analyzer, libs);
 
     // ---- 分配 stub 命名 ----
     // 直接目标里相当一部分是「每类分配 stub」：它们没有 Function 包装，因此不在
@@ -271,7 +317,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
         .map_err(|e| format!("写 callgraph.dot 失败: {e}"))?;
 
     Ok(CallGraphCounts {
-        funcs: plan.len(),
+        funcs: n_funcs,
         direct: n_direct,
         edges_resolved: n_resolved,
         indirect: n_indirect,

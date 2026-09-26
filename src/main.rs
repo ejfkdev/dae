@@ -6,26 +6,26 @@
 use dae::analyzer::Analyzer;
 use dae::export;
 use dae::platform;
-use dae::profile::{
-    parse_platform, parse_sdk, PlatformProfile, SdkProfile,
-};
+use dae::profile::{parse_sdk, PlatformProfile, SdkProfile};
 use std::path::PathBuf;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const PLATFORM_MACHO_ARM64: &str = include_str!("../profiles/platform/macho-arm64.json");
-const PLATFORM_ELF_ARM64: &str = include_str!("../profiles/platform/elf-arm64.json");
-const PLATFORM_ELF_X64: &str = include_str!("../profiles/platform/elf-x64.json");
-const PLATFORM_MACHO_X64: &str = include_str!("../profiles/platform/macho-x64.json");
-const PLATFORM_PE_X64: &str = include_str!("../profiles/platform/pe-x64.json");
-const PLATFORM_PE_ARM64: &str = include_str!("../profiles/platform/pe-arm64.json");
 
 fn main() {
     let lang = dae::locale::detect();
     let s = dae::locale::messages(lang);
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 渐进式模式：`dae <子命令> ...`（见 src/cli.rs）。判定只看第一个参数是否是已知
+    // 子命令名——本机文件恰好同名时写 `./info` 即可落回全量导出。
+    if let Some(first) = args.first() {
+        if dae::cli::is_subcommand(first) {
+            std::process::exit(dae::cli::dispatch(&args, lang, &s));
+        }
+    }
     let mut positional: Vec<String> = Vec::new();
+    let mut sel = dae::selection::Selection::default();
     let mut sdk_override: Option<PathBuf> = None;
     let mut platform_override: Option<PathBuf> = None;
     let mut decompile = false;
@@ -52,6 +52,34 @@ fn main() {
                 decompile = true;
                 i += 1;
             }
+            "--lib" => {
+                if i + 1 >= args.len() {
+                    eprintln!("--lib 需要一个取值");
+                    std::process::exit(2);
+                }
+                sel.libs.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--class" => {
+                if i + 1 >= args.len() {
+                    eprintln!("--class 需要一个取值");
+                    std::process::exit(2);
+                }
+                sel.classes.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--func" => {
+                if i + 1 >= args.len() {
+                    eprintln!("--func 需要一个取值");
+                    std::process::exit(2);
+                }
+                sel.funcs.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--fuzzy" => {
+                sel.fuzzy = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 print_help(&s);
                 std::process::exit(0);
@@ -73,125 +101,40 @@ fn main() {
     let bin = &positional[0];
     let out = &positional[1];
 
-    if let Err(e) = run(bin, out, sdk_override.as_deref(), platform_override.as_deref(), decompile, &s) {
+    if let Err(e) = run(
+        bin,
+        out,
+        sdk_override.as_deref(),
+        platform_override.as_deref(),
+        decompile,
+        &sel,
+        &s,
+    ) {
         eprintln!("{}: {e}", s.err_prefix);
         std::process::exit(1);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     bin: &str,
     out: &str,
     sdk_override: Option<&std::path::Path>,
     platform_override: Option<&std::path::Path>,
     decompile: bool,
+    sel: &dae::selection::Selection,
     s: &dae::locale::Messages,
 ) -> Result<(), String> {
     let since = std::time::Instant::now();
-    let bin_path = resolve_binary(bin, s)?;
+    let bin_path = dae::cli::resolve_binary(bin, s)?;
     let data = std::fs::read(&bin_path)
         .map_err(|e| format!("{} {bin_path}: {e}", s.err_read_binary))?;
     if std::env::var("DART_AOT_TIMINGS").is_ok() {
         eprintln!("[timing] 读文件({} MB): {:?}", data.len() >> 20, since.elapsed());
     }
 
-    // 平台 Profile：显式覆盖或按容器+架构自动选择
-    let plat_storage;
-    let platform: PlatformProfile = if let Some(p) = platform_override {
-        let c = std::fs::read_to_string(p).map_err(|e| format!("{}{e}", s.err_read_platform))?;
-        plat_storage = parse_platform(&c)?;
-        plat_storage
-    } else {
-        let kind = platform::detect_container(&data).ok_or_else(|| {
-            // 裸 JIT 快照（app-jit）以 kMessageMagic（dc dc f6 f6）打头，无容器
-            if data.len() >= 4 && data[..4] == [0xdc, 0xdc, 0xf6, 0xf6] {
-                s.err_bare_jit.to_string()
-            } else {
-                s.err_container.to_string()
-            }
-        })?;
-        let arch = match kind {
-            "macho" => {
-                let slice = platform::macho::fat_slice_offset(&data);
-                if slice + 8 > data.len() {
-                    None
-                } else {
-                    let cputype =
-                        u32::from_le_bytes(data[slice + 4..slice + 8].try_into().unwrap());
-                    match cputype {
-                        0x0100_000C => Some("arm64"),
-                        0x0100_0007 => Some("x64"),
-                        0x0000_000C => Some("arm"),
-                        _ => None,
-                    }
-                }
-            }
-            "elf" => {
-                let m = u16::from_le_bytes([data[18], data[19]]);
-                match m {
-                    62 => Some("x64"),
-                    183 => Some("arm64"),
-                    40 => Some("arm"),
-                    243 => Some("riscv"),
-                    _ => None,
-                }
-            }
-            "pe" => {
-                let lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
-                if lfanew + 6 > data.len() {
-                    None
-                } else {
-                    match u16::from_le_bytes(data[lfanew + 4..lfanew + 6].try_into().unwrap()) {
-                        0x8664 => Some("x64"),
-                        0xAA64 => Some("arm64"),
-                        0x014C => Some("x86"),
-                        0x01C0 => Some("arm"),
-                        _ => None,
-                    }
-                }
-            }
-            _ => None,
-        };
-        match (kind, arch) {
-            ("macho", Some("arm64")) => {
-                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
-                PARSED
-                    .get_or_init(|| parse_platform(PLATFORM_MACHO_ARM64).expect("内嵌平台 profile 损坏"))
-            }
-            ("elf", Some("arm64")) => {
-                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
-                PARSED
-                    .get_or_init(|| parse_platform(PLATFORM_ELF_ARM64).expect("内嵌平台 profile 损坏"))
-            }
-            ("elf", Some("x64")) => {
-                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
-                PARSED
-                    .get_or_init(|| parse_platform(PLATFORM_ELF_X64).expect("内嵌平台 profile 损坏"))
-            }
-            ("macho", Some("x64")) => {
-                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
-                PARSED
-                    .get_or_init(|| parse_platform(PLATFORM_MACHO_X64).expect("内嵌平台 profile 损坏"))
-            }
-            ("pe", Some("x64")) => {
-                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
-                PARSED
-                    .get_or_init(|| parse_platform(PLATFORM_PE_X64).expect("内嵌平台 profile 损坏"))
-            }
-            ("pe", Some("arm64")) => {
-                static PARSED: std::sync::OnceLock<PlatformProfile> = std::sync::OnceLock::new();
-                PARSED
-                    .get_or_init(|| parse_platform(PLATFORM_PE_ARM64).expect("内嵌平台 profile 损坏"))
-            }
-            _ => {
-                return Err(format!(
-                    "container {kind} arch {arch:?}: {}",
-                    s.err_platform_missing
-                ));
-            }
-        }
-        .clone()
-    };
+    // 平台 Profile：显式覆盖或按容器+架构自动选择（与渐进式子命令共用同一份逻辑）
+    let platform: PlatformProfile = dae::cli::resolve_platform(&data, platform_override, s)?;
 
     // 快照偏移定位（自动识别与解析共用同一份结果）
     let (snap_offs, used_fallback) = platform::locate_snapshots(&data, &platform)?;
@@ -265,7 +208,21 @@ fn run(
     let out_abs = std::path::absolute(out)
         .map_err(|e| format!("解析输出目录绝对路径 {out}: {e}"))?;
     let out_display = out_abs.display().to_string();
-    let summary = export::run(&analyzer, &out_abs)?;
+    let filtered_libs = dae::selection::filter_libs(&analyzer.build_functions(true), sel);
+    if !sel.is_empty() {
+        let (nl, nc, nf) = dae::selection::counts(&filtered_libs);
+        if nf == 0 {
+            return Err(format!(
+                "{}（筛选后库 0 / 类 0 / 函数 0）",
+                s.err_no_match
+            ));
+        }
+        println!(
+            "{}: {} {}, {} {}, {} {}",
+            s.target_label, nl, s.sum_libs, nc, s.sum_classes, nf, s.sum_funcs
+        );
+    }
+    let summary = export::run_with(&analyzer, &out_abs, sel)?;
     println!("{} {}:", s.export_done, out_display);
     println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
     println!("  ida_script/addNames.py    {} {}", summary.ida_functions, s.sum_ida);
@@ -291,11 +248,21 @@ fn run(
     if decompile {
         #[cfg(feature = "asm")]
         {
-            let libs = analyzer.build_functions(true);
-            let st = dae::decompiler::write(&analyzer, &libs, &out_abs)?;
+            let st = dae::decompiler::write(&analyzer, &filtered_libs, &out_abs)?;
             println!(
-                "  dart/                     {} {}（{} 基本块 / {} 语句；{} 已结构化，{} 未结构化）",
-                st.funcs, s.sum_dart, st.blocks, st.stmts, st.structured, st.fallback
+                "  dart/                     {} {}（{} 基本块 / {} 语句；{} 已结构化，{} 未结构化；{} {} 行；{} {}，{} {}）",
+                st.funcs,
+                s.sum_dart,
+                st.blocks,
+                st.stmts,
+                st.structured,
+                st.fallback,
+                st.unmapped,
+                s.sum_unmapped,
+                st.calls,
+                s.sum_calls,
+                st.calls_named,
+                s.sum_named
             );
         }
         #[cfg(not(feature = "asm"))]
@@ -329,7 +296,9 @@ fn print_help(s: &dae::locale::Messages) {
         println!("dae {} — Dart AOT 快照调试信息静态导出工具（支持 Dart 2.7–3.14β；Mach-O/ELF/PE，x64/arm64）", env!("GIT_VERSION"));
         println!("https://github.com/ejfkdev/dae");
         println!();
-        println!("用法: dae <binary> <out_dir> [选项]");
+        println!("用法: dae <binary> <out_dir> [选项]        # 全量或筛选导出");
+        println!("      dae <子命令> <binary> [选项]        # 渐进式：先查清单，再定点反编译");
+        println!("                                          （dae help 看全部子命令）");
         println!();
         println!("参数:");
         println!("  <binary>              目标二进制（Mach-O/ELF/PE，含 Dart AOT 快照）");
@@ -340,6 +309,11 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，按版本指纹自动识别）");
         println!("  --platform-profile PATH 强制指定平台 Profile（默认: 按容器+架构自动选择）");
         println!("  --decompile            额外产出 dart/ 伪 Dart（实验性：已做 if/else 与循环结构化）");
+        println!("  --lib PATTERN          只导出这些库（可重复；库名前缀即整个包）");
+        println!("  --class PATTERN        只导出这些类（可重复）");
+        println!("  --func PATTERN         只导出这些函数（可重复，可写 Class.method）");
+        println!("  --fuzzy                上面三个模式串改为子串匹配（默认精确）");
+        println!();
         println!("  -h, --help            显示此帮助");
         println!("  -V, --version         显示版本");
         println!();
@@ -360,7 +334,10 @@ fn print_help(s: &dae::locale::Messages) {
         println!("dae {} — static Dart AOT snapshot debug-info exporter (Dart 2.7–3.14β; Mach-O/ELF/PE, x64/arm64)", env!("GIT_VERSION"));
         println!("https://github.com/ejfkdev/dae");
         println!();
-        println!("usage: dae <binary> <out_dir> [options]");
+        println!("usage: dae <binary> <out_dir> [options]        # full or filtered export");
+        println!("       dae <subcommand> <binary> [options]     # progressive: list first, then");
+        println!("                                               decompile one class/library");
+        println!("                                               (`dae help` lists every subcommand)");
         println!();
         println!("arguments:");
         println!("  <binary>              target binary (Mach-O/ELF/PE with a Dart AOT snapshot);");
@@ -371,8 +348,15 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected by version fingerprint)");
         println!("  --platform-profile PATH force a platform profile (default: auto by container + arch)");
         println!("  --decompile            also emit dart/ pseudocode (experimental; if/else + loops structured)");
+        println!("  --lib PATTERN          export only these libraries (repeatable; a prefix = whole package)");
+        println!("  --class PATTERN        export only these classes (repeatable)");
+        println!("  --func PATTERN         export only these functions (repeatable; Class.method works)");
+        println!("  --fuzzy                make the three patterns substring matches (default: exact)");
         println!("  -h, --help            show this help");
         println!("  -V, --version         show version");
+        println!();
+        println!("progressive (writes no full export): dae info | libs | classes | functions |");
+        println!("  strings | largest | callers | disasm | getclass | getmethod | getlib -- see `dae help`");
         println!();
         println!("outputs:");
         println!("  ida_script/    IDA naming script + struct header (addNames.py / ida_dart_struct.h)");
@@ -388,28 +372,4 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  dae App.app out/");
         println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
     }
-}
-
-/// 智能路径解析：如果输入是 .app 目录，自动查找 Flutter 二进制。
-fn resolve_binary(path: &str, s: &dae::locale::Messages) -> Result<String, String> {
-    let p = std::path::Path::new(path);
-    if p.is_dir() {
-        // macOS Flutter: xxx.app/Contents/Frameworks/App.framework/App
-        let candidates = vec![
-            p.join("Contents/Frameworks/App.framework/App"),
-            p.join("Frameworks/App.framework/App"),
-            p.join("App"),
-        ];
-        for c in &candidates {
-            if c.is_file() {
-                return Ok(c.to_string_lossy().to_string());
-            }
-        }
-        return Err(format!(
-            "{} {path}（{}）",
-            s.err_flutter_dir,
-            candidates.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join(", ")
-        ));
-    }
-    Ok(path.to_string())
 }

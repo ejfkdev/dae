@@ -95,6 +95,13 @@ pub struct Messages {
     pub sum_cg_i: &'static str,
     pub sum_cg_r: &'static str,
     pub sum_dart: &'static str,
+    pub sum_unmapped: &'static str,
+    pub sum_calls: &'static str,
+    pub sum_named: &'static str,
+    /// 筛选（--lib/--class/--func）后一个都没命中
+    pub err_no_match: &'static str,
+    /// 渐进式子命令的段标题
+    pub q_list_hint: &'static str,
 }
 
 pub fn messages(lang: Lang) -> Messages {
@@ -156,6 +163,17 @@ pub fn messages(lang: Lang) -> Messages {
         sum_cg_i: p("个间接调用", "indirect calls"),
         sum_cg_r: p("条解析到名字", "resolved"),
         sum_dart: p("个函数伪代码", "function pseudocode blocks"),
+        sum_unmapped: p("未映射", "unmapped"),
+        sum_calls: p("个直接调用", "direct calls"),
+        sum_named: p("已命名", "named"),
+        err_no_match: p(
+            "筛选条件没有命中任何函数（可先用 `dae libs` / `dae classes` 查清单）",
+            "the filter matched no function (try `dae libs` / `dae classes` first)",
+        ),
+        q_list_hint: p(
+            "渐进式查询：`dae help` 看全部子命令",
+            "progressive queries: `dae help` lists every subcommand",
+        ),
     }
 }
 

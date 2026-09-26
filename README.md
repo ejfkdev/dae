@@ -18,6 +18,9 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
 - **Self-contained & auto-detecting** — all 26 SDK profiles are embedded; the Dart version is matched by snapshot hash, with a structural-probe fallback for custom/Flutter-engine builds.
 - **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference).
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
+- **Progressive mode** — `dae libs` / `classes` / `functions` / `strings` / `callers` to query the
+  snapshot like a database, then `dae getclass` / `getmethod` / `getlib` to decompile just that
+  one thing (`dae info` 0.03 s vs 1.9 s for a full export). See [Progressive mode](#progressive-mode-list-first-decompile-one-thing).
 - **Zero dependencies** — parses Mach-O/ELF/PE directly.
 
 ## Install
@@ -38,6 +41,7 @@ macOS prebuilt binaries are ad-hoc signed; if Gatekeeper blocks the first run: `
 ```bash
 dae <binary> <out_dir>                    # auto-detect the Dart version
 dae <binary> <out_dir> --sdk-profile P.json   # or force one
+dae help                                  # progressive subcommands (list, then decompile one)
 ```
 
 ```console
@@ -108,35 +112,94 @@ Three layers; the engine is version-invariant, versions add configuration only:
 
 Spec: [`docs/PROFILES.md`](docs/PROFILES.md)
 
+## Progressive mode (list first, decompile one thing)
+
+A full export writes thousands of files; often you only want one class or one package.
+Query first, decompile surgically (`dae help` has every option):
+
+```
+dae info      <binary>                        snapshot, SDK, sizes -- writes nothing
+dae libs      <binary> [pattern]              libraries (packages) with class/function counts
+dae classes   <binary> [pattern] [--lib P]    classes
+dae functions <binary> [pattern] [--lib P]    functions (entry, size, owner)
+dae strings   <binary> [-f TEXT]              snapshot string table
+dae largest   <binary> [-n N]                 biggest functions by code size
+dae callers   <binary> <NAME|0xADDR>          who calls it (static direct-call edges)
+dae disasm    <binary> <CLASS[.method]>       raw disassembly (arm64 keeps the IL comments)
+dae getclass  <binary> <CLASS>                decompile just this class
+dae getmethod <binary> <CLASS.method>         decompile just this method
+dae getlib    <binary> <LIB>                  decompile just this library (package)
+```
+
+Conventions, chosen so the commands compose:
+
+- **stdout is the data channel.** Query results and `get*` pseudocode go to stdout with no
+  stats or timing mixed in; every diagnostic (target, SDK profile, warnings, counts) goes to
+  stderr, so `dae getclass app.apk Foo | less` and `dae classes app.apk > index.tsv` just work.
+  `-o FILE` writes to a file instead; `get*` with `-o FILE.dart` merges into one file and
+  `-o DIR` writes the same `<DIR>/dart/<lib>.dart` layout as a full export.
+- **Names you can guess.** A library can be written three ways — the `lib` column of
+  `functions.txt` (`testing_app$screens$home`), the URL from `libs.txt`
+  (`package:testing_app/screens/home.dart`), or the artifact file name
+  (`testing_app_screens_home`) — and library names match by **prefix**, so
+  `getlib testing_app` is the whole package. Classes are exact (case-insensitive fallback);
+  add `--fuzzy` for substring. Functions accept `Class.method`, a bare member, or the
+  artifact-style `Class_method` you just copied out of the output.
+- A miss is actionable: `getclass HomePag` suggests real names instead of silently doing nothing.
+- `--lib/--class/--func` also work on the full export, giving a **filtered** export: the
+  function-scoped artifacts (`functions.txt`, `asm/`, `dart/`, `call_edges.txt`,
+  `callgraph.dot`) shrink to the selection, while the object-layer dumps (`pp`, `objs`,
+  `strings`, `libs`, `classes`, `arrays`, `maps`) stay complete because they are the index you
+  pick from.
+
+Cost, measured on a real Flutter app (10,245 functions): a full `--decompile` export takes
+1.9s and writes ~1000 files; `dae info` / `dae getclass Foo` take 0.03s, `dae disasm` 0.05s,
+and `dae callers` (the one query that disassembles every function) 0.18s. Snapshot parsing
+itself is ~50ms — what progressive mode saves is the writing.
+
 ## Decompiler (experimental)
 
 `dae --decompile` adds `dart/<library>.dart`: one pseudocode function per named function,
 lifted from the disassembly through the same pipeline shape the sibling tools use
 (machine-specific lift → basic blocks → emission).
 
-What it does today: real comparison conditions folded from `cmp`/`test` + the branch
-(`if (rdx < 2)`), framework register names (`PP`/`THR`/`SP`/`FP`) including inside memory
-operands, named direct call targets, and the raw disassembly kept as a comment block above
-each function so the output stays checkable.
+What it does today:
+
+- Real comparison conditions folded from `cmp`/`fcmp`/`test` + the branch (`if (rdx < 2)`).
+- Framework register names (`PP`/`THR`/`SP`/`FP`, plus each platform's `register_aliases`) —
+  including inside memory operands.
+- Named direct call targets (`call router`), and `sub_0x...` for entries with no name.
+- Stack slots rendered as locals (`local_8`), frame save/restore and barriers kept as
+  `// frame:` / `// barrier:` comments, and the raw disassembly kept above each function so
+  the output stays checkable.
 
 Control flow is **structured**: dominators give the natural loops (back edge = header
-dominates its tail), then each region is emitted recursively — a conditional branch whose
-two arms rejoin becomes `if/else`, a loop header becomes `while`, and an arm that leaves the
-loop becomes `break`/`continue`. Roughly 60% of functions come out fully structured; the
-rest keep a `goto` and are marked with a `NOTE` header so a reader knows which files are
-pseudocode rather than Dart.
+dominates its tail), then each region is emitted recursively — a conditional branch whose two
+arms rejoin becomes `if/else`, `join == region end` counts as a valid diamond, an arm that
+returns becomes `if (c) { return ... }`, a loop header becomes `while`, and an arm that leaves
+the loop becomes `break`/`continue`. 87–92% of functions come out fully structured on the
+corpora we gate on; the rest keep a `goto` and are marked with a `NOTE` header, so a reader
+knows which files are pseudocode rather than Dart.
 
-What it does **not** do yet: expression nesting (`mem(qword ptr [FP + 8])` stays flat rather
-than composing into field reads), and type recovery. Unrecognised instructions are emitted
-verbatim as `// unmapped:` rather than approximated.
+What it does **not** do yet: cross-block expression composition beyond a few levels, and type
+recovery. Unrecognised instructions are emitted verbatim as `// unmapped:` rather than
+approximated, and the count is printed in the run summary — treat it as the quality dial.
 
-A shape gate runs on every change (`tests/decompiler_shape.rs`): braces must balance in every
+A gate runs on every change (`tests/decompiler_shape.rs`): braces must balance in every
 emitted file — an unbalanced file means a branch was silently dropped — every in-function
-statement must terminate, and the structured rate has a floor.
+statement must terminate, the structured rate has a floor, and **addresses must be
+self-consistent** (function ends look like terminators, direct calls land on function
+entries). That last gate exists because an address-location bug on appended Mach-O snapshots
+once made the decompiler read the wrong bytes while every name-based metric stayed green.
 
 ## Known limitations
 
 - Addresses are file-offset space, not runtime VAs (matches the blutter reference)
+- The snapshot/instructions sections are located in three layers: symbols (`kDartVm*` /
+  single-snapshot `kDartSnapshot*`) → the Mach-O `LC_NOTE __dart_app_snap` appended blob
+  (`dart compile exe`, some Flutter builds) → a magic-number scan inside the analysed slice.
+  If only the last layer succeeds, instruction-section addresses are unavailable and dae says
+  so; the address-dependent artifacts are then object-layer only
 - `asm/` IL comments are arm64-only (x64 disassembly is emitted)
 - Call graph: indirect calls (`blr` / `call reg`) stay unresolved by design — their targets
   are computed at runtime. Direct targets land on a name when the target is an exported

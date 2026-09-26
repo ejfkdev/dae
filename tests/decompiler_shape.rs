@@ -12,13 +12,41 @@ use dae::analyzer::Analyzer;
 use dae::profile::{parse_platform, parse_sdk, PlatformProfile, SdkProfile};
 use std::path::Path;
 
+/// 从操作数文本里取第一个 `0x...`（arm64 写作 `bl #0x1234`、x64 写作 `call 0x1234`）。
+fn first_hex(s: &str) -> Option<u64> {
+    let i = s.find("0x")?;
+    let hex: String = s[i + 2..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(&hex, 16).ok()
+}
+
 /// 结构化率下限（直线函数也算结构化）。
 ///
 /// 这个数字随 lift 覆盖面变化，**不是越高越好**：lift 认不出的分支（曾经的 cbz/tbz/csel）
 /// 会退化成 `Other`，块里就没有分支，函数看起来"直线所以结构化"，但产物是**缺了分支的**。
-/// 目前 lift 已覆盖条件跳转的全部常见形态，所以这个比率是诚实的：x64 样本约 0.54、
-/// arm64 样本约 0.50（覆盖前虚高到 0.62，那是丢了分支换来的）。
-const STRUCTURED_FLOOR: f64 = 0.45;
+/// 目前 lift 已覆盖条件跳转的全部常见形态，结构化器也补了 join==区域终点、if-return
+/// 两类形状，故实测：T4_blank(x64) 87%、hello_3.12.2(x64) 89%、真实 Flutter app 92%、
+/// 最小 arm64 样本 76%。门禁取 0.70（对最小样本留余量）。
+const STRUCTURED_FLOOR: f64 = 0.70;
+
+/// 地址可信度下限——**这条门禁是补出来的教训**。
+///
+/// 曾经 Mach-O 的 appended 快照（`dart compile exe` / 部分 Flutter 产物）拿不到指令段
+/// 基准，`instr_off=0`，于是 pc_offset 被当成文件偏移：反汇编的是**别的代码**，
+/// 而函数名/结构化率这些指标全都正常（名字来自 Code 对象，与地址无关）。
+/// 只有「地址自洽性」能暴露它：
+/// * 函数**入口**应是序言（arm64 `stp`/`sub sp`、x64 `push rbp`/`mov`）；
+/// * 函数**末尾**应是终止符（`ret`/`b`/`jmp`/`brk`）或填充（x64 `int3` 对齐填充）；
+/// * 直接调用的目标应落在函数入口上（Dart AOT 的 `bl` 目标 = Code 入口）。
+///
+/// 修复前：末指令为终止符 1%、调用命中入口 1%。修复后：82–96% / 29–34%。
+const TERMINATOR_FLOOR: f64 = 0.60;
+const CALL_HIT_FLOOR: f64 = 0.20;
 
 #[cfg(feature = "asm")]
 #[test]
@@ -36,6 +64,13 @@ fn decompiler_shape() {
             root.join("dart/dart_samples/artifacts/hello_3.12.2.aot"),
             "dart-3.12.2-w64-no-compressed.json",
             "macho-x64.json",
+        ),
+        // arm64 且是 append 到可执行文件尾部的快照（无符号表，靠 LC_NOTE 定位指令段）
+        (
+            "sample_arm64 (macho arm64)",
+            root.join("testing/decompiler_corpus/sample_arm64"),
+            "dart-3.13.0-w64-no-compressed.json",
+            "macho-arm64.json",
         ),
     ];
     let mut ran = 0usize;
@@ -67,6 +102,11 @@ fn decompiler_shape() {
             }
             files += 1;
             let src = std::fs::read_to_string(&p).unwrap();
+            // 产物必须**零非 ASCII**（仓库口径：导出物一律英文，便于跨环境比对与阅读）
+            if let Some(pos) = src.find(|c: char| !c.is_ascii()) {
+                let ctx = &src[pos.saturating_sub(40)..(pos + 40).min(src.len())];
+                panic!("{}: 产物含非 ASCII 字符 …{ctx}…", p.display());
+            }
             let mut depth: i64 = 0;
             let mut in_fn = false;
             for (ln, line) in src.lines().enumerate() {
@@ -104,6 +144,91 @@ fn decompiler_shape() {
         assert!(
             structured >= STRUCTURED_FLOOR,
             "{label}: 结构化率 {structured:.3} 低于门禁 {STRUCTURED_FLOOR}"
+        );
+
+        // ---- 地址自洽性 ----
+        let mut entries: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_lib, cls_map) in &libs {
+            for (_cls, funcs) in cls_map {
+                for f in funcs {
+                    if f.ep != 0 {
+                        entries.insert(f.ep);
+                    }
+                }
+            }
+        }
+        // 指令表里所有入口也算（含没有名字的 stub/闭包）
+        for idx in 0..a.pc_offsets.len() {
+            if let Some((ep, _)) = a.code_range(idx) {
+                entries.insert(ep);
+            }
+        }
+        let (mut n_fn, mut n_term, mut n_call, mut n_hit) = (0usize, 0usize, 0usize, 0usize);
+        for ent in std::fs::read_dir(out.join("dart")).unwrap() {
+            let p = ent.unwrap().path();
+            if p.extension().and_then(|s| s.to_str()) != Some("dart") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.starts_with("// raw disassembly:") {
+                    continue;
+                }
+                // 反汇编块：`//  0x4080: stp FP, LR, [SP, #-0x10]!` → (助记符, 操作数)
+                let mut ins: Vec<(&str, &str)> = Vec::new();
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].starts_with("//  0x") {
+                    let rest = lines[j].split_once(':').map(|x| x.1).unwrap_or("");
+                    let rest = rest.trim();
+                    let mn = rest.split_whitespace().next().unwrap_or("");
+                    let ops = rest[mn.len()..].trim();
+                    ins.push((mn, ops));
+                    j += 1;
+                }
+                if ins.is_empty() {
+                    continue;
+                }
+                n_fn += 1;
+                // x64 的 int3 是函数末尾的对齐填充（0xCC），与终止符等价
+                if matches!(
+                    ins[ins.len() - 1].0,
+                    "ret" | "retq" | "b" | "jmp" | "brk" | "ud2" | "int3"
+                ) {
+                    n_term += 1;
+                }
+                for (mn, ops) in &ins {
+                    if !matches!(*mn, "bl" | "call" | "callq") {
+                        continue;
+                    }
+                    if let Some(v) = first_hex(ops) {
+                        n_call += 1;
+                        if entries.contains(&v) {
+                            n_hit += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let term_rate = n_term as f64 / n_fn.max(1) as f64;
+        let hit_rate = n_hit as f64 / n_call.max(1) as f64;
+        println!(
+            "{label:20} 末指令终止符 {:.1}%  调用命中入口 {:.1}%（{n_hit}/{n_call}）",
+            term_rate * 100.0,
+            hit_rate * 100.0
+        );
+        assert!(
+            term_rate >= TERMINATOR_FLOOR,
+            "{label}: 只有 {:.1}% 的函数以终止符/填充结束（门禁 {:.0}%）——\
+             代码范围很可能整体错位（历史故障：Mach-O appended 快照的 instr_off 缺失）",
+            term_rate * 100.0,
+            TERMINATOR_FLOOR * 100.0
+        );
+        assert!(
+            hit_rate >= CALL_HIT_FLOOR,
+            "{label}: 直接调用只有 {:.1}% 命中函数入口（门禁 {:.0}%）——地址与函数表不一致",
+            hit_rate * 100.0,
+            CALL_HIT_FLOOR * 100.0
         );
     }
     if ran == 0 {
