@@ -105,6 +105,35 @@ Code objects, and valid-Dart-ness is about syntax, not semantics. Only *address 
   on either. The earlier "terminator rate" metric was retired after it turned out to be counting
   x64 `int3` padding — it reported 95.7% while the addresses were wrong.
 
+## Value recovery: pool constants
+
+`ldr x0, [PP, #0x17f8]` is a load from the **object pool**. dae resolves it against the pool
+entries it already parses, so the literal shows up in the pseudocode:
+
+```dart
+rax = "Hello" /* pp+0x17f8 */;   // was: rax = mem(PP + 0x17f7);
+```
+
+Verified against source on both architectures: `"Testing Sample"` (from the app's
+`lib/main.dart`) appears three times in its output, `"Hello"` and `" fib(20)="` from
+`hello.dart` appear in the 2.15.0 one. Counts of inlined literals: app 1922, hello_3.13.0 556,
+hello_2.15.0 579, hello_2.13.4 448, hello_3.3.4 403.
+
+Three things this needed, each found by a wrong result first:
+
+- **The pool pointer is tagged on x64.** `[PP + 0x17f7]` addresses the entry at `0x17f8`
+  (tag 1), so the lookup tries the offset and offset+1 — pool slots are 8 bytes apart, so the
+  two candidates cannot both be entries.
+- **Not every string survives the trip.** `describe_into` recognises strings by cid
+  (93/94), which older profiles number differently — those came out as the *class name*
+  `String`. Resolving by ref (`sref_str`) instead is version-independent.
+- **The pool contains binary junk** (Unicode data tables). Only printable-ASCII, ≤ 60 chars
+  strings are inlined, escaped properly (`"`, `\`, newlines); the rest keep the memory form
+  with a type comment. That also keeps the "artifacts are pure ASCII" rule intact.
+
+Non-string entries get a type comment (`mem(PP, 0x2d8) /* Field */`) rather than a value —
+they are not Dart expressions, and inventing one would be worse than saying nothing.
+
 ## Known weak spots (the backlog)
 
 1. Shared tails and irreducible loops: **forward** jumps into an already-emitted block are now
@@ -123,9 +152,9 @@ Code objects, and valid-Dart-ness is about syntax, not semantics. Only *address 
    lines**, the same league as the rest. What genuinely remains for them: `add`/`or`/`sub`/`inc`/
    `dec` with a memory destination (`add byte ptr [rax], 8`) and `.byte` runs where the table's
    code size cuts a function short of its last branch target.
-4. No type recovery: every value is `dynamic`, field accesses are `mem(base, disp)`, and locals
-   are `local_m8`. Recovering types/fields is what would move the output from "readable
-   pseudocode" to "recompilable code".
+4. Type recovery is partial: pool **values** are resolved (above), but local/parameter types are
+   still `dynamic`, field accesses are `mem(obj, disp)` (the analyzer has `instance_fields`
+   per class, but the base register's class is not known), and locals are `local_m8`.
 5. The preamble is per file and mechanical; a smarter version would only declare what is used
    and give the helpers real signatures.
 

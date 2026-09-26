@@ -208,6 +208,12 @@ fn run(
     let out_abs = std::path::absolute(out)
         .map_err(|e| format!("解析输出目录绝对路径 {out}: {e}"))?;
     let out_display = out_abs.display().to_string();
+    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+        #[cfg(feature = "asm")]
+        {
+            dae::decompiler::pool_debug(&analyzer);
+        }
+    }
     let filtered_libs = dae::selection::filter_libs(&analyzer.build_functions(true), sel);
     if !sel.is_empty() {
         let (nl, nc, nf) = dae::selection::counts(&filtered_libs);

@@ -47,12 +47,12 @@ enum Expr {
 }
 
 impl Expr {
-    fn text(&self) -> String {
+    fn text(&self, rl: &Roles) -> String {
         match self {
             Expr::Reg(r) => r.clone(),
             Expr::Imm(v) => format!("{v}"),
             Expr::Pool(i) => format!("pp[0x{i:x}]"),
-            Expr::Mem(m) => mem_read(m),
+            Expr::Mem(m) => mem_read(rl, m),
             Expr::Text(x) => x.clone(),
         }
     }
@@ -310,6 +310,10 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
 struct Roles {
     pp: String,
     thr: String,
+    /// 对象池：偏移 → 可直接内联的 Dart 值。字符串字面量直接写出来（这是可读性
+    /// 跳跃最大的一步：`x0 = mem(PP, 0x4178)` → `x0 = "objects"`），立即数写成数字，
+    /// 别的对象写成类名注释。Stub 条目没有值可展示，不入表。
+    pool: BTreeMap<u64, String>,
     /// Dart 代码里的栈指针寄存器名（arm64 是 x15 —— SDK constants_arm64.h 的
     /// `R15 = 15; // SP in Dart code.`；x64 是 rsp）
     sp: String,
@@ -325,7 +329,114 @@ fn roles(analyzer: &Analyzer) -> Roles {
         thr: g("thr", "thr"),
         sp: g("sp", "sp"),
         aliases: analyzer.platform.register_aliases.clone(),
+        pool: pool_map(analyzer),
     }
+}
+
+#[cfg(feature = "asm")]
+pub fn pool_debug(analyzer: &Analyzer) -> usize {
+    let m = pool_map(analyzer);
+    eprintln!(
+        "[dbg-pool] entries={:?} mapped={}",
+        analyzer
+            .iso
+            .objectpool_entries
+            .as_ref()
+            .map(|v| v.len()),
+        m.len()
+    );
+    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+        for (k, v) in m.iter().take(6) {
+            eprintln!("[dbg-pool]   {k:#x} = {v}");
+        }
+        for (k, v) in m.iter().filter(|(_, v)| v.starts_with('"')).take(3) {
+            eprintln!("[dbg-pool]   str {k:#x} = {v}");
+        }
+        for (k, v) in m.iter().filter(|(_, v)| v.starts_with("/*")).take(6) {
+            eprintln!("[dbg-pool]   cmt {k:#x} = {v}");
+        }
+    }
+    m.len()
+}
+
+/// 对象池表：`0x10 + i*8` 是池内偏移（与 pp.txt 一致）。
+/// 只收**能表达成 Dart 值**的条目；Stub / 解析不出的条目留空（宁可不写，不编）。
+fn pool_map(analyzer: &Analyzer) -> BTreeMap<u64, String> {
+    let mut m = BTreeMap::new();
+    let Some(entries) = analyzer.iso.objectpool_entries.as_ref() else {
+        return m;
+    };
+    for (i, ent) in entries.iter().enumerate() {
+        let off = 0x10 + i as u64 * 8;
+        match ent.typ.as_str() {
+            "imm" => {
+                let v = ent.value.unwrap_or(0);
+                m.insert(off, v.to_string());
+            }
+            "obj" => {
+                let vref = ent.value.unwrap_or(0) as u64;
+                // 先按**字符串对象**直接取值：`sref_str` 只认"这个 ref 是字符串"，
+                // 不依赖 cid 编号表（`describe_into` 走的是 cid==93/94 的判断，
+                // 老版本 profile 的 cid 枚举一偏，字符串就被描述成类名 `String`）。
+                if let Some(text) = analyzer.sref_str(vref) {
+                    if let Some(lit) = dart_literal(text) {
+                        m.insert(off, lit);
+                        continue;
+                    }
+                    // 长文本/非 ASCII（Unicode 数据表那类）：不内联，留类型注释
+                    m.insert(off, "/* String */".to_string());
+                    continue;
+                }
+                // 其它对象：类名注释（比裸 mem() 有信息量）
+                let mut t = String::new();
+                crate::export::ppobjs::describe_into(analyzer, &mut t, vref, 0);
+                if let Some(name) = t.split(':').next() {
+                    if !name.is_empty() && name.len() < 40 {
+                        m.insert(off, format!("/* {name} */"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+/// 池里的字符串 → Dart 字面量。两条纪律：
+/// 1. **只收纯 ASCII 可打印**：池里混着 Unicode 数据表之类的大块二进制（实测有整段
+///    CJK/控制字符），内联出来既读不懂也会破坏"产物零非 ASCII"的仓库口径；
+/// 2. **自己转义**：上游 `describe_into` 只做 `"{}"` 拼接，字符串里带引号/换行就会
+///    把产物写成非法 Dart。
+/// 不合规的（含非 ASCII、控制字符过多）返回 None → 调用方退回原来的 `mem(...)` 写法。
+fn dart_literal(raw: &str) -> Option<String> {
+    const MAX: usize = 60;
+    let printable = raw
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .count();
+    if raw.chars().any(|c| c as u32 > 0x7e) || printable * 5 < raw.chars().count() * 4 {
+        return None;
+    }
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    let mut n = 0usize;
+    for c in raw.chars() {
+        if n >= MAX {
+            out.push_str("...");
+            break;
+        }
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+        n += 1;
+    }
+    out.push('"');
+    Some(out)
 }
 
 /// 单条指令 → IR。**认不出就 Other**，不做语义猜测。
@@ -1153,13 +1264,107 @@ fn local_ident(off: &str) -> String {
     }
 }
 
-/// 读内存 → 合法表达式
-fn mem_read(operand: &str) -> String {
+/// 内存读 → 合法表达式。
+/// 基址是对象池（`PP` 或已被折叠成 `(PP + 0xb000)`）且偏移命中池表时，直接写成条目的值
+/// ——这是**值恢复**：字符串常量、立即数在伪代码里直接可见。
+fn mem_read(rl: &Roles, operand: &str) -> String {
     let m = mem_parts(operand);
     if let Some(l) = m.local_name() {
         return l;
     }
+    if let Some(v) = pool_value(rl, &m) {
+        return v;
+    }
     format!("mem({})", m.args())
+}
+
+/// 池偏移 = 基址里的 PP 加数 + 位移。三种写法都要认：
+/// * `[PP, #0x2d8]`（arm64 常见，基址与位移分开）；
+/// * `[(PP + 0xb000), #0x778]`（adrp/add 折叠后基址带加数）；
+/// * `[PP + 0x17f7]`（x64：池指针**带 tag**，偏移是 `条目偏移 - 1`，且写在一个操作数里）。
+/// 带 tag 的情况不靠平台知识判断，直接 `off` 与 `off + 1` 各试一次——池条目间距 8 字节，
+/// 相邻两个都是条目的概率为零，不会误命中。
+fn pool_value(rl: &Roles, m: &MemOperand) -> Option<String> {
+    if rl.pool.is_empty() {
+        return None;
+    }
+    let (delta, disp) = pool_operand(m)?;
+    for cand in [delta + disp, delta + disp + 1] {
+        if cand < 0 {
+            continue;
+        }
+        let key = cand as u64;
+        if let Some(v) = rl.pool.get(&key) {
+            let v = v.clone();
+            // 字符串字面量后面留一个池偏移注释：`x0 = "key" /* pp+0x78 */`——
+            // 值可以直接读，但读者仍能顺着偏移回到 pp.txt 对照原始条目。
+            if v.starts_with('"') {
+                return Some(format!("{v} /* pp+{key:#x} */"));
+            }
+            // 非字符串对象条目只带一个类型注释（`/* Field */`）：它自己不是表达式，
+            // 直接当值会把产物写成 `x9 = /* Field */;`（语法错误）——补上内存读法。
+            if v.starts_with("/*") {
+                return Some(format!("mem({}) {v}", m.args()));
+            }
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 从内存操作数里析出 (PP 加数, 位移)；基址不是池指针时返回 None。
+fn pool_operand(m: &MemOperand) -> Option<(i64, i64)> {
+    let parts: Vec<String> = m
+        .parts
+        .iter()
+        .map(|p| p.trim().trim_start_matches('#').trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let parse_i = |t: &str| -> Option<i64> {
+        let t = t.trim();
+        let neg = t.starts_with('-');
+        let body = t.trim_start_matches('-').trim_start_matches("0x");
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = i64::from_str_radix(body, 16).ok()?;
+        Some(if neg { -v } else { v })
+    };
+    // 基址段：要么就是 `PP`，要么是 `PP + 0x..` / `(PP + 0x..)`
+    let base_of = |t: &str| -> Option<i64> {
+        let t = t.trim();
+        let inner = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
+        if inner.trim() == "PP" {
+            return Some(0);
+        }
+        let (a, b) = inner.split_once('+')?;
+        if a.trim() != "PP" {
+            return None;
+        }
+        // 加数可能是 `0xb, 0x12`（lsl 折叠后）——取第一个可解析的
+        for tok in b.split(',') {
+            if let Some(v) = parse_i(tok) {
+                return Some(v);
+            }
+        }
+        None
+    };
+    match parts.len() {
+        1 => {
+            // `PP + 0x17f7`：一个操作数里既带基址又带位移
+            let t = parts[0].trim();
+            let inner = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
+            let (a, b) = inner.split_once('+')?;
+            let delta = base_of(a)?;
+            let disp = parse_i(b)?;
+            Some((delta, disp))
+        }
+        _ => {
+            let delta = base_of(&parts[0])?;
+            let disp = parse_i(&parts[1])?;
+            Some((delta, disp))
+        }
+    }
 }
 
 /// 写内存 → 合法语句（返回 `lvalue = value;` 或 `memSet(...);`）
@@ -2109,7 +2314,7 @@ impl<'a> Structurer<'a> {
         ) as usize;
         let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], &self.rl);
         for s in &nested {
-            if let Some(line) = render_op(&s.op, s.addr) {
+            if let Some(line) = render_op(&self.rl, &s.op, s.addr) {
                 v.push(Node::Line(line));
             }
         }
@@ -2578,14 +2783,14 @@ fn sanitize_regs(text: &str) -> String {
 }
 
 /// 单条 IR → 伪代码行（None = 不产出，如无跳转意义的指令）
-fn render_op(op: &Op, addr: u64) -> Option<String> {
-    let line = render_op_inner(op, addr)?;
+fn render_op(rl: &Roles, op: &Op, addr: u64) -> Option<String> {
+    let line = render_op_inner(rl, op, addr)?;
     Some(sanitize_regs(&sanitize_mem_refs(&line)))
 }
 
-fn render_op_inner(op: &Op, addr: u64) -> Option<String> {
+fn render_op_inner(rl: &Roles, op: &Op, addr: u64) -> Option<String> {
     match op {
-        Op::Assign { dst, src } => Some(format!("{dst} = {}; // {addr:#x}", src.text())),
+        Op::Assign { dst, src } => Some(format!("{dst} = {}; // {addr:#x}", src.text(rl))),
         Op::Cmp => None,
         Op::IndirectJump(r) => Some(format!("gotoIndirect({r}); // {addr:#x}")),
         Op::Helper(t) => Some(format!("{t}; // {addr:#x}")),
@@ -2675,9 +2880,9 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                     Expr::Mem(m) => {
                         let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
                         if d < NEST_MAX_DEPTH {
-                            mem_read(&subst_regs(m, &pending, rl))
+                            mem_read(rl, &subst_regs(m, &pending, rl))
                         } else {
-                            mem_read(m)
+                            mem_read(rl, m)
                         }
                     }
                     Expr::Text(x) => x.clone(),

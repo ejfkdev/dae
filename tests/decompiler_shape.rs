@@ -12,6 +12,31 @@ use dae::analyzer::Analyzer;
 use dae::profile::{parse_platform, parse_sdk, PlatformProfile, SdkProfile};
 use std::path::Path;
 
+/// 把 `"..."`（含 `\` 转义）替换成 `""`，只留结构
+fn strip_literals(line: &str) -> String {
+    let b: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '"' {
+            out.push('"');
+            out.push('"');
+            i += 1;
+            while i < b.len() && b[i] != '"' {
+                if b[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 /// 从操作数文本里取第一个 `0x...`（arm64 写作 `bl #0x1234`、x64 写作 `call 0x1234`）。
 fn first_hex(s: &str) -> Option<u64> {
     let i = s.find("0x")?;
@@ -133,8 +158,11 @@ fn decompiler_shape() {
                 depth += t.matches('{').count() as i64;
                 depth -= t.matches('}').count() as i64;
                 assert!(depth >= 0, "{}:{} 花括号提前闭合", p.display(), ln + 1);
-                // 行尾 `// 0x..` 是地址注释，判形态前先剥掉
-                let code = t.split("//").next().unwrap_or("").trim_end();
+                // 判形态前先把**字符串字面量**换成占位符，再剥行尾注释：
+                // 池里内联出来的字面量可能本身就是 `"//"` 或带 `;`（实测踩过），
+                // 不先屏蔽就会把 `x2 = "//" /* pp+0x.. */;` 误判成行没结束。
+                let code = strip_literals(t);
+                let code = code.split("//").next().unwrap_or("").trim_end();
                 if in_fn
                     && depth > 0
                     && !code.is_empty()

@@ -169,6 +169,9 @@ What it does today:
 - Framework register names (`PP`/`THR`/`SP`/`FP`, plus each platform's `register_aliases`) —
   including inside memory operands.
 - Named direct call targets (`call router`), and `sub_0x...` for entries with no name.
+- **Pool constants recovered**: `ldr x0, [PP, #0x17f8]` becomes `x0 = "Hello" /* pp+0x17f8 */`
+  (string literals, immediates; non-string entries get a type comment). Verified against source
+  on both arm64 and x64.
 - Stack slots rendered as locals (`local_8`), frame save/restore and barriers kept as
   `// frame:` / `// barrier:` comments, and the raw disassembly kept above each function so
   the output stays checkable.
