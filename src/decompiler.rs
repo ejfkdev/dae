@@ -111,13 +111,15 @@ struct Stmt {
 /// 2. 寄存器名统一替换成框架名（FP/SP/THR/PP…），内存操作数内部也替换。
 fn lift(
     cs: &Capstone,
-    analyzer: &Analyzer,
+    rl: &Roles,
     code: &[u8],
     base: u64,
     is_arm64: bool,
     names: &BTreeMap<u64, String>,
 ) -> (Vec<Stmt>, String) {
-    let rl = roles(analyzer);
+    // `Roles` 由调用方传入，**不在这里构建**：`roles()` 会调 `pool_map()` 重建整张对象池
+    // 映射表（Reqable.app 有 122 064 条），而 lift 是每函数调一次的——曾经每个函数都重建
+    // 一遍池表，material_3_demo 15 082 个函数上光这一步就吃掉 100.2s（占 render 的 94%）。
     let mut out = Vec::new();
     let mut raw = String::new();
     let mut last_cmp: Option<(String, String)> = None;
@@ -128,7 +130,7 @@ fn lift(
     raw.reserve(insns.len() * 40);
     for ins in insns.iter() {
         let mnem = ins.mnemonic().unwrap_or("").to_string();
-        let ops_masked = mask_regs(&rl, ins.op_str().unwrap_or(""));
+        let ops_masked = mask_regs(rl, ins.op_str().unwrap_or(""));
         let addr = ins.address();
         let _ = writeln!(raw, "  {addr:#x}: {mnem} {ops_masked}");
         // IR 用**去掉 `#`** 的操作数：`#` 只是汇编的立即数标记，`mem(x2, #0x3f)`、
@@ -149,7 +151,7 @@ fn lift(
             out.push(Stmt { addr, op: Op::Cmp });
             continue;
         }
-        let s = match lift_one(&rl, is_arm64, &mnem, &ops, addr) {
+        let s = match lift_one(rl, is_arm64, &mnem, &ops, addr) {
             // csel：条件码先换成 condFlag("cc")，再尝试用上一条 cmp 折成真条件
             Op::Assign { dst, src: Expr::Text(t) } if mnem == "csel" || mnem == "csinc" => {
                 if let (Some((a, b)), Some(cc)) = (&last_cmp, sel_cc(&t)) {
@@ -192,7 +194,7 @@ fn lift(
                 ) =>
             {
                 last_cmp = None;
-                lift_one(&rl, is_arm64, &mnem, &ops, addr)
+                lift_one(rl, is_arm64, &mnem, &ops, addr)
             }
             other => other,
         };
@@ -1616,7 +1618,7 @@ fn emit_function(
     fallback: &mut usize,
     fa: &FieldAnnot,
 ) {
-    let mut s = Structurer::new(blocks, rl.clone());
+    let mut s = Structurer::new(blocks, rl);
     let nodes = s.seq(0, None, 0);
     let reason = s.reason.clone();
     let mut unstructured = s.unstructured;
@@ -1943,6 +1945,7 @@ const CHUNK_MAX_BYTES: usize = 256;
 fn lift_chunks(
     cs: &Capstone,
     analyzer: &Analyzer,
+    rl: &Roles,
     stmts: &[Stmt],
     is_arm64: bool,
     names: &BTreeMap<u64, String>,
@@ -2012,7 +2015,7 @@ fn lift_chunks(
         if end <= t {
             continue;
         }
-        let (mut cs_stmts, _raw) = lift(cs, analyzer, &keep, t, is_arm64, names);
+        let (mut cs_stmts, _raw) = lift(cs, rl, &keep, t, is_arm64, names);
         // 块内不能出现与主范围重复的地址
         cs_stmts.retain(|s| !known.contains(&s.addr));
         if cs_stmts.is_empty() {
@@ -2071,6 +2074,18 @@ pub fn render(
     analyzer: &Analyzer,
     libs: &LibGroups,
 ) -> Result<(Vec<(String, String)>, DecompileStats), String> {
+    // `DART_AOT_PROF=1`：分阶段计时。加它是因为 release 构建开了 LTO，
+    // `sample` 拿不到 inclusive 归因（除 start 外最高符号只占 0.6%），
+    // 靠剖析器猜已经错过两次，所以改成自己量。
+    let prof = std::env::var("DART_AOT_PROF").is_ok();
+    let t0 = std::time::Instant::now();
+    let mut mark = t0;
+    let lap = |label: &str, mark: &mut std::time::Instant| {
+        if prof {
+            eprintln!("[prof] {label:<28} {:>8.2}s", mark.elapsed().as_secs_f64());
+        }
+        *mark = std::time::Instant::now();
+    };
     let is_arm64 = analyzer.platform.arch == "arm64";
     let rl = roles(analyzer);
     let cs = build_cs(is_arm64)?;
@@ -2080,6 +2095,7 @@ pub fn render(
         let rec = recover_fields(analyzer)?;
         FieldCtx { by_class_off: rec.by_class_off, word: analyzer.profile.word_size }
     };
+    lap("recover_fields", &mut mark);
 
     let mut files: Vec<(String, String)> = Vec::new();
     let mut stats = DecompileStats {
@@ -2135,6 +2151,12 @@ pub fn render(
             names.entry(ep).or_insert_with(|| format!("sub_{ep:#x}"));
         }
     }
+    lap(&format!("names+stubs ({} entries)", names.len()), &mut mark);
+    let prof_t_main = std::time::Instant::now();
+    use std::time::{Duration, Instant};
+    let (mut p_lift, mut p_chunks, mut p_cfg, mut p_emit, mut p_pre) =
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut n_prof_fn = 0usize;
     for (lib_name, cls_map) in libs {
         let mut file = if lib_name.is_empty() {
             "app".to_string()
@@ -2197,7 +2219,9 @@ pub fn render(
                 let look = 16usize;
                 let end = ((foff as usize + csize as usize) + look).min(analyzer.data.len());
                 let code = &analyzer.data[foff as usize..end];
-                let (mut stmts, raw) = lift(&cs, analyzer, code, entry, is_arm64, &names);
+                let _pt = Instant::now();
+                let (mut stmts, raw) = lift(&cs, &rl, code, entry, is_arm64, &names);
+                if prof { p_lift += _pt.elapsed(); }
                 let limit = entry + csize;
                 stmts.retain(|s| s.addr < limit);
                 if stmts.is_empty() {
@@ -2207,12 +2231,17 @@ pub fn render(
                     continue;
                 }
                 // 共享尾块（跳进别的函数范围又跳回来）也算本函数的一部分
-                let (extra, chunks) = lift_chunks(&cs, analyzer, &stmts, is_arm64, &names);
+                let _pt = Instant::now();
+                let (extra, chunks) = lift_chunks(&cs, analyzer, &rl, &stmts, is_arm64, &names);
+                if prof { p_chunks += _pt.elapsed(); }
                 if !extra.is_empty() {
                     stmts.extend(extra);
                     stmts.sort_by_key(|s| s.addr);
                 }
+                let _pt = Instant::now();
                 let blocks = build_blocks(stmts);
+                if prof { p_cfg += _pt.elapsed(); }
+                if prof { n_prof_fn += 1; }
                 stats.stmts += blocks.iter().map(|b| b.stmts.len()).sum::<usize>();
                 stats.blocks += blocks.len();
                 for b in &blocks {
@@ -2248,6 +2277,7 @@ pub fn render(
                     eprintln!("[dbg-dec] annotate name={name} cls={_cls:?} map_has={}", fctx.by_class_off.contains_key(&(_cls.to_string(), 0x18)));
                 }
                 let fa = FieldAnnot { class: _cls, ctx: &fctx, rl: &rl };
+                let _pt = Instant::now();
                 emit_function(
                     &name,
                     &blocks,
@@ -2259,6 +2289,7 @@ pub fn render(
                     &mut stats.fallback,
                     &fa,
                 );
+                if prof { p_emit += _pt.elapsed(); }
                 // 未映射行只数**发射出去的**：原来的口径统计所有基本块，
                 // 把永远走不到的块也算进去，产物一变就虚高（chunk 之后尤其明显）
                 stats.unmapped += of[before..].matches("// unmapped:").count();
@@ -2267,11 +2298,36 @@ pub fn render(
         }
         stats.funcs += cnt;
         // 前导声明要在正文全部渲染完之后算（要知道用到哪些标识符、定义了哪些函数）
+        let _pt = Instant::now();
         let preamble = dart_preamble(&of, &defined);
+        if prof { p_pre += _pt.elapsed(); }
         let mut full = String::with_capacity(of.len() + preamble.len());
         full.push_str(&preamble);
         full.push_str(&of);
         files.push((fname, full));
+    }
+    if prof {
+        let tot = prof_t_main.elapsed().as_secs_f64();
+        eprintln!(
+            "[prof] {:<28} {:>8.2}s",
+            "主循环(lift+结构+渲染)",
+            tot
+        );
+        for (l, d) in [
+            ("  ├ lift (反汇编+IR)", p_lift),
+            ("  ├ lift_chunks (共享尾块)", p_chunks),
+            ("  ├ build_blocks (CFG)", p_cfg),
+            ("  ├ emit_function (结构化+渲染)", p_emit),
+            ("  └ dart_preamble (前导声明)", p_pre),
+        ] {
+            eprintln!(
+                "[prof] {l:<28} {:>8.2}s  ({:>5.1}%)",
+                d.as_secs_f64(),
+                d.as_secs_f64() / tot.max(0.001) * 100.0
+            );
+        }
+        eprintln!("[prof]   函数数={n_prof_fn}");
+        eprintln!("[prof] {:<28} {:>8.2}s", "render 合计", t0.elapsed().as_secs_f64());
     }
     Ok((files, stats))
 }
@@ -2584,7 +2640,7 @@ fn accessor_fields(
         if foff as usize >= end {
             continue;
         }
-        let (stmts, _) = lift(cs, analyzer, &analyzer.data[foff as usize..end], entry, is_arm64, &names);
+        let (stmts, _) = lift(cs, rl, &analyzer.data[foff as usize..end], entry, is_arm64, &names);
         let limit = entry + csize;
         let mut offs: BTreeSet<u64> = BTreeSet::new();
         let mut unknown = 0usize;
@@ -2764,7 +2820,10 @@ enum Node {
 
 struct Structurer<'a> {
     blocks: &'a [Block],
-    rl: Roles,
+    /// **借用**而非持有：`Roles` 里有整张对象池映射（`pool: BTreeMap<u64, String>`，
+    /// Reqable.app 有 122 064 条），而 Structurer 是每函数新建一个的——按值持有意味着
+    /// 每个函数都深拷贝一遍池表。
+    rl: &'a Roles,
     idx: BTreeMap<u64, usize>,
     loops: BTreeMap<usize, (usize, usize)>, // header idx → (body 入口, 出口)
     in_loop: BTreeMap<usize, usize>,    // block idx → 所属循环头 idx
@@ -2905,7 +2964,7 @@ fn dominates(idom: &[usize], h: usize, mut u: usize) -> bool {
 }
 
 impl<'a> Structurer<'a> {
-    fn new(blocks: &'a [Block], rl: Roles) -> Self {
+    fn new(blocks: &'a [Block], rl: &'a Roles) -> Self {
         let idx: BTreeMap<u64, usize> =
             blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
         let dom = dominators(blocks, &idx);
@@ -2983,15 +3042,15 @@ impl<'a> Structurer<'a> {
                 | Some(Op::Abort(_))
                 | Some(Op::IndirectJump(_))
         ) as usize;
-        let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], &self.rl);
+        let nested = nest_block(&blk.stmts[..n.saturating_sub(cut)], self.rl);
         for s in &nested {
             // 帧簿记走注释（与 stp/ldp 同口径）：Dart 里没有 FP/SP，写成赋值只会
             // 制造「写了没人读」的噪声
-            if let Some(note) = Self::frame_note(s, &self.rl) {
+            if let Some(note) = Self::frame_note(s, self.rl) {
                 v.push(Node::Line(note));
                 continue;
             }
-            if let Some(line) = render_op(&self.rl, &s.op, s.addr) {
+            if let Some(line) = render_op(self.rl, &s.op, s.addr) {
                 v.push(Node::Line(line));
             }
         }
