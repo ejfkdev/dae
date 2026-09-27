@@ -33,6 +33,10 @@ const FUNC_FLOOR: usize = 400;
 ///   完全相同的 22 623 个表项；但同一布局下 2.18.1 会塌陷。旧布局（2 svarint）下
 ///   2.18.1 也只有 `classes=2`（健康值约 320），**本来就是坏的**——多出的那个 svarint
 ///   只是在补偿另一处尚未定位的布局错误。
+///   实测两种布局**都不健康**：1 svarint → libraries=1 / classes=1 / 63 函数；
+///   2 svarint → libraries=1 / classes=2 / 629 函数（健康样本约 15 库 / 320 类 / 1300 函数）。
+///   保留源码正确的 1 svarint：2 个 svarint 只是用多读的字节**补偿**另一处未知错误，
+///   把它固化下来会误导后来定位的人，而且与已被 .symtab 和 aotopsy 双重证明的 2.19.6 相矛盾。
 const KNOWN_COLLAPSED: &[&str] = &["hello_2.18.1"];
 
 /// 语料：路径 + SDK/平台 profile（与 scripts/regress_all.sh 的样本表一致）

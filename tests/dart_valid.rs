@@ -258,6 +258,36 @@ fn emitted_dart_is_valid() {
     );
 }
 
+/// 全量记分卡的下限与已知塌陷登记。判据来自实测：健康的 hello 样本恢复 1000+ 个函数
+/// （最低的是 hello_2.12.4 的 1212），塌陷时掉到几十个（hello_2.18.1 现在是 27）。
+/// 400 这个下限把两者隔开一个数量级，不会误伤。
+const SCORECARD_MIN_SAMPLES: usize = 20;
+const SCORECARD_FUNC_FLOOR: usize = 400;
+
+/// 已知塌陷且原因未定位的样本。登记是为了**不让它掩盖新的塌陷**，不是承认它正常。
+///
+/// - `hello_2.18.1.aot`：Function 的 fill 尾部按源码判定应与 2.19.6 完全相同
+///   （两版 `WriteFill` diff 为空、`UntaggedFunction` 字段范围相同、都是 product 构建），
+///   即 refs(4) + code_index + kind_tag = 1 个 svarint；2.15–2.17 才是 2 个
+///   （那三版的 `packed_fields_` 写在 `kind != kFullAOT` 条件块**之外**）。
+///   1-svarint 让 2.19.6 从 630 → 1318 个函数、并让真机微博 2.19.6 解出与 aotopsy
+///   完全相同的 22 623 个表项；但同一布局下 2.18.1 会塌陷。旧布局（2 svarint）下
+///   2.18.1 也只有 `classes=2`（健康值约 320），**本来就是坏的**——多出的那个 svarint
+///   只是在补偿另一处尚未定位的布局错误。
+///   实测两种布局**都不健康**：1 svarint → libraries=1 / classes=1 / 63 函数；
+///   2 svarint → libraries=1 / classes=2 / 629 函数（健康样本约 15 库 / 320 类 / 1300 函数）。
+///   保留源码正确的 1 svarint：2 个 svarint 只是用多读的字节**补偿**另一处未知错误，
+///   把它固化下来会误导后来定位的人，而且与已被 .symtab 和 aotopsy 双重证明的 2.19.6 相矛盾。
+const SCORECARD_KNOWN_COLLAPSED: &[&str] = &["hello_2.18.1.aot"];
+
+/// 按设计**只有对象层、没有地址层**的样本：指令表不可得（2.7.2 是 bare-instructions 早期形态、
+/// 2.10.4 属同一族），没有函数入口就无从反编译，`files=0 / funcs=0` 是预期结果而非塌陷。
+/// 与 `scripts/regress_all.sh` 里 `expect_of` 归为 `objects` 的那两个版本一一对应。
+///
+/// 列成显式登记而不是「files==0 就放过」：后者会让将来「塌陷到什么都不产出」的样本静默通过，
+/// 那正是本仓库最贵的失败形态。新增一个这样的样本必须改这里，是个有意识的动作。
+const SCORECARD_NO_ADDRESS_LAYER: &[&str] = &["hello_2.7.2.exe", "hello_2.10.4.exe"];
+
 /// 全量基线：`dart/dart_samples/artifacts/` 下每个版本都跑一遍并打印表。
 /// 默认 `#[ignore]`——25 个版本 × dart analyze 要几分钟，不进每次提交的门禁。
 #[test]
@@ -322,13 +352,62 @@ fn full_scorecard() {
         }
     }
     let total: usize = rows.iter().map(|r| r.errors).sum();
+    let files: usize = rows.iter().map(|r| r.files).sum();
+    let funcs: usize = rows.iter().map(|r| r.funcs).sum();
     println!(
-        "\n合计 {} 个样本，{} 个文件，{} 个函数；dart analyze 错误 {}",
-        rows.len(),
-        rows.iter().map(|r| r.files).sum::<usize>(),
-        rows.iter().map(|r| r.funcs).sum::<usize>(),
-        total
+        "\n合计 {n} 个样本，{files} 个文件，{funcs} 个函数；dart analyze 错误 {total}",
+        n = rows.len()
     );
+
+    // ---- 断言：这个测试跑遍全部语料，却长期只打印不断言 ----
+    // 后果实测过一次：Function 布局改动让 hello_2.18.1 的产物出现 1 个
+    // `argument_type_not_assignable`，合计行明明白白印着「错误 1」，而套件全绿——
+    // 因为 `dart_valid` 的断言语料只有 3 份、这个全量测试是 `#[ignore]` 的信息性输出。
+    // 「产物 0 错误」是本仓库对外的招牌结论，必须由跑遍语料的这个测试来把守。
+    assert!(
+        rows.len() >= SCORECARD_MIN_SAMPLES,
+        "全量记分卡只收到 {} 份语料（下限 {}）——artifacts 目录缺了或被挪走了，\
+         此时的 0 错误不代表产物干净",
+        rows.len(),
+        SCORECARD_MIN_SAMPLES
+    );
+    assert_eq!(
+        total, 0,
+        "全量语料的 dart analyze 错误必须为 0，实得 {total}：{}",
+        rows.iter()
+            .filter(|r| r.errors > 0)
+            .map(|r| format!("{} → {} 条，例如 {}", r.label, r.errors, r.first))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    // 塌陷检测：解析漂移会让函数数掉一个数量级而 analyze 仍是 0 错误
+    // （产物只是变得很小），所以「0 错误」不足以证明健康。
+    for r in rows.iter().filter(|r| !r.skipped) {
+        if SCORECARD_KNOWN_COLLAPSED.contains(&r.label.as_str()) {
+            println!(
+                "    ⚠ {} 已登记为塌陷样本（funcs={} < {}），原因见 SCORECARD_KNOWN_COLLAPSED",
+                r.label, r.funcs, SCORECARD_FUNC_FLOOR
+            );
+            continue;
+        }
+        if r.files == 0 {
+            assert!(
+                SCORECARD_NO_ADDRESS_LAYER.contains(&r.label.as_str()),
+                "{}: 一个 .dart 都没产出，而它不在「只有对象层」的登记里——\
+                 要么是新出现的塌陷，要么是该样本的定位能力退化了；\
+                 确属预期的请登记进 SCORECARD_NO_ADDRESS_LAYER 并写明原因",
+                r.label
+            );
+            println!("    · {} 只有对象层（无指令表），按设计不产 .dart", r.label);
+            continue;
+        }
+        assert!(
+            r.funcs >= SCORECARD_FUNC_FLOOR,
+            "{}: 只恢复出 {} 个函数（下限 {}）——解析很可能已塌陷（libraries/classes 会同时塌成 1）\
+             而 analyze 仍报 0 错误；若确为新的已知塌陷，必须登记进 SCORECARD_KNOWN_COLLAPSED 并附源码级原因",
+            r.label, r.funcs, SCORECARD_FUNC_FLOOR
+        );
+    }
 }
 
 /// **门禁自检**：`analyze_errors` 对一个不存在/没产出任何东西的目录必须返回 Err。
