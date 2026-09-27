@@ -1,6 +1,6 @@
 [package]
 name = "dae-rs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Dart AOT snapshot analyzer: blutter-compatible symbols for IDA/radare2/Frida, plus a decompiler emitting dart-analyze-clean Dart. Desktop and mobile (compressed pointers)."
 license = "MIT"
