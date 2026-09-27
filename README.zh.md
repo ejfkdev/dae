@@ -35,15 +35,20 @@
   飞书 3.6.1 结构化 95.9%、微博 2.19.6 结构化 91.1%（19 053 个函数、153 万条语句），两者均 0 错误。
   不可归约的控制流保留显式 `gotoLabel` 并在函数头打 `NOTE`，绝不静默压平。
   见[反编译器](#反编译器实验性)。
-- **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）；26 MB 的 macOS 应用
-  `--decompile` 约 1 s，真机飞书/微博安卓产物 1.6 s / 5.6 s。
+- **快**——以下都是本版二进制实测：9 MB 的 macOS Flutter 样本导出 0.26 s；`--decompile` 在
+  飞书（25.6 MB 安卓、25 183 个函数）1.6 s、`material_3_demo`（14 MB macOS、15 796 个函数）2.4 s、
+  微博（9 MB 安卓、19 053 个反编译函数 / 153 万条语句）3.5 s，峰值 RSS 179–211 MB。
+  同一产物上比 v0.1.7 **快约 50 倍**（106.8 s → 1.91 s）——收益来自「不再每函数重建全局不变数据」，
+  不是换了更快的算法。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
 - **渐进式模式**——20 条子命令像查数据库一样查快照（`libs`/`classes`/`functions`/`members`/
   `strings`/`findrefs`/`callers`/`callees`/`pp`/`objs`/`stubs`……），再只反编译你要的那一份
-  （`getclass`/`getmethod`/`getlib`/`decompile --app`）。查询 15–30 毫秒出结果，
-  而一个 15 796 函数的应用全量导出约 2.1 秒、上千个文件；每条命令的输出都能直接抄进下一条。
+  （`getclass`/`getmethod`/`getlib`/`decompile --app`）。查询在小语料上 15–30 毫秒、
+  在 15 796 函数的应用上 43–311 毫秒；那个应用全量导出 0.54 秒，加 `--decompile` 约 2.1 秒、
+  上千个文件。每条命令的输出都能直接抄进下一条。
   见[渐进式](#渐进式先查清单再定点反编译)。
-- **零依赖**——直接解析 Mach-O/ELF/PE，无需 Dart SDK 或 Flutter 工具链。
+- **不需要工具链**——单个自足二进制：无需 Dart SDK、无需装 Flutter，且**从不运行目标程序**，
+  只解析它。Mach-O/ELF/PE 解析与全部 47 份 profile 都内嵌在二进制里。
 
 ## 安装
 
@@ -101,9 +106,10 @@ export done -> /绝对路径/to/out:
 | `functions.txt` | 平铺 `库.类.方法 → 偏移` 索引（在 `text/` 下） |
 | `arrays.txt` / `maps.txt` | 每个 List / Map 对象及其内容（在 `text/` 下） |
 | `text/fields.txt` | 恢复出的具名字段：来源（快照 Field 簇 `rec` / 隐式访问器名 `accessor`）+ 字节偏移 |
+| `text/stubs.txt` | 指令表里**没有** Code 对象的条目（`functions.txt` 略掉的 stub 前缀）；只在能从分配 stub 序言证明时给名字，否则留空 |
 | `text/call_edges.txt` | 调用边：直接 `bl`/`call` 目标 + 间接调用点；每类分配 stub 由序言解出名字 |
 | `callgraph.dot` | 已命名函数之间的直接调用图（Graphviz DOT） |
-| `dart/*.dart` | 每函数伪代码，**可过 `dart analyze`**（加 `--decompile`） |
+| `dart/*.dart` | 每函数伪代码，**可过 `dart analyze`**；**一个库一个文件**，由 `--decompile` 或 `decompile` 子命令产出 |
 
 结构头按目标生成：`DartThread` 取自「版本 × 架构」布局表，`DartObjectPool` 由目标自身对象池生成。
 

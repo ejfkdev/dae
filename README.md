@@ -37,16 +37,22 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
   structured and Weibo 2.19.6 at 91.1% (19 053 functions, 1.53 M statements), both error-free.
   Irreducible control flow keeps an explicit `gotoLabel` and a `NOTE` header rather than being
   silently flattened. See [Decompiler](#decompiler-experimental).
-- **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference);
-  `--decompile` on a 26 MB macOS app takes ~1 s, and a real Lark/Weibo Android build 1.6 s / 5.6 s.
+- **Fast** — all measured with this release's binary: a 9 MB macOS Flutter sample exports in
+  0.26 s; `--decompile` takes 1.6 s on Lark (25.6 MB Android, 25 183 functions), 2.4 s on
+  `material_3_demo` (14 MB macOS, 15 796 functions) and 3.5 s on Weibo (9 MB Android,
+  19 053 decompiled functions / 1.53 M statements), at 179–211 MB peak RSS. That is **~50× faster
+  than v0.1.7** on the same artifact (106.8 s → 1.91 s) — from not rebuilding run-invariant data
+  per function, not from a faster algorithm.
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
 - **Progressive mode** — 20 subcommands to query the snapshot like a database (`libs`, `classes`,
   `functions`, `members`, `strings`, `findrefs`, `callers`, `callees`, `pp`, `objs`, `stubs`, ...)
   and then decompile exactly one thing (`getclass` / `getmethod` / `getlib` / `decompile --app`).
-  Queries answer in 15–30 ms; a full export of a 15,796-function app takes ~2.1 s and ~1000 files.
-  Every command's output is pasteable into the next one.
+  Queries answer in 15–30 ms on a small corpus and 43–311 ms on a 15,796-function app; a full
+  export of that app is 0.54 s, or ~2.1 s with `--decompile` (~1000 files). Every command's output
+  is pasteable into the next one.
   See [Progressive mode](#progressive-mode-list-first-decompile-one-thing).
-- **Zero dependencies** — parses Mach-O/ELF/PE directly.
+- **No toolchain required** — one self-contained binary: no Dart SDK, no Flutter install, and the
+  target is never executed, only parsed. Mach-O/ELF/PE parsing and all 47 profiles are built in.
 
 ## Install
 
@@ -104,9 +110,10 @@ export done -> /absolute/path/to/out:
 | `functions.txt` | flat `Library.Class.method → offset` index (under `text/`) |
 | `arrays.txt` / `maps.txt` | every List / Map object with its contents (under `text/`) |
 | `text/fields.txt` | named fields recovered from the snapshot's Field cluster (`rec`) or implicit-accessor names (`accessor`), with byte offsets |
+| `text/stubs.txt` | instruction-table entries with **no** Code object (the stub prefix that `functions.txt` omits); names only where provable from the allocation-stub prologue, empty otherwise |
 | `text/call_edges.txt` | call edges: direct `bl`/`call` targets + indirect call sites; per-class allocation stubs are named from their prologue |
 | `callgraph.dot` | direct-call graph between named functions (Graphviz DOT) |
-| `dart/*.dart` | per-function pseudocode that passes `dart analyze` (with `--decompile`) |
+| `dart/*.dart` | per-function pseudocode that passes `dart analyze` — one file per **library**, via `--decompile` or the `decompile` subcommand |
 
 Struct headers are generated **per target**: `DartThread` from a version × architecture layout table, `DartObjectPool` from the target's own object pool.
 

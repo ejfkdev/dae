@@ -43,12 +43,31 @@ functions still carry a `goto`, how many object-pool literals got inlined, and w
 | name agreement (uniform rule) | 83.8% | 87.1% | 81.0% | 84.6% | 83.5% | 87.2% |
 | `dart analyze` syntax errors | **0** | 5233 | **0** | 5380 | **0** | 5233 |
 | `dart analyze` semantic errors | **0** | 65109 | **0** | 62720 | **0** | 65081 |
-| functions with a `goto` | **12.2%** | 64.3% | **9.3%** | 63.4% | **12.2%** | 64.3% |
-| inlined pool literals | 318 | 298 | 502 | 295 | 315 | 295 |
-| wall time | **0.38s** | 2.90s | **0.33s** | 2.61s | **0.39s** | 2.87s |
+| functions with a `goto` | **12.8%** | 64.3% | **9.9%** | 63.4% | **12.8%** | 64.3% |
+| inlined pool literals | 297 | **298** | **487** | 295 | 294 | **295** |
+| wall time | **0.23s** | 4.95s | **0.21s** | 5.19s | **0.20s** | 5.76s |
 
 Function counts are equal because of a fix this comparison produced (below); the earlier state was
 1258 vs 1434.
+
+**Why three of dae's own numbers moved since this table was last measured** (2026-09-28, dae v0.1.8):
+`goto` 12.2% → 12.8% and inlined literals 318 → 297 / 502 → 487 / 315 → 294. The decompiler's
+output is byte-identical across every change since, so this is not a regression in code generation —
+the previous measurement predates v0.1.7's `first_entry_with_code` fix, which stopped discarding
+~86% of recoverable function names and therefore changed *which* functions are in the decompiled
+set the script counts over. Covering more functions pulled in some harder ones, which is why the
+`goto` ratio rose slightly. Both tools were re-run in the same pass, so the comparison is still
+apples to apples.
+
+**Wall time, and why the ratio is not comparable to the previous row of measurements.** The host
+carried load 13–20 from processes belonging to other work during this run (a `javac` at 102% CPU,
+a Go test binary, Spotlight-style storage indexing). Load inflates the slower tool far more than
+the faster one: aotopsy reads 2.61–2.90 s in the previous measurement and 4.95–5.76 s now, while
+dae reads 0.33–0.39 s then and 0.20–0.23 s now. Three interleaved re-runs on `hello_2.15.0` gave
+dae 0.18/0.19/0.20 s and aotopsy 4.45/4.97/5.08 s, so dae's spread is small and aotopsy's is not.
+**The defensible claim is dae's absolute time, not the ratio.** aotopsy did not regress. For a
+fair speed statement see the paired v0.1.7 → v0.1.8 A/B in [`DECOMPILER.md`](DECOMPILER.md)
+(106.8 s → 1.91 s on a 15,082-function app, interleaved so both sides saw the same host).
 
 ## Where dae is ahead
 
@@ -59,9 +78,15 @@ Function counts are equal because of a fix this comparison produced (below); the
 - **Control flow is structured.** 9–12% of dae's functions keep a `goto` vs 63–64% of aotopsy's.
   aotopsy's own output says so in place: `goto block_2;` with `block_2:;` labels, plus
   `// --- code omitted by the structured walk, shown verbatim ---`.
-- **Speed.** ~7× faster on the same file (0.4s vs 2.9s).
-- **Pool constants.** dae inlines more resolved literals here (318 vs 298, 502 vs 295); on the
-  Flutter macOS app it resolves 1922.
+- **Speed.** 0.20–0.23 s vs 4.95–5.76 s on the same file. The ~22–26× that implies is **not** a
+  fair ratio to quote — see the wall-time note above the "Where dae is ahead" heading: the host was
+  at load 13–20, which inflates the slower tool much more than the faster one. What is defensible is
+  dae's absolute time (0.33 s → 0.19 s on `hello_2.15.0` since the previous measurement) and the
+  paired A/B against dae's own previous release (~50×, in [`DECOMPILER.md`](DECOMPILER.md)).
+- **Pool constants.** dae inlines clearly more on `hello_2.15.0` (487 vs 295), and is within one
+  literal of aotopsy on the two variant corpora (297 vs 298, 294 vs 295) — i.e. **aotopsy edges dae
+  by 1 there**, which the previous version of this table did not show because dae's count was
+  measured over a smaller function set. On the Flutter macOS app dae resolves 1922.
 
 ## Where aotopsy is ahead
 

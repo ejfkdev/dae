@@ -218,6 +218,14 @@ spanning Mach-O x64, ELF x64, ELF arm64 and SDK 2.10/2.14 — the arm64 corpus a
 exercise the x64 alias table. Metrics match exactly on every one (181,504 blocks / 985,900
 statements / 13,950 structured / 1,132 unstructured / 3 unmapped lines).
 
+Current absolute numbers on the released v0.1.8 binary, for readers who want "how fast is it now"
+rather than the per-round deltas (host load 13–20 from unrelated processes, so treat these as an
+upper bound): Lark 3.6.1 android, 25.6 MB, 25,183 table functions — **1.63 s** with `--decompile`;
+Weibo 2.19.6 android, 9 MB, 19,053 decompiled functions / 1.53 M statements — **3.51 s**;
+`material_3_demo` macOS, 14 MB, 15,796 functions — **2.37 s**; export without `--decompile` is
+0.26 s for a 9 MB sample and 0.96 s for Lark. The round-1 table above still shows Weibo at 5.6 s
+because that was its round-1 measurement; rounds 2 and 3 took it to 3.5 s.
+
 Also in this round: capstone's `.detail(true)` was switched to `.detail(false)` at all eight
 engine constructions. A grep confirms no detail API is used anywhere — only `mnemonic`, `op_str`,
 `address` and `bytes` — so this is strictly less work, but the A/B showed **no measurable speedup**
