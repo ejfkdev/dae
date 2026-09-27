@@ -37,7 +37,8 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
   structured and Weibo 2.19.6 at 91.1% (19 053 functions, 1.53 M statements), both error-free.
   Irreducible control flow keeps an explicit `gotoLabel` and a `NOTE` header rather than being
   silently flattened. See [Decompiler](#decompiler-experimental).
-- **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference).
+- **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference);
+  `--decompile` on a 26 MB macOS app takes ~1 s, and a real Lark/Weibo Android build 1.6 s / 5.6 s.
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
 - **Progressive mode** — `dae libs` / `classes` / `functions` / `strings` / `callers` to query the
   snapshot like a database, then `dae getclass` / `getmethod` / `getlib` to decompile just that

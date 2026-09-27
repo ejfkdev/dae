@@ -153,10 +153,37 @@ in the output, so the enum was tree-shaken or canonicalised away rather than mis
 unmapped `animations` files are examples nothing references.
 
 `app_truth`'s fast half (plain export + source comparison) takes ~2 s and runs in the normal suite;
-the `--decompile` + `dart analyze` half is `#[ignore]`d because a million statements take minutes
+the `--decompile` + `dart analyze` half is `#[ignore]`d because a million statements still take
+a couple of minutes under `dart analyze` (dae's own half is seconds — see Performance below)
 (247 s for both demos). Point `DAE_DEMO_ROOT` at a `flutter-samples` checkout built with
 `flutter build macos --release`. The same binaries can be folded into the scorecard with
 `DAE_SCORECARD_EXTRA=/path/to/App:/path/to/App2 cargo test --release --test dart_valid -- --ignored`.
+
+## Performance
+
+`DART_AOT_PROF=1` prints a per-phase breakdown of `render`. It exists because the release build
+uses LTO, which collapses the call tree until `sample` attributes ~86% to `start` and no dae symbol
+exceeds 0.6% — guessing from that produced two changes with no measurable effect before the
+instrumentation found the real cause.
+
+On `material_3_demo` (15,082 functions, 985,900 statements), and on real artifacts:
+
+| artifact | before | after | output |
+|---|---|---|---|
+| `material_3_demo` | 113.5 s, 236 MB peak | **3.4 s, 217 MB** | byte-identical |
+| Lark 3.6.1 (android) | 181.3 s | **1.6 s** | identical metrics, 0 analyze errors |
+| Reqable.app 3.3.4 (macOS) | 156.0 s | **1.0 s** | identical metrics, 0 analyze errors |
+| Weibo 2.19.6 (android) | ~214 s | **5.6 s** | identical metrics |
+
+The cause was two per-function rebuilds of run-invariant data: `lift` called `roles(analyzer)`
+itself, and `roles` builds the whole object-pool map (`BTreeMap<u64, String>`, 122,064 entries on
+Reqable.app); and `Structurer` owned its `Roles`, so `emit_function` deep-cloned that same map once
+per function. Both now borrow. Phases after the fix: lift 1.91 s (66.8%), emit 0.71 s (25.0%),
+preamble 0.14 s, CFG 0.03 s.
+
+This retires an earlier claim in this file's history that `--decompile` was dominated by ~1M
+`format!` calls. Rendering was 5.7% of render; the allocation-heavy profiler leaves were the pool
+map being rebuilt, not statement formatting.
 
 ## The trap this table keeps springing
 

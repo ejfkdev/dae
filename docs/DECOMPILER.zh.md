@@ -144,6 +144,29 @@ DAE_REQUIRE_GATES=1 cargo test --release           # 把所有「缺依赖，跳
 一个跑过 `flutter build macos --release` 的 flutter-samples 检出。同一批产物也能并进记分卡：
 `DAE_SCORECARD_EXTRA=/path/to/App:/path/to/App2 cargo test --release --test dart_valid -- --ignored`。
 
+## 性能
+
+`DART_AOT_PROF=1` 会打印 `render` 的分阶段耗时。加它是因为 release 开了 LTO，调用树被内联打散，
+`sample` 把约 86% 归给 `start`、dae 自身符号最高才 0.6%——照着那个猜，先后做出两处
+「输出一致但无可测收益」的改动，最后是靠计时才找到真因。
+
+`material_3_demo`（15 082 个函数、985 900 条语句）与真机产物：
+
+| 产物 | 之前 | 之后 | 产物 |
+|---|---|---|---|
+| `material_3_demo` | 113.5 s、峰值 236 MB | **3.4 s、217 MB** | 逐字节一致 |
+| 飞书 3.6.1（安卓） | 181.3 s | **1.6 s** | 指标一致、analyze 0 错误 |
+| Reqable.app 3.3.4（macOS） | 156.0 s | **1.0 s** | 指标一致、analyze 0 错误 |
+| 微博 2.19.6（安卓） | ~214 s | **5.6 s** | 指标一致 |
+
+病因是两处**每函数重建一次的全局不变数据**：`lift` 自己调 `roles(analyzer)`，而 `roles` 会构建
+整张对象池映射（`BTreeMap<u64, String>`，Reqable.app 有 122 064 条）；`Structurer` 又按值持有
+`Roles`，于是 `emit_function` 每个函数都深拷贝一遍同一张表。两处都改成借用。修复后各阶段：
+lift 1.91 s（66.8%）、emit 0.71 s（25.0%）、前导 0.14 s、CFG 0.03 s。
+
+这也推翻了本文档早先「`--decompile` 的时间主要花在约 100 万次 `format!`」的说法：渲染只占
+render 的 5.7%；剖析里那些分配密集的叶子是**池表被反复重建**，不是语句格式化。
+
 ## 这张表反复踩的同一个坑
 
 同一个失效模式已经出现三次，值得直说——**指标看不见它**：指令段定位错了，反编译器读的是

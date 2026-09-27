@@ -35,7 +35,8 @@
   飞书 3.6.1 结构化 95.9%、微博 2.19.6 结构化 91.1%（19 053 个函数、153 万条语句），两者均 0 错误。
   不可归约的控制流保留显式 `gotoLabel` 并在函数头打 `NOTE`，绝不静默压平。
   见[反编译器](#反编译器实验性)。
-- **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）。
+- **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）；26 MB 的 macOS 应用
+  `--decompile` 约 1 s，真机飞书/微博安卓产物 1.6 s / 5.6 s。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
 - **渐进式模式**——`dae libs`/`classes`/`functions`/`strings`/`callers` 像查数据库一样查快照，
   再用 `dae getclass`/`getmethod`/`getlib` 只反编译那一份（`dae info` 0.03 秒 vs 全量 1.9 秒），
