@@ -47,6 +47,7 @@ pub const SUBCOMMANDS: &[&str] = &[
     "getclass",
     "getmethod",
     "getlib",
+    "decompile",
     "help",
     "version",
 ];
@@ -77,6 +78,12 @@ struct Opts {
     classes: Vec<String>,
     funcs: Vec<String>,
     fuzzy: bool,
+    /// `--exclude-lib`（可重复）
+    exclude_libs: Vec<String>,
+    /// `--no-sdk`：排除 URL 以 `dart:` 开头的库
+    no_sdk: bool,
+    /// `--app`：排除 `dart:` 与 `package:flutter`
+    app: bool,
     /// 位置参数（除 <binary> 与选项外的其余）
     rest: Vec<String>,
 }
@@ -98,8 +105,40 @@ fn opts_of(c: &Common, bin: String, rest: Vec<String>) -> Opts {
         classes: c.class.clone(),
         funcs: c.func.clone(),
         fuzzy: c.fuzzy,
+        exclude_libs: c.exclude_lib.clone(),
+        no_sdk: c.no_sdk,
+        app: c.app,
         rest,
     }
+}
+
+/// `Opts` → `Selection`，并把 `--no-sdk` / `--app` 解析成**具体库名**再排除。
+///
+/// 这两个 flag 按库的**原始 URL 前缀**判（`dart:` / `package:flutter`），不按 mangled 名猜：
+/// `library_name` 把 `dart:core` 写成 `dart_core`，一个叫 `dart_core_extra` 的包会长得很像。
+///
+/// 所有需要 Selection 的命令都走这一处，于是「某个命令解析了 flag 却悄悄忽略」在结构上
+/// 不可能——参考项目 ddc 的 `callers` 就解析了 `--dex` 又在重建 argv 时丢掉。
+fn resolve_selection(a: &Analyzer, o: &Opts) -> Selection {
+    apply_scope(a, o, o.selection())
+}
+
+/// 把 `--no-sdk` / `--app` 解析出的排除库名并进一个**已有的** Selection。
+///
+/// 单独一个函数是因为 `getclass`/`disasm` 的 Selection 由 `target_sel` 在 `with_analyzer`
+/// **之外**构造（那时还没有 Analyzer），只能在闭包里补这一步。
+fn apply_scope(a: &Analyzer, o: &Opts, mut sel: Selection) -> Selection {
+    let prefixes: &[&str] = if o.app {
+        &["dart:", "package:flutter"]
+    } else if o.no_sdk {
+        &["dart:"]
+    } else {
+        &[]
+    };
+    if !prefixes.is_empty() {
+        sel.exclude_libs.extend(a.lib_names_by_url_prefix(prefixes));
+    }
+    sel
 }
 
 /// `-h/--help` 走本项目自己的双语文本（写了输出列格式与命名口径），不是 clap 自动生成的。
@@ -118,6 +157,7 @@ impl Opts {
             classes: self.classes.clone(),
             funcs: self.funcs.clone(),
             fuzzy: self.fuzzy,
+            exclude_libs: self.exclude_libs.clone(),
         }
     }
     fn bin(&self, cmd: &str, lang: Lang) -> Result<&str, String> {
@@ -411,6 +451,12 @@ pub fn run_cmd(cmd: Cmd, lang: Lang, s: &Messages) -> i32 {
         Cmd::Getclass(a) => run_get(a, "getclass", lang, s),
         Cmd::Getmethod(a) => run_get(a, "getmethod", lang, s),
         Cmd::Getlib(a) => run_get(a, "getlib", lang, s),
+        // 不复用 run_query：`decompile` 没有 pattern 位置参数（范围由 --lib/--no-sdk/--app
+        // 决定）。若硬套 Query，`dae decompile bin foo` 会收下 foo 再静默忽略——正是要避免的。
+        Cmd::Decompile(a) => {
+            maybe_help(&a.common, "decompile", lang);
+            cmd_decompile(opts_of(&a.common, a.binary, Vec::new()), lang, s)
+        }
     };
     match r {
         Ok(()) => 0,
@@ -492,7 +538,8 @@ fn cmd_export(o: Opts, out: &str, decompile: bool, s: &Messages) -> Result<(), S
     let bin = o.bin("export", s.lang)?;
     let sdk_override = o.sdk.as_deref();
     let platform_override = o.platform.as_deref();
-    let sel = o.selection();
+    // --no-sdk / --app 要按库的原始 URL 判，得等有 Analyzer 才能解析（见 apply_scope）
+    let mut sel = o.selection();
     let since = std::time::Instant::now();
     let bin_path = resolve_binary(bin, s)?;
     let data = std::fs::read(&bin_path)
@@ -582,6 +629,7 @@ fn cmd_export(o: Opts, out: &str, decompile: bool, s: &Messages) -> Result<(), S
             crate::decompiler::pool_debug(&analyzer);
         }
     }
+    sel = apply_scope(&analyzer, &o, sel);
     let filtered_libs = filter_libs(&analyzer.build_functions(true), &sel);
     if !sel.is_empty() {
         let (nl, nc, nf) = counts(&filtered_libs);
@@ -848,7 +896,7 @@ fn cmd_classes(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("classes", lang)?;
     let pat = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
-        let libs = filter_libs(&a.build_functions(true), &o.selection());
+        let libs = filter_libs(&a.build_functions(true), &resolve_selection(a, &o));
         // cid 取 iso.classes 的 class_id（与 text/classes.txt 同源），不在表里就写 "-"，
         // 不编一个看起来像 id 的数字
         let mut cid_of: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
@@ -942,7 +990,7 @@ fn cmd_functions(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("functions", lang)?;
     let pat = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
-        let libs = filter_libs(&a.build_functions(true), &o.selection());
+        let libs = filter_libs(&a.build_functions(true), &resolve_selection(a, &o));
         let mut rows: Vec<(u64, u64, String, String, String)> = Vec::new();
         for (lib, cls_map) in &libs {
             for (cls, funcs) in cls_map {
@@ -1030,7 +1078,7 @@ fn cmd_strings(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
 fn cmd_largest(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("largest", lang)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
-        let libs = filter_libs(&a.build_functions(true), &o.selection());
+        let libs = filter_libs(&a.build_functions(true), &resolve_selection(a, &o));
         let mut rows: Vec<(u64, u64, String)> = Vec::new();
         for (lib, cls_map) in &libs {
             for (cls, funcs) in cls_map {
@@ -1074,9 +1122,13 @@ fn call_table(
     outgoing: bool,
     lang: Lang,
 ) -> Result<(String, usize, usize), String> {
-    let sel = o.selection();
+    let sel = resolve_selection(a, o);
     if !sel.is_empty() {
-        let (nl, nc, nf) = (sel.libs.len(), sel.classes.len(), sel.funcs.len());
+        let (nl, nc, nf) = (
+            sel.libs.len() + sel.exclude_libs.len(),
+            sel.classes.len(),
+            sel.funcs.len(),
+        );
         // 这句问的是什么，取决于方向——先算好再进格式串（Rust 的格式串里没有内联条件）
         let what_zh = if outgoing { "它调谁" } else { "谁调它" };
         let what_en = if outgoing { "what it calls" } else { "who calls it" };
@@ -1384,7 +1436,7 @@ fn cmd_members(
 
         if !only_field {
             let libs = a.build_functions(true);
-            let libs = filter_libs(&libs, &o.selection());
+            let libs = filter_libs(&libs, &resolve_selection(a, &o));
             for (_lib, cls_map) in &libs {
                 for (cls, funcs) in cls_map {
                     for f in funcs {
@@ -1604,6 +1656,7 @@ fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("disasm", lang)?;
     let sel = target_sel(&o, "disasm", lang, TargetKind::Any)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
+        let sel = apply_scope(a, &o, sel);
         let all = a.build_functions(true);
         let picked = filter_libs(&all, &sel);
         if counts(&picked).2 == 0 {
@@ -1662,6 +1715,7 @@ fn cmd_get(cmd: &str, o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     };
     let sel = target_sel(&o, cmd, lang, kind)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
+        let sel = apply_scope(a, &o, sel);
         let all = a.build_functions(true);
         let picked = filter_libs(&all, &sel);
         let (nl, nc, nf) = counts(&picked);
@@ -1669,65 +1723,124 @@ fn cmd_get(cmd: &str, o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
             return Err(no_match(cmd, &sel, &all, lang));
         }
         let (files, st) = crate::decompiler::render(a, &picked)?;
-        // 输出：-o FILE.dart 单文件；-o DIR 走与全量导出同形的 dart/<库>.dart；
-        // 无 -o / -o - 走 stdout（只出伪代码，不掺时间与统计，方便管道）
-        match o.out.as_deref() {
-            None | Some("-") => {
-                let mut body = String::new();
-                for (name, text) in &files {
-                    let _ = writeln!(body, "// ===== {name} =====");
-                    body.push_str(text);
-                }
-                print!("{body}");
+        emit_decompiled(&o, &files, &st, (nl, nc, nf), lang)
+    })
+}
+
+/// `getclass` / `getmethod` / `getlib` / `decompile` 共用的输出路由：
+/// * 无 `-o` 或 `-o -` → **stdout**，每文件一段 `// ===== name =====`，不掺时间与统计（可管道）；
+/// * `-o FILE.dart` → 合并成单文件；
+/// * `-o DIR` → 当作目录，写 `<DIR>/dart/<库>.dart`，与全量导出**同形**。
+///
+/// 四条命令一份实现：`decompile` 与 `get*` 的差别只在 Selection 是「全部」还是「一个目标」，
+/// 落盘形态没有任何理由不同（分成两份的话，改一处忘一处就会让 `getlib X -o DIR` 与
+/// `decompile --lib X -o DIR` 产出不同的目录布局）。
+#[cfg(feature = "asm")]
+fn emit_decompiled(
+    o: &Opts,
+    files: &[(String, String)],
+    st: &crate::decompiler::DecompileStats,
+    (nl, nc, nf): (usize, usize, usize),
+    lang: Lang,
+) -> Result<(), String> {
+    match o.out.as_deref() {
+        None | Some("-") => {
+            let mut body = String::new();
+            for (name, text) in files {
+                let _ = writeln!(body, "// ===== {name} =====");
+                body.push_str(text);
             }
-            Some(p) if p.ends_with(".dart") => {
-                let mut body = String::new();
-                for (_, text) in &files {
-                    body.push_str(text);
-                }
-                if let Some(parent) = Path::new(p).parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                }
-                std::fs::write(p, &body).map_err(|e| format!("{p}: {e}"))?;
-                eprintln!(
-                    "{}",
-                    tr(
-                        lang,
-                        &format!("dae：已写出 {p}（{nf} 个函数）"),
-                        &format!("dae: wrote {p} ({nf} functions)")
-                    )
-                );
-            }
-            Some(dir) => {
-                let root = Path::new(dir).join("dart");
-                std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
-                for (name, text) in &files {
-                    std::fs::write(root.join(name), text).map_err(|e| format!("{name}: {e}"))?;
-                }
-                eprintln!(
-                    "{}",
-                    tr(
-                        lang,
-                        &format!("dae：已写出 {nl} 个库 / {nc} 个类 / {nf} 个函数到 {}", root.display()),
-                        &format!("dae: wrote {nl} libs / {nc} classes / {nf} functions to {}", root.display())
-                    )
-                );
-            }
+            print!("{body}");
         }
-        if st.unmapped > 0 {
+        Some(p) if p.ends_with(".dart") => {
+            let mut body = String::new();
+            for (_, text) in files {
+                body.push_str(text);
+            }
+            if let Some(parent) = Path::new(p).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            std::fs::write(p, &body).map_err(|e| format!("{p}: {e}"))?;
             eprintln!(
                 "{}",
                 tr(
                     lang,
-                    &format!("dae：{} 行未映射指令（认不出的原样保留）", st.unmapped),
-                    &format!("dae: {} unmapped instruction lines (kept verbatim)", st.unmapped)
+                    &format!("dae：已写出 {p}（{nf} 个函数）"),
+                    &format!("dae: wrote {p} ({nf} functions)")
                 )
             );
         }
-        Ok(())
+        Some(dir) => {
+            let root = Path::new(dir).join("dart");
+            std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+            for (name, text) in files {
+                std::fs::write(root.join(name), text).map_err(|e| format!("{name}: {e}"))?;
+            }
+            eprintln!(
+                "{}",
+                tr(
+                    lang,
+                    &format!("dae：已写出 {nl} 个库 / {nc} 个类 / {nf} 个函数到 {}", root.display()),
+                    &format!("dae: wrote {nl} libs / {nc} classes / {nf} functions to {}", root.display())
+                )
+            );
+        }
+    }
+    if st.unmapped > 0 {
+        eprintln!(
+            "{}",
+            tr(
+                lang,
+                &format!("dae：{} 行未映射指令（认不出的原样保留）", st.unmapped),
+                &format!("dae: {} unmapped instruction lines (kept verbatim)", st.unmapped)
+            )
+        );
+    }
+    Ok(())
+}
+
+/// `dae decompile <bin> [-o DIR|FILE.dart|-]`：只反编译，不写其它产物。
+///
+/// 与 `export --decompile` 的差别是**只出 dart/**：不写 ida_script/r2_script/asm/text/。
+/// 与 `getlib` 的差别是默认范围为全部（可用 --lib/--no-sdk/--app 收窄）。
+/// 无 `-o` 时走 stdout——这是「把整个应用的伪代码灌进管道」的唯一入口，
+/// 全量导出必须给 out_dir。
+#[cfg(feature = "asm")]
+fn cmd_decompile(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
+    let bin = o.bin("decompile", lang)?;
+    with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
+        let sel = resolve_selection(a, &o);
+        let all = a.build_functions(true);
+        let picked = filter_libs(&all, &sel);
+        let (nl, nc, nf) = counts(&picked);
+        if nf == 0 {
+            return Err(no_match("decompile", &sel, &all, lang));
+        }
+        if !sel.is_empty() {
+            eprintln!(
+                "{}",
+                tr(
+                    lang,
+                    &format!("dae：范围 {nl} 个库 / {nc} 个类 / {nf} 个函数"),
+                    &format!("dae: scope is {nl} libs / {nc} classes / {nf} functions")
+                )
+            );
+        }
+        let (files, st) = crate::decompiler::render(a, &picked)?;
+        emit_decompiled(&o, &files, &st, (nl, nc, nf), lang)
     })
+}
+
+#[cfg(not(feature = "asm"))]
+fn cmd_decompile(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
+    let _ = (o, s);
+    Err(tr(
+        lang,
+        "decompile：本构建未启用反编译器（capstone）",
+        "decompile: this build has no decompiler (capstone)",
+    ))
 }
 
 // 无 capstone 的构建（--no-default-features）：只读查询仍然可用，涉及反汇编的三个
@@ -1829,6 +1942,26 @@ fn help_for(cmd: &str, lang: Lang) -> String {
                 t("没命中会给「是不是想找」提示（放宽为子串匹配）。", "On a miss, dae suggests near matches (relaxed to substring matching).")
             )
         }
+        "decompile" => format!(
+            "{}\n\n  dae decompile <binary> [-o DIR|FILE.dart|-] [--lib P] [--class P] [--func P]\n                [--exclude-lib P] [--no-sdk] [--app] [--fuzzy]\n\n{}\n{}\n{}\n{}",
+            t("decompile —— 只反编译，不写其它产物", "decompile -- decompile only, writing no other artifact"),
+            t(
+                "输出路由与 getclass/getmethod/getlib **同一份代码**：无 -o 或 -o - 走 stdout\n（每库一段 `// ===== name =====`）；-o FILE.dart 合并成单文件；-o DIR 写\n<DIR>/dart/<库>.dart，与全量导出同形。实测 `getlib X -o D` 与 `decompile --lib X -o D`\n产物逐字节相同。",
+                "Output routing is the **same code** as getclass/getmethod/getlib: no -o (or -o -) goes\nto stdout (one `// ===== name =====` block per library); -o FILE.dart merges into one\nfile; -o DIR writes <DIR>/dart/<lib>.dart, same shape as a full export. Verified that\n`getlib X -o D` and `decompile --lib X -o D` produce byte-identical trees.",
+            ),
+            t(
+                "与 `export --decompile` 的差别是**只出 dart/**：不写 ida_script / r2_script / asm / text。\n与 getlib 的差别是默认范围为全部。",
+                "Unlike `export --decompile` it writes **only dart/** -- no ida_script / r2_script /\nasm / text. Unlike getlib its default scope is everything.",
+            ),
+            t(
+                "范围收窄：--lib P（库名前缀=整个包）、--no-sdk（排除 URL 以 dart: 开头的库）、\n--app（再排除 package:flutter）。后两个按**库的原始 URL 前缀**判定，不是按 mangled\n名猜——library_name 把 dart:core 写成 dart_core，一个叫 dart_core_extra 的包会长得很像。\n实测 Flutter 应用：505 库/15796 函数 → --no-sdk 489/11016 → --app 56/765。",
+                "Scope: --lib P (a lib prefix = whole package), --no-sdk (drop libraries whose URL\nstarts with dart:), --app (also drop package:flutter). The last two are decided by the\nlibrary's **original URL prefix**, not by guessing from the mangled name -- library_name\nwrites dart:core as dart_core, and a package called dart_core_extra would look similar.\nMeasured on a Flutter app: 505 libs/15796 functions -> --no-sdk 489/11016 -> --app 56/765.",
+            ),
+            t(
+                "不做 ddc 的 `pkg --app`（从 manifest 取应用包名）：Dart 快照没有 manifest，\n猜包名就是编造。要更窄用 --lib <你的包> 或 --exclude-lib <不想要的包>。",
+                "There is no ddc-style `pkg --app` (which takes the package from the manifest): a Dart\nsnapshot has no manifest, so guessing the package name would be fabrication. Narrow\nfurther with --lib <your package> or --exclude-lib <unwanted package>.",
+            )
+        ),
         "export" => format!(
             "{}\n\n  dae export <binary> <out_dir> [--decompile] [--lib P] [--class P] [--func P] [--fuzzy]\n\n{}\n{}\n{}",
             t("export —— 全量（或按筛选）导出所有产物到 out_dir", "export -- write every artifact under out_dir (full or filtered)"),
@@ -1979,6 +2112,7 @@ pub fn help(lang: Lang) -> String {
     row(&mut h, "getclass  <binary> <CLASS>", t("单类", "one class"));
     row(&mut h, "getmethod <binary> <CLASS.method>", t("单方法", "one method"));
     row(&mut h, "getlib    <binary> <LIB>", t("单库（包）；库名前缀即整个包", "one library (package); a prefix = whole package"));
+    row(&mut h, "decompile <binary> [-o DIR|FILE.dart|-]", t("只反编译（默认全部；无 -o 走 stdout）", "decompile only (everything by default; stdout without -o)"));
     let _ = writeln!(h);
 
     let _ = writeln!(h, "{}", t("低层：", "Low-level:"));
@@ -2005,8 +2139,8 @@ pub fn help(lang: Lang) -> String {
         h,
         "{}",
         t(
-            "通用选项：-o FILE 落盘（默认 stdout，-o - 也是），\n          -n N 限制条数，--lib/--class/--func 过滤（可重复），--fuzzy 放宽为子串，\n          --sdk-profile P / --platform-profile P 覆盖自动识别，-h 看子命令帮助。",
-            "Common options: -o FILE to write (stdout by default; -o - is the same),\n          -n N to limit rows, --lib/--class/--func filters (repeatable), --fuzzy for substring\n          matching, --sdk-profile P / --platform-profile P to override detection, -h for per-command help."
+            "通用选项：-o FILE 落盘（默认 stdout，-o - 也是），\n          -n N 限制条数，--lib/--class/--func 过滤（可重复），--fuzzy 放宽为子串，\n          --exclude-lib P 排除库（可重复），--no-sdk 排除 dart: 库，--app 再排除 package:flutter，\n          --sdk-profile P / --platform-profile P 覆盖自动识别，-h 看子命令帮助。",
+            "Common options: -o FILE to write (stdout by default; -o - is the same),\n          -n N to limit rows, --lib/--class/--func filters (repeatable), --fuzzy for substring\n          matching, --exclude-lib P to drop libraries (repeatable), --no-sdk to drop dart: libraries,\n          --app to also drop package:flutter, --sdk-profile P / --platform-profile P to override\n          detection, -h for per-command help."
         )
     );
     let _ = writeln!(h);

@@ -78,6 +78,8 @@ pub enum Cmd {
     Getmethod(Target),
     /// decompile one library (package); a prefix selects the whole package
     Getlib(Target),
+    /// decompile everything (stdout by default), without writing any other artifact
+    Decompile(Decompile),
 
     /// this guide (bilingual), or `dae help <cmd>` for one command
     Help(Help),
@@ -131,6 +133,18 @@ pub struct Common {
     /// make the patterns substring matches (default: exact)
     #[arg(long = "fuzzy")]
     pub fuzzy: bool,
+
+    /// exclude these libraries (repeatable; same prefix rule as --lib)
+    #[arg(long = "exclude-lib", value_name = "PATTERN")]
+    pub exclude_lib: Vec<String>,
+
+    /// exclude SDK libraries (those whose URL starts with `dart:`)
+    #[arg(long = "no-sdk")]
+    pub no_sdk: bool,
+
+    /// exclude the SDK and the Flutter framework (`dart:` and `package:flutter`)
+    #[arg(long = "app", conflicts_with = "no_sdk")]
+    pub app: bool,
 }
 
 /// `<binary> [pattern]` —— 清单类命令的共同形状。
@@ -230,6 +244,20 @@ pub struct FindRefs {
 
     /// the text to search (substring) or the object kind name (exact)
     pub query: String,
+}
+
+/// `decompile <binary> [-o DIR|FILE.dart|-]`
+///
+/// 只反编译，不写 ida/r2/asm/text 那些产物。无 `-o` 时走 **stdout**（与 `get*` 一致），
+/// 这是「把整个应用的伪代码灌进管道」的唯一入口——全量导出必须给 out_dir。
+#[derive(Args)]
+#[command(disable_help_flag = true)]
+pub struct Decompile {
+    #[command(flatten)]
+    pub common: Common,
+
+    /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
+    pub binary: String,
 }
 
 /// `help [cmd]`

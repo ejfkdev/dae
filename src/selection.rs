@@ -21,11 +21,20 @@ pub struct Selection {
     pub funcs: Vec<String>,
     /// 类名/函数名改为子串匹配（库名本来就是前缀匹配）
     pub fuzzy: bool,
+    /// **排除**这些库（`--exclude-lib`，以及 `--no-sdk` / `--app` 解析出来的库名）。
+    ///
+    /// 匹配口径与 `libs` 完全相同（精确 / 加 `/` 的前缀 / fuzzy 时子串），所以
+    /// `--exclude-lib dart_core` 不会误伤一个叫 `dart_core_extra` 的包——前缀规则要求
+    /// 后面紧跟分隔符。这条性质很重要：`--no-sdk` 解析出来的就是一批 `dart_*` 名字。
+    pub exclude_libs: Vec<String>,
 }
 
 impl Selection {
     pub fn is_empty(&self) -> bool {
-        self.libs.is_empty() && self.classes.is_empty() && self.funcs.is_empty()
+        self.libs.is_empty()
+            && self.classes.is_empty()
+            && self.funcs.is_empty()
+            && self.exclude_libs.is_empty()
     }
 
     pub fn any_lib(&self, lib: &str) -> bool {
@@ -34,6 +43,19 @@ impl Selection {
         }
         let l = norm_lib(lib);
         self.libs.iter().any(|p| {
+            let p = norm_lib(p);
+            l == p || l.starts_with(&format!("{p}/")) || (self.fuzzy && l.contains(&p))
+        })
+    }
+
+    /// 这个库是否被排除。口径与 [`Selection::any_lib`] 对称（同一套规范化与前缀规则），
+    /// 只是语义相反——两边不一致的话，「选中」与「排除」会互相说不清谁赢。
+    pub fn lib_excluded(&self, lib: &str) -> bool {
+        if self.exclude_libs.is_empty() {
+            return false;
+        }
+        let l = norm_lib(lib);
+        self.exclude_libs.iter().any(|p| {
             let p = norm_lib(p);
             l == p || l.starts_with(&format!("{p}/")) || (self.fuzzy && l.contains(&p))
         })
@@ -136,7 +158,7 @@ pub fn filter_libs(libs: &LibGroups, sel: &Selection) -> LibGroups {
     }
     let mut out: LibGroups = Vec::new();
     for (lib, cls_map) in libs {
-        if !sel.any_lib(lib) {
+        if !sel.any_lib(lib) || sel.lib_excluded(lib) {
             continue;
         }
         let mut kept: Vec<(String, Vec<crate::analyzer::FuncEntry>)> = Vec::new();

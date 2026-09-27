@@ -100,6 +100,9 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  --class PATTERN        只导出这些类（可重复）");
         println!("  --func PATTERN         只导出这些函数（可重复，可写 Class.method）");
         println!("  --fuzzy                上面三个模式串改为子串匹配（默认精确）");
+        println!("  --exclude-lib PATTERN  排除这些库（可重复；前缀规则与 --lib 相同）");
+        println!("  --no-sdk               排除 SDK 库（URL 以 dart: 开头的）");
+        println!("  --app                  只留应用侧代码（再排除 package:flutter）");
         println!();
         println!("  -h, --help            显示此帮助");
         println!("  -V, --version         显示版本");
@@ -142,6 +145,9 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  --class PATTERN        export only these classes (repeatable)");
         println!("  --func PATTERN         export only these functions (repeatable; Class.method works)");
         println!("  --fuzzy                make the three patterns substring matches (default: exact)");
+        println!("  --exclude-lib PATTERN  exclude these libraries (repeatable; same prefix rule as --lib)");
+        println!("  --no-sdk               exclude SDK libraries (URL starts with dart:)");
+        println!("  --app                  app-side code only (also excludes package:flutter)");
         println!("  -h, --help            show this help");
         println!("  -V, --version         show version");
         println!();
@@ -151,7 +157,7 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  get oriented   dae info | libs | classes | functions | largest");
         println!("  find things    dae strings | fields | members | findrefs | callers | callees");
         println!("  object layer   dae pp | objs | stubs");
-        println!("  decompile one  dae getclass | getmethod | getlib");
+        println!("  decompile one  dae getclass | getmethod | getlib | decompile");
         println!("  low-level      dae disasm                  -- see `dae help` for each");
         println!();
         println!("outputs:");

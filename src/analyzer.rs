@@ -630,6 +630,28 @@ impl<'a> Analyzer<'a> {
     /// 在反编译工具里只剩混淆名/默认名）。
     /// 保持 Python dict 插入序语义：lib 与 cls 按函数 ref 升序的首现顺序，
     /// 类内函数按 ref 升序。
+    /// 原始 URL 以 `prefixes` 之一开头的库，返回它们 **mangled 后的库名**
+    /// （`LibGroups` 用的就是这个名字，所以能直接喂给 `Selection::exclude_libs`）。
+    ///
+    /// **按 URL 判，不按 mangled 名猜**：`library_name` 把 `dart:core` 写成 `dart_core`，
+    /// 而一个叫 `dart_core_extra` 的包也会 mangle 成相近的名字——只有 URL 前缀是可证的。
+    /// 实测语料里 535 个库的 URL 形态很干净：21 个 `dart:`、513 个 `package:`、1 个 `file:`，
+    /// 所以 `--no-sdk`（`dart:`）与 `--app`（`dart:` + `package:flutter`）都是纯前缀判定。
+    pub fn lib_names_by_url_prefix(&self, prefixes: &[&str]) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for libs in [&self.vm.libraries, &self.iso.libraries] {
+            for rec in libs.values() {
+                let Some(url) = self.sref_str(rec.url_ref) else {
+                    continue;
+                };
+                if prefixes.iter().any(|p| url.starts_with(p)) {
+                    out.insert(crate::engine::restore::library_name(url));
+                }
+            }
+        }
+        out
+    }
+
     pub fn build_functions(&self, include_dart_libs: bool) -> LibGroups {
         struct Lib {
             classes: Vec<(String, Vec<FuncEntry>)>,

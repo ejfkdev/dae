@@ -359,3 +359,147 @@ fn query_commands_are_honest() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// `decompile` 动词与三个作用域 flag。
+///
+/// 每一项都带**负对照**：光断言「加了 --no-sdk 之后没有 dart_* 文件」是假的——
+/// 如果 flag 根本没接上，输出可能恰好也没有那些文件。所以同时断言「不加 flag 时
+/// 确实有 dart_* 文件」，两边一比才证明是这个 flag 起的作用。
+#[test]
+fn decompile_verb_and_scope_flags() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 decompile/作用域门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let tmp = root.join("target").join("cli_query_scope");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let dir = |n: &str| tmp.join(n).to_string_lossy().to_string();
+
+    // 取一个真实库名（第一条，按函数数降序）
+    let (libs_out, _e, rc) = run(bin, &["libs", &s]);
+    assert_eq!(rc, 0);
+    let lib = libs_out
+        .lines()
+        .next()
+        .and_then(|l| l.split('\t').next())
+        .expect("libs 没有输出")
+        .to_string();
+
+    // ---------- 共用输出路由：decompile --lib X 与 getlib X 必须逐字节相同 ----------
+    let (a, b) = (dir("a"), dir("b"));
+    assert_eq!(run(bin, &["getlib", &s, &lib, "-o", &a]).2, 0);
+    assert_eq!(run(bin, &["decompile", &s, "--lib", &lib, "-o", &b]).2, 0);
+    assert!(
+        !std::path::Path::new(&a).join("dart").exists()
+            || same_tree(std::path::Path::new(&a), std::path::Path::new(&b)),
+        "getlib {lib} -o DIR 与 decompile --lib {lib} -o DIR 产物不一致（说是共用路由就得真的一致）"
+    );
+
+    // ---------- 无 -o 走 stdout，且不掺诊断 ----------
+    let (so, se, rc) = run(bin, &["decompile", &s, "--lib", &lib]);
+    assert_eq!(rc, 0, "decompile 到 stdout 失败: {se}");
+    assert!(so.contains("// ===== "), "stdout 应有 `// ===== 库名 =====` 分隔: {}", &so[..so.len().min(200)]);
+    for bad in ["dae:", "SDK profile:", "target:"] {
+        assert!(!so.contains(bad), "decompile 的 stdout 混进了诊断行 {bad:?}");
+    }
+    // 诊断行必须在 stderr 而不是被丢掉：`SDK profile:` 由 detect 打在 stderr
+    assert!(
+        se.contains("SDK profile:") || se.contains("dae:"),
+        "decompile 的 stderr 既没有 SDK 行也没有 dae: 行，诊断可能被吞了: {se:?}"
+    );
+
+    // ---------- --no-sdk / --app / --exclude-lib：都要有负对照 ----------
+    let (all, nosdk, app, excl) = (dir("all"), dir("nosdk"), dir("app"), dir("excl"));
+    for (d, extra) in [
+        (&all, &[][..]),
+        (&nosdk, &["--no-sdk"][..]),
+        (&app, &["--app"][..]),
+        (&excl, &["--exclude-lib", lib.as_str()][..]),
+    ] {
+        let mut argv: Vec<&str> = vec!["decompile", &s, "-o", d];
+        argv.extend_from_slice(extra);
+        let (_o, e, rc) = run(bin, &argv);
+        assert_eq!(rc, 0, "decompile {extra:?} 失败: {e}");
+    }
+    let dart_files = |d: &str| -> Vec<String> {
+        let p = std::path::Path::new(d).join("dart");
+        let mut v: Vec<String> = std::fs::read_dir(&p)
+            .unwrap_or_else(|_| panic!("{d}/dart 不存在"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let (f_all, f_nosdk, f_app, f_excl) =
+        (dart_files(&all), dart_files(&nosdk), dart_files(&app), dart_files(&excl));
+
+    // 负对照：不加 flag 时**确实有** dart_* 文件，否则下面的断言全是空过
+    assert!(
+        f_all.iter().any(|n| n.starts_with("dart_")),
+        "语料里没有 dart_* 库，--no-sdk 的断言会空过——换语料或换判据"
+    );
+    assert!(
+        !f_nosdk.iter().any(|n| n.starts_with("dart_")),
+        "--no-sdk 之后仍有 dart_* 文件: {:?}",
+        f_nosdk.iter().filter(|n| n.starts_with("dart_")).take(3).collect::<Vec<_>>()
+    );
+    assert!(
+        f_nosdk.len() < f_all.len(),
+        "--no-sdk 没有减少库数（{} → {}），flag 可能没接上",
+        f_all.len(),
+        f_nosdk.len()
+    );
+    // --app 是 --no-sdk 的超集排除：结果必须 ⊆，且不含 flutter_*
+    assert!(
+        f_app.iter().all(|n| f_nosdk.contains(n)),
+        "--app 的结果不是 --no-sdk 的子集（--app 应排除得更多）"
+    );
+    assert!(
+        !f_app.iter().any(|n| n.starts_with("flutter_")),
+        "--app 之后仍有 flutter_* 文件"
+    );
+    // --exclude-lib 精确挖掉那一个库，其余不动
+    let stem = lib.replace(['$', '/', ':'], "_");
+    assert!(
+        !f_excl.iter().any(|n| n == &format!("{stem}.dart")),
+        "--exclude-lib {lib} 没有排除掉 {stem}.dart"
+    );
+    assert_eq!(
+        f_excl.len(),
+        f_all.len() - 1,
+        "--exclude-lib 多排除了别的库（{} → {}，应只少 1）",
+        f_all.len(),
+        f_excl.len()
+    );
+
+    // ---------- --app 与 --no-sdk 互斥（clap 层就该拒）----------
+    let (_o, _e, rc) = run(bin, &["decompile", &s, "--app", "--no-sdk"]);
+    assert_ne!(rc, 0, "--app 与 --no-sdk 同时给应当被拒（一个是另一个的超集）");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// 两棵产物树是否逐文件相同。
+fn same_tree(a: &Path, b: &Path) -> bool {
+    fn walk(d: &Path, pre: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut m = std::collections::BTreeMap::new();
+        let Ok(rd) = std::fs::read_dir(d) else { return m };
+        for e in rd.flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(pre).unwrap().to_string_lossy().to_string();
+            if p.is_dir() {
+                for (k, v) in walk(&p, pre) {
+                    m.insert(format!("{rel}/{k}"), v);
+                }
+            } else {
+                m.insert(rel, std::fs::read(&p).unwrap_or_default());
+            }
+        }
+        m
+    }
+    walk(a, a) == walk(b, b)
+}
