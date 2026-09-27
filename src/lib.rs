@@ -3,6 +3,8 @@ pub mod args;
 pub mod cli;
 #[cfg(feature = "asm")]
 pub mod decompiler;
+#[cfg(feature = "asm")]
+pub mod disasm;
 pub mod engine;
 pub mod export;
 pub mod locale;

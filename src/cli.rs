@@ -1121,7 +1121,7 @@ fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
             return Err(no_match("disasm", &sel, &all, lang));
         }
         let arm64 = a.platform.arch == "arm64";
-        let cs = if arm64 { Some(crate::export::asm::build_cs()?) } else { None };
+        let cs = if arm64 { Some(crate::disasm::build_cs(true)?) } else { None };
         let mut out = String::new();
         let mut n = 0usize;
         'outer: for (lib, cls_map) in &picked {
@@ -1133,7 +1133,9 @@ fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
                     let Some((entry, csize)) = a.code_range(e.idx) else {
                         continue;
                     };
-                    let foff = entry + a.slice_off;
+                    // 防回绕：见 crate::disasm::function_code
+                    let (foff, _) = crate::disasm::function_code(a.data, a.slice_off, entry, csize)
+                        .ok_or_else(|| "函数字节超出文件范围".to_string())?;
                     let full = if cls.is_empty() {
                         format!("{lib}.{}", e.mangled)
                     } else {
@@ -1147,7 +1149,7 @@ fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
                         tr(lang, "字节", "bytes")
                     );
                     let text = if let Some(cs) = &cs {
-                        crate::export::asm::render_one(a, cs, &e.mangled, entry, csize, foff, entry)?
+                        crate::export::asm::render_one(a, cs, &e.mangled, entry, csize, entry)?
                     } else {
                         crate::decompiler::disasm_text(a, entry, csize, foff)?
                     };

@@ -34,10 +34,7 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     };
 
     // 分块并行生成，顺序 concat（输出字节序不变）
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
+    let n_threads = crate::analyzer::n_threads();
     let n = entries.len();
     let chunk = n.div_ceil(n_threads).max(1);
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -112,10 +109,7 @@ fn write_objs(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
         .filter(|(_, (cid, _))| *cid >= imin)
         .map(|(r, _)| *r)
         .collect();
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
+    let n_threads = crate::analyzer::n_threads();
     let n = cands.len();
     let chunk = n.div_ceil(n_threads).max(1);
     let mut ranges: Vec<(usize, usize)> = Vec::new();

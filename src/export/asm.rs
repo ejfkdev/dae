@@ -4,7 +4,6 @@
 //! 全部从 Profile 取值（不再硬编码 0x60/0x17/x26 等）。
 
 use crate::analyzer::{Analyzer, LibGroups};
-use capstone::arch;
 use capstone::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -31,7 +30,6 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
         ep: u64,
         csize: u64,
         payload: u64,
-        foff: u64,
     }
     struct Job {
         path: std::path::PathBuf,
@@ -75,8 +73,16 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                 let Some((payload, csize)) = analyzer.code_range(f.idx) else {
                     continue;
                 };
-                let foff = payload + analyzer.slice_off;
-                if foff as usize + csize as usize > analyzer.data.len() {
+                // 越界（或加法回绕）的函数在这里就跳过——与 render_one 里的检查同源，
+                // 见 crate::disasm::function_code 的说明：错位反汇编是指标看不见的。
+                if crate::disasm::function_code(
+                    analyzer.data,
+                    analyzer.slice_off,
+                    payload,
+                    csize,
+                )
+                .is_none()
+                {
                     continue;
                 }
                 est += 96 + f.mangled.len() + csize as usize * 12;
@@ -85,7 +91,6 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                     ep: f.ep,
                     csize,
                     payload,
-                    foff,
                 });
             }
         }
@@ -95,30 +100,16 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
     let acc_plan = t0.elapsed() - acc_build;
 
     // ---------- 阶段 B（并行）：反汇编 + 格式化 + 写文件 ----------
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
+    let n_threads = crate::analyzer::n_threads();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let t0 = std::time::Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..n_threads {
             scope.spawn(|| {
-                let cs = Capstone::new()
-                    .arm64()
-                    .mode(arch::arm64::ArchMode::Arm)
-                    .detail(false)
-                    .build()
-                    .map_err(|e| format!("capstone 初始化失败: {e}"));
-                // 开 skipdata：函数入口前常带 0 填充/对齐字节，遇到非指令字节要还原成
-                // `.byte ..` 继续，否则整段代码会被判为反汇编失败而消失（实测踩过）。
-                let cs = cs.and_then(|mut c| {
-                    c.set_skipdata(true)
-                        .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
-                    Ok(c)
-                });
-                let cs = match cs {
+                // asm/ 产物按设计只出 arm64（见 export::run_with 的 do_asm），
+                // 但引擎构造走共享基元，参数由架构决定而不是写死。
+                let cs = match crate::disasm::build_cs(analyzer.platform.arch == "arm64") {
                     Ok(c) => c,
                     Err(e) => {
                         *err.lock().unwrap() = Some(e);
@@ -137,7 +128,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                     let mut of = String::with_capacity(job.est);
                     of.push_str(&job.header);
                     for p in &job.plan {
-                        match render_one(analyzer, &cs, &p.mangled, p.ep, p.csize, p.foff, p.payload)
+                        match render_one(analyzer, &cs, &p.mangled, p.ep, p.csize, p.payload)
                         {
                             Ok(text) => of.push_str(&text),
                             Err(e) => {
@@ -179,13 +170,15 @@ pub fn render_one(
     mangled: &str,
     ep: u64,
     csize: u64,
-    foff: u64,
     payload: u64,
 ) -> Result<String, String> {
-    if foff as usize + csize as usize > analyzer.data.len() {
+    // 文件偏移在这里算（原来是调用方算好传进来，于是三个调用点各有一份裸加法）。
+    // 反汇编地址仍是 payload（运行时入口），不是文件偏移。
+    let Some((_foff, code)) =
+        crate::disasm::function_code(analyzer.data, analyzer.slice_off, payload, csize)
+    else {
         return Err("函数字节超出文件范围".to_string());
-    }
-    let code = &analyzer.data[foff as usize..(foff + csize) as usize];
+    };
     let insns_all = cs
         .disasm_all(code, payload)
         .map_err(|e| format!("capstone disassembly failed: {e}"))?;
@@ -216,19 +209,6 @@ pub fn render_one(
     }
     of.push_str("  }\n");
     Ok(of)
-}
-
-/// disasm/as 子命令共用：arm64 capstone（开 skipdata）
-pub fn build_cs() -> Result<Capstone, String> {
-    let mut c = Capstone::new()
-        .arm64()
-        .mode(arch::arm64::ArchMode::Arm)
-        .detail(false)
-        .build()
-        .map_err(|e| format!("capstone 初始化失败: {e}"))?;
-    c.set_skipdata(true)
-        .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
-    Ok(c)
 }
 
 fn first_word(s: &str) -> Option<&str> {

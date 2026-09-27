@@ -10,7 +10,6 @@
 
 use std::io::Write as _;
 use crate::analyzer::{Analyzer, LibGroups};
-use capstone::arch;
 use capstone::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -121,10 +120,7 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
     let is_arm64 = analyzer.platform.arch == "arm64";
     let data = analyzer.data;
     let slice_off = analyzer.slice_off;
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
+    let n_threads = crate::analyzer::n_threads();
     let chunk = plan.len().div_ceil(n_threads).max(1);
     let ranges: Vec<(usize, usize)> = (0..plan.len())
         .step_by(chunk)
@@ -136,45 +132,21 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
         for (pi, &(b, e)) in ranges.iter().enumerate() {
             let tx = tx.clone();
             scope.spawn(move || {
-                let cs = if is_arm64 {
-                    Capstone::new()
-                        .arm64()
-                        .mode(arch::arm64::ArchMode::Arm)
-                        .detail(false)
-                        .build()
-                } else {
-                    Capstone::new()
-                        .x86()
-                        .mode(arch::x86::ArchMode::Mode64)
-                        .syntax(arch::x86::ArchSyntax::Intel)
-                        .detail(false)
-                        .build()
-                };
-                let cs = match cs {
-                    Ok(mut c) => {
-                        if let Err(e) = c.set_skipdata(true) {
-                            let _ = tx.send((pi, Vec::new(), Some(format!("capstone skipdata: {e}"))));
-                            return;
-                        }
-                        c
-                    }
+                let cs = match crate::disasm::build_cs(is_arm64) {
+                    Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send((pi, Vec::new(), Some(format!("capstone 初始化失败: {e}"))));
+                        let _ = tx.send((pi, Vec::new(), Some(e)));
                         return;
                     }
                 };
                 let mut out: Vec<Edge> = Vec::new();
                 for &(ep, payload, csize, ref fname) in &plan_ref[b..e] {
-                    let foff = payload + slice_off;
-                    // 用 u64 判，且避免任何加法回绕（`foff + csize` 回绕会绕过检查）
-                    let end = match foff.checked_add(csize) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    if end > data.len() as u64 {
+                    // 切片与边界（含防回绕）走共享基元；反汇编地址仍是 payload 而非文件偏移
+                    let Some((_foff, code)) =
+                        crate::disasm::function_code(data, slice_off, payload, csize)
+                    else {
                         continue;
-                    }
-                    let code = &data[foff as usize..(foff + csize) as usize];
+                    };
                     let Ok(insns) = cs.disasm_all(code, payload) else { continue };
                     for ins in insns.iter() {
                         let Some(mnem) = ins.mnemonic() else { continue };
@@ -381,28 +353,6 @@ fn class_layer_usable(analyzer: &Analyzer) -> bool {
     bad * 2 < total
 }
 
-fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
-    if is_arm64 {
-        Capstone::new()
-            .arm64()
-            .mode(arch::arm64::ArchMode::Arm)
-            .detail(false)
-            .build()
-    } else {
-        Capstone::new()
-            .x86()
-            .mode(arch::x86::ArchMode::Mode64)
-            .syntax(arch::x86::ArchSyntax::Intel)
-            .detail(false)
-            .build()
-    }
-    .map_err(|e| format!("capstone 初始化失败: {e}"))
-    .and_then(|mut c| {
-        c.set_skipdata(true)
-            .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
-        Ok(c)
-    })
-}
 
 /// 从 stub 序言解出「被分配的类」→ 名字。
 ///
@@ -513,7 +463,7 @@ fn name_alloc_stubs(
     if targets.is_empty() || !class_layer_usable(analyzer) {
         return out;
     }
-    let Ok(cs) = build_cs(is_arm64) else {
+    let Ok(cs) = crate::disasm::build_cs(is_arm64) else {
         return out;
     };
     for t in targets {
@@ -531,7 +481,7 @@ pub fn alloc_stubs_at(analyzer: &Analyzer, addrs: &[u64]) -> Vec<(u64, Option<St
     if !class_layer_usable(analyzer) {
         return addrs.iter().map(|a| (*a, None)).collect();
     }
-    let Ok(cs) = build_cs(is_arm64) else {
+    let Ok(cs) = crate::disasm::build_cs(is_arm64) else {
         return addrs.iter().map(|a| (*a, None)).collect();
     };
     addrs

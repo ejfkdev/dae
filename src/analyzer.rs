@@ -540,10 +540,7 @@ impl<'a> Analyzer<'a> {
             .iter()
             .map(|(r, e)| (*r, *e))
             .collect();
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(1, 8);
+        let n_threads = n_threads();
         let n = funcs.len();
         let chunk = n.div_ceil(n_threads).max(1);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -877,7 +874,12 @@ fn self_str<'a>(vm: &'a Snapshot, iso: &'a Snapshot, num_base: u64, r: u64) -> O
     }
 }
 
-fn n_threads() -> usize {
+/// 扫描类工作的并行度：跟 CPU 数走，但封顶 8。
+///
+/// 六处调用点原本各抄一遍这个表达式（analyzer 两处、ppobjs 两处、asm、callgraph），
+/// 口径其实完全相同。抄六份的代价不是行数，是**改不动**：真要调这个上限，
+/// 得先确认六处是不是本来就打算一样。
+pub(crate) fn n_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)

@@ -12,7 +12,6 @@
 use crate::analyzer::{Analyzer, FieldRow, LibGroups};
 use crate::engine::snapshot::PoolKind;
 use crate::engine::restore::scrub_name;
-use capstone::arch;
 use capstone::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1777,7 +1776,7 @@ pub fn disasm_text(
 ) -> Result<String, String> {
     let is_arm64 = analyzer.platform.arch == "arm64";
     let rl = roles(analyzer);
-    let cs = build_cs(is_arm64)?;
+    let cs = crate::disasm::build_cs(is_arm64)?;
     if foff as usize + csize as usize > analyzer.data.len() {
         return Err("函数字节超出文件范围".to_string());
     }
@@ -2090,38 +2089,6 @@ fn lift_chunks(
     (extra, chunk_addrs)
 }
 
-/// 建 capstone 实例。**开 skipdata**：遇到非指令字节（函数入口前的 0 填充、对齐
-/// padding）不中断整段反汇编，而是还原成 `.byte ..` 继续走——否则一个坏字节会让
-/// 整个函数从产物里消失（实测 `dart compile exe` 的部分函数入口前就带 16 字节 0）。
-/// 建 capstone 引擎。
-///
-/// **`.detail(false)`**：全仓库只用 `mnemonic()` / `op_str()` / `address()` / `bytes()`，
-/// 从不调 `insn_detail()` / `arch_detail()` / `operands()`（已 grep 确认零处）。detail 模式会让
-/// capstone 为每条指令额外解析并存储完整操作数结构，是反汇编的主要开销之一，而 lift 在
-/// 33× 提速之后仍占 render 的 66.8%，所以这里不该付这笔钱。
-/// 改这一项必须用「产物逐字节对拍」验证，不能只看它编译过。
-fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
-    let c = if is_arm64 {
-        Capstone::new()
-            .arm64()
-            .mode(arch::arm64::ArchMode::Arm)
-            .detail(false)
-            .build()
-    } else {
-        Capstone::new()
-            .x86()
-            .mode(arch::x86::ArchMode::Mode64)
-            .syntax(arch::x86::ArchSyntax::Intel)
-            .detail(false)
-            .build()
-    }
-    .map_err(|e| format!("capstone 初始化失败: {e}"))?;
-    let mut c = c;
-    c.set_skipdata(true)
-        .map_err(|e| format!("capstone skipdata 设置失败: {e}"))?;
-    Ok(c)
-}
-
 // ---------------------------------------------------------------- entry
 
 pub fn write(
@@ -2158,7 +2125,7 @@ pub fn render(
     };
     let is_arm64 = analyzer.platform.arch == "arm64";
     let rl = roles(analyzer);
-    let cs = build_cs(is_arm64)?;
+    let cs = crate::disasm::build_cs(is_arm64)?;
 
     // 字段名：Field 簇（直接写着）+ 访问器名推断（隐式 getter/setter 的名字）。
     let fctx = {
@@ -2486,7 +2453,7 @@ pub fn field_rows_of(analyzer: &Analyzer, rec: &RecoveredFields) -> Vec<FieldRow
 pub fn recover_fields(analyzer: &Analyzer) -> Result<RecoveredFields, String> {
     let is_arm64 = analyzer.platform.arch == "arm64";
     let rl = roles(analyzer);
-    let cs = build_cs(is_arm64)?;
+    let cs = crate::disasm::build_cs(is_arm64)?;
     let word = analyzer.profile.word_size;
     let mut by_class_off = analyzer.field_by_class_off.clone();
     let from_records = by_class_off.len();
