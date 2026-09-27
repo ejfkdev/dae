@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod args;
 pub mod cli;
 #[cfg(feature = "asm")]
 pub mod decompiler;

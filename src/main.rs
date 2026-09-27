@@ -1,345 +1,79 @@
 //! Dart AOT 快照调试信息导出工具（配置驱动）。
 //!
 //! 用法:
-//!   dae <binary> <out_dir> [--sdk-profile P] [--platform-profile P] [--no-asm]
+//!   dae <binary> <out_dir> [--sdk-profile P] [--platform-profile P] [--decompile]
+//!   dae <subcommand> <binary> [...]      # 渐进式，见 `dae help`
+//!
+//! 本文件只负责三件事：选语言、截获 `-h`/`-V`（要出双语文本）、把快捷形式补成
+//! `export` 子命令后交给 clap。命令树声明在 `src/args.rs`，实现在 `src/cli.rs`。
 
-use dae::analyzer::Analyzer;
-use dae::export;
-use dae::platform;
-use dae::profile::{parse_sdk, PlatformProfile, SdkProfile};
-use std::path::PathBuf;
+use clap::Parser;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 
 fn main() {
     let lang = dae::locale::detect();
     let s = dae::locale::messages(lang);
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // 渐进式模式：`dae <子命令> ...`（见 src/cli.rs）。判定只看第一个参数是否是已知
-    // 子命令名——本机文件恰好同名时写 `./info` 即可落回全量导出。
-    if let Some(first) = args.first() {
-        if dae::cli::is_subcommand(first) {
-            std::process::exit(dae::cli::dispatch(&args, lang, &s));
-        }
-    }
-    let mut positional: Vec<String> = Vec::new();
-    let mut sel = dae::selection::Selection::default();
-    let mut sdk_override: Option<PathBuf> = None;
-    let mut platform_override: Option<PathBuf> = None;
-    let mut decompile = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--sdk-profile" => {
-                if i + 1 >= args.len() {
-                    eprintln!("{}", s.err_sdk_arg);
-                    std::process::exit(2);
-                }
-                sdk_override = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--platform-profile" => {
-                if i + 1 >= args.len() {
-                    eprintln!("{}", s.err_platform_arg);
-                    std::process::exit(2);
-                }
-                platform_override = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--decompile" => {
-                decompile = true;
-                i += 1;
-            }
-            "--lib" => {
-                if i + 1 >= args.len() {
-                    eprintln!("--lib 需要一个取值");
-                    std::process::exit(2);
-                }
-                sel.libs.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--class" => {
-                if i + 1 >= args.len() {
-                    eprintln!("--class 需要一个取值");
-                    std::process::exit(2);
-                }
-                sel.classes.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--func" => {
-                if i + 1 >= args.len() {
-                    eprintln!("--func 需要一个取值");
-                    std::process::exit(2);
-                }
-                sel.funcs.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--fuzzy" => {
-                sel.fuzzy = true;
-                i += 1;
-            }
-            "--help" | "-h" => {
-                print_help(&s);
-                std::process::exit(0);
-            }
-            "--version" | "-V" => {
-                println!("dae {}", env!("GIT_VERSION"));
-                std::process::exit(0);
-            }
-            _ => {
-                positional.push(args[i].clone());
-                i += 1;
-            }
-        }
-    }
-    if positional.len() < 2 {
+
+    // 无参数：打帮助并以 2 退出（用法错误）。文本用本项目双语版而不是 clap 自动生成的。
+    if args.is_empty() {
         print_help(&s);
         std::process::exit(2);
     }
-    let bin = &positional[0];
-    let out = &positional[1];
-
-    if let Err(e) = run(
-        bin,
-        out,
-        sdk_override.as_deref(),
-        platform_override.as_deref(),
-        decompile,
-        &sel,
-        &s,
-    ) {
-        eprintln!("{}: {e}", s.err_prefix);
-        std::process::exit(1);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run(
-    bin: &str,
-    out: &str,
-    sdk_override: Option<&std::path::Path>,
-    platform_override: Option<&std::path::Path>,
-    decompile: bool,
-    sel: &dae::selection::Selection,
-    s: &dae::locale::Messages,
-) -> Result<(), String> {
-    let since = std::time::Instant::now();
-    let bin_path = dae::cli::resolve_binary(bin, s)?;
-    let data = std::fs::read(&bin_path)
-        .map_err(|e| format!("{} {bin_path}: {e}", s.err_read_binary))?;
-    if std::env::var("DART_AOT_TIMINGS").is_ok() {
-        eprintln!("[timing] 读文件({} MB): {:?}", data.len() >> 20, since.elapsed());
-    }
-
-    // 平台 Profile：显式覆盖或按容器+架构自动选择（与渐进式子命令共用同一份逻辑）
-    let platform: PlatformProfile = dae::cli::resolve_platform(&data, platform_override, s)?;
-
-    // 快照偏移定位（自动识别与解析共用同一份结果）
-    let (snap_offs, used_fallback) = platform::locate_snapshots(&data, &platform)?;
-
-    // SDK Profile：版本自动识别（hash 指纹 → 结构探针），--sdk-profile 强制覆盖
-    let sdk_storage;
-    let sdk: &SdkProfile = if let Some(p) = sdk_override {
-        let c = std::fs::read_to_string(p).map_err(|e| format!("读 --sdk-profile: {e}"))?;
-        sdk_storage = parse_sdk(&c)?;
-        &sdk_storage
-    } else {
-        dae::profile::detect::detect_or_default(&data, snap_offs, s)
-    };
-
-    if sdk.status != "verified" {
-        eprintln!(
-            "{}: {} {} {}",
-            s.warn_prefix, s.sdk_profile_label, sdk.abi, s.sdk_unverified
-        );
-    }
-    println!(
-        "{}: {} ({} {})",
-        s.target_label, bin_path, platform.container.kind, platform.arch
-    );
-    let analyzer = Analyzer::new_located(&data, sdk, &platform, snap_offs, used_fallback)?;
-    // 内部诊断（快照头/对象计数/指令表）：默认不刷屏，仅调试与回归时 DART_AOT_VERBOSE=1 展示
-    if std::env::var("DART_AOT_VERBOSE").is_ok() {
-        println!(
-            "VM kinds={}  ISO kinds={} (kind={})",
-            analyzer.vm.kind,
-            analyzer.iso.kind,
-            if analyzer.iso.kind == sdk.full_aot_kind { "FullAOT" } else { "?" }
-        );
-        println!(
-            "VM: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
-            analyzer.vm.hdr.get("num_base_objects"),
-            analyzer.vm.hdr.get("num_objects"),
-            analyzer.vm.hdr.get("num_clusters"),
-            analyzer.vm.hdr.get("instructions_table_len"),
-            analyzer.vm.hdr.get("instructions_table_rodata_offset"),
-        );
-        println!(
-            "ISO: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
-            analyzer.iso.hdr.get("num_base_objects"),
-            analyzer.iso.hdr.get("num_objects"),
-            analyzer.iso.hdr.get("num_clusters"),
-            analyzer.iso.hdr.get("instructions_table_len"),
-            analyzer.iso.hdr.get("instructions_table_rodata_offset"),
-        );
-        println!(
-            "strings vm={} iso={} classes vm={} iso={} libs vm={} iso={} funcs vm={} iso={}",
-            analyzer.vm.strings.len(),
-            analyzer.iso.strings.len(),
-            analyzer.vm.classes.len(),
-            analyzer.iso.classes.len(),
-            analyzer.vm.libraries.len(),
-            analyzer.iso.libraries.len(),
-            analyzer.vm.functions.len(),
-            analyzer.iso.functions.len(),
-        );
-        println!(
-            "InstructionsTable: first_entry_with_code={} n_entries={} instr_base(file-offset)={:#x}",
-            analyzer.first_entry,
-            analyzer.pc_offsets.len(),
-            analyzer.instr_base
-        );
-    }
-
-    // 输出目录的绝对路径（不解析软链、不要求已存在，仅把相对路径接到 cwd 上），
-    // 便于调用方/脚本直接复制取用最终产物位置。
-    let out_abs = std::path::absolute(out)
-        .map_err(|e| format!("解析输出目录绝对路径 {out}: {e}"))?;
-    let out_display = out_abs.display().to_string();
-    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
-        #[cfg(feature = "asm")]
-        {
-            dae::decompiler::pool_debug(&analyzer);
+    // 帮助与版本先截获：clap 的那份是英文通用 flag 列表，而本项目的帮助写了每个命令的
+    // 输出列格式与命名口径，且是双语的。
+    match args[0].as_str() {
+        "-h" | "--help" => {
+            print_help(&s);
+            std::process::exit(0);
         }
-    }
-    let filtered_libs = dae::selection::filter_libs(&analyzer.build_functions(true), sel);
-    if !sel.is_empty() {
-        let (nl, nc, nf) = dae::selection::counts(&filtered_libs);
-        if nf == 0 {
-            return Err(format!(
-                "{}（筛选后库 0 / 类 0 / 函数 0）",
-                s.err_no_match
-            ));
+        "-V" | "--version" => {
+            println!("dae {}", env!("GIT_VERSION"));
+            std::process::exit(0);
         }
-        println!(
-            "{}: {} {}, {} {}, {} {}",
-            s.target_label, nl, s.sum_libs, nc, s.sum_classes, nf, s.sum_funcs
-        );
-    }
-    // 解析漂移 = 快照布局与所选 Profile 不匹配（实测：移动端 product + compressed-pointers
-    // 产物会漂成 libraries=1/classes=1）。此时**所有**产物都不可信，但对象池/字符串这类
-    // 原始 dump 仍可人工核对，所以照常落盘、额外写一份 PARSE_DRIFT.txt，并以非零退出码收尾
-    // ——让脚本和人都不会把垃圾当成结果。
-    let drift: Vec<String> = analyzer
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("!!! drift") || w.starts_with("!! alloc mismatch"))
-        .cloned()
-        .collect();
-
-    let summary = export::run_with(&analyzer, &out_abs, sel)?;
-    println!("{} {}:", s.export_done, out_display);
-    println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
-    println!("  ida_script/addNames.py    {} {}", summary.ida_functions, s.sum_ida);
-    println!("  frida.js                  {} {}", summary.frida_classes, s.sum_frida);
-    if summary.asm_enabled {
-        println!("  asm/                      {} {}", summary.asm_functions, s.sum_asm);
-    }
-    println!("  text/pp.txt               {} {}", summary.pp_entries, s.sum_pp);
-    println!("  text/objs.txt             {} {}", summary.objs_instances, s.sum_objs);
-    println!("  text/strings.txt          {} {}", summary.textinfo.strings, s.sum_strings);
-    println!("  text/libs.txt             {} {}", summary.textinfo.libs, s.sum_libs);
-    println!("  text/classes.txt          {} {}", summary.textinfo.classes, s.sum_classes);
-    println!("  text/functions.txt        {} {}", summary.textinfo.functions, s.sum_funcs);
-    println!("  text/arrays.txt           {} {}", summary.textinfo.arrays, s.sum_arrays);
-    println!("  text/maps.txt             {} {}", summary.textinfo.maps, s.sum_maps);
-    if summary.textinfo.fields > 0 {
-        println!("  text/fields.txt           {} {}", summary.textinfo.fields, s.sum_fields);
-    }
-    if let Some((total, named)) = summary.stubs {
-        println!("  text/stubs.txt            {total} {}（{named} {}）", s.sum_stubs, s.sum_named);
-    }
-    if let Some((_f, d, dr, i)) = summary.callgraph {
-        println!(
-            "  call_edges.txt            {} {} + {} {}（{} {}）",
-            d, s.sum_cg_d, i, s.sum_cg_i, dr, s.sum_cg_r
-        );
+        _ => {}
     }
 
-    if decompile {
-        #[cfg(feature = "asm")]
-        {
-            let st = dae::decompiler::write(&analyzer, &filtered_libs, &out_abs)?;
-            println!(
-                "  dart/                     {} {} ({} {} / {} {}; {} {}, {} {}; {} {} {}; {} {}, {} {})",
-                st.funcs,
-                s.sum_dart,
-                st.blocks,
-                s.sum_blocks,
-                st.stmts,
-                s.sum_stmts,
-                st.structured,
-                s.sum_structured,
-                st.fallback,
-                s.sum_unstructured,
-                st.unmapped,
-                s.sum_unmapped,
-                s.sum_lines,
-                st.calls,
-                s.sum_calls,
-                st.calls_named,
-                s.sum_named
+    // 快捷形式：第一个参数不是已知子命令 ⇒ 当成 `export` 的参数。
+    // 于是 `dae App.app out/ --decompile` 与 `dae export App.app out/ --decompile` 完全等价。
+    // 本机恰好有个叫 `info` 的文件时写 `./info` 即可落回全量导出（与既有口径一致）。
+    //
+    // 顺带修掉一个歧义：以前 `dae bogus App.app out/` 会把 `bogus` 当二进制路径去读、
+    // 报 "failed to read binary" 并 exit 1；现在 clap 报「unrecognized subcommand」并 exit 2，
+    // 即用法错误该有的退出码。（参考项目 ddc 因为把判定放在路径解析之后，至今仍是前一种。）
+    //
+    // ⚠️ `try_parse_from` 把**第 0 个元素当程序名**，所以这里必须自己补上 "dae"——
+    // 少补一个会让 `dae info` 被读成「程序名 info、缺子命令」。
+    let mut argv: Vec<String> = Vec::with_capacity(args.len() + 2);
+    argv.push("dae".to_string());
+    if !dae::cli::is_subcommand(&args[0]) {
+        argv.push("export".to_string());
+    }
+    argv.extend(args);
+
+    let cli = match dae::args::Cli::try_parse_from(&argv) {
+        Ok(c) => c,
+        Err(e) => {
+            // clap 的用法错误文本只有英文（clap 自身无 i18n）。保留它精确的诊断
+            // （哪个参数、期望什么、正确的 usage 行），另加一行双语指路，
+            // 免得中文用户只看到英文。
+            //
+            // 退出码 **2 = 用法错误**，与本项目既有口径一致；手写解析器时代
+            // `dae info bin --nope` 报的是 1，把用法错误混进了运行期错误。
+            eprintln!(
+                "{}: {}",
+                s.err_prefix,
+                lang.pick(
+                    "用法错误（`dae help` 列出全部命令与选项）",
+                    "usage error (`dae help` lists every command and option)"
+                )
             );
+            e.exit()
         }
-        #[cfg(not(feature = "asm"))]
-        eprintln!("note: --decompile needs the `asm` feature (capstone); rebuild with default features");
-    }
-
-    for w in &analyzer.warnings {
-        eprintln!("{}: {w}", s.warn_prefix);
-    }
-    if let Ok(dump) = std::env::var("DART_AOT_DUMP_STRINGS") {
-        let mut csv = String::new();
-        for (k, v) in analyzer.iso.strings.iter() {
-            let v = v.clone().unwrap_or_else(|| "<None>".to_string());
-            csv.push_str(&format!("{k}\t{}\n", v.replace('\t', "\\t").replace('\n', "\\n")));
-        }
-        std::fs::write(&dump, csv).map_err(|e| format!("dump strings: {e}"))?;
-        eprintln!("strings dumped to {dump}");
-    }
-    println!(
-        "{} ({} {:.3}s)",
-        s.done_label,
-        s.elapsed_label,
-        since.elapsed().as_secs_f64()
-    );
-    if !drift.is_empty() {
-        let mut body = String::from(
-            "Snapshot parse drifted: the SDK profile does not match this binary.\n\
-             Every artifact in this directory was produced from a mismatched parse and must not be trusted.\n\
-             The raw dumps (text/strings.txt, text/pp.txt) are still worth reading by hand.\n\n",
-        );
-        for w in &drift {
-            body.push_str(w);
-            body.push('\n');
-        }
-        body.push_str(
-            "\nCommon cause: a mobile/Android build (features string contains `compressed-pointers`,\n\
-             and often `dwarf_stack_traces_mode`) analyzed with a desktop profile.\n\
-             Run `dae info <binary>` to see the detected SDK and the warnings, then pass an\n\
-             explicit --sdk-profile if you have one for that build.\n",
-        );
-        let _ = std::fs::write(out_abs.join("PARSE_DRIFT.txt"), &body);
-        eprintln!("{}", s.parse_drift_fatal);
-        return Err(if s.lang == dae::locale::Lang::Zh {
-            format!("快照解析漂移（{} 条告警）——产物不可信，详见 {}/PARSE_DRIFT.txt", drift.len(), out_abs.display())
-        } else {
-            format!("parse drifted ({} warnings) -- artifacts not trustworthy, see {}/PARSE_DRIFT.txt", drift.len(), out_abs.display())
-        });
-    }
-    Ok(())
+    };
+    std::process::exit(dae::cli::run_cmd(cli.cmd, lang, &s));
 }
 
 fn print_help(s: &dae::locale::Messages) {

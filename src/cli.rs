@@ -19,6 +19,7 @@
 #[cfg(feature = "asm")]
 use crate::analyzer::LibGroups;
 use crate::analyzer::Analyzer;
+use crate::args::{Cmd, Common, Query, Target};
 use crate::locale::{Lang, Messages};
 use crate::profile::{parse_platform, parse_sdk, PlatformProfile, SdkProfile};
 use crate::selection::{counts, filter_libs, name_hit, norm_lib, Selection};
@@ -26,6 +27,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 pub const SUBCOMMANDS: &[&str] = &[
+    "export",
     "info",
     "libs",
     "classes",
@@ -72,75 +74,34 @@ struct Opts {
     rest: Vec<String>,
 }
 
-/// 统一解析：`<binary>` 恒为第一个位置参数，其余位置参数进 `rest`。
-fn parse_opts(args: &[String], cmd: &str, lang: Lang) -> Result<Opts, String> {
-    let mut o = Opts::default();
-    let need = |i: usize, what: &str| -> Result<String, String> {
-        args.get(i + 1)
-            .cloned()
-            .ok_or_else(|| tr(lang, &format!("{cmd}：{what} 缺少取值"), &format!("{cmd}: {what} needs a value")))
-    };
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--sdk-profile" => {
-                o.sdk = Some(PathBuf::from(need(i, "--sdk-profile")?));
-                i += 2;
-            }
-            "--platform-profile" => {
-                o.platform = Some(PathBuf::from(need(i, "--platform-profile")?));
-                i += 2;
-            }
-            "-o" | "--output" => {
-                o.out = Some(need(i, "-o")?);
-                i += 2;
-            }
-            "-n" | "--limit" => {
-                o.n = Some(
-                    need(i, "-n")?
-                        .parse()
-                        .map_err(|_| tr(lang, "-n 需要一个数字", "-n needs a number"))?,
-                );
-                i += 2;
-            }
-            "-f" | "--find" => {
-                o.find = Some(need(i, "-f")?);
-                i += 2;
-            }
-            "--lib" => {
-                o.libs.push(need(i, "--lib")?);
-                i += 2;
-            }
-            "--class" => {
-                o.classes.push(need(i, "--class")?);
-                i += 2;
-            }
-            "--func" => {
-                o.funcs.push(need(i, "--func")?);
-                i += 2;
-            }
-            "--fuzzy" => {
-                o.fuzzy = true;
-                i += 1;
-            }
-            "-h" | "--help" => {
-                println!("{}", help_for(cmd, lang));
-                std::process::exit(0);
-            }
-            a if a.starts_with('-') && a.len() > 1 && a != "-" => {
-                return Err(tr(lang, &format!("{cmd}：未知选项 {a}"), &format!("{cmd}: unknown option {a}")));
-            }
-            a => {
-                if o.bin.is_none() {
-                    o.bin = Some(a.to_string());
-                } else {
-                    o.rest.push(a.to_string());
-                }
-                i += 1;
-            }
-        }
+/// clap 的解析结果 → 内部统一的 [`Opts`]。
+///
+/// **所有命令共用这一处转换**，所以「某个 flag 被解析了却没传下去」这类 bug 在结构上
+/// 不可能出现——参考项目 ddc 的 `callers` 就解析了 `--dex` 又在重建 argv 时把它丢了，
+/// 于是 `callers x.dex foo -d 不存在的镜像` 照样返回结果而不报错。
+fn opts_of(c: &Common, bin: String, rest: Vec<String>) -> Opts {
+    Opts {
+        bin: Some(bin),
+        sdk: c.sdk_profile.clone(),
+        platform: c.platform_profile.clone(),
+        out: c.output.clone(),
+        n: c.limit,
+        find: c.find.clone(),
+        libs: c.lib.clone(),
+        classes: c.class.clone(),
+        funcs: c.func.clone(),
+        fuzzy: c.fuzzy,
+        rest,
     }
-    Ok(o)
+}
+
+/// `-h/--help` 走本项目自己的双语文本（写了输出列格式与命名口径），不是 clap 自动生成的。
+/// 命中就直接退出 0——与手写解析器时代的行为一致。
+fn maybe_help(c: &Common, cmd: &str, lang: Lang) {
+    if c.help {
+        println!("{}", help_for(cmd, lang));
+        std::process::exit(0);
+    }
 }
 
 impl Opts {
@@ -386,42 +347,47 @@ fn no_match(cmd: &str, sel: &Selection, libs: &LibGroups, lang: Lang) -> String 
 
 // ---------------------------------------------------------------- 子命令
 
-pub fn dispatch(args: &[String], lang: Lang, s: &Messages) -> i32 {
-    let cmd = args[0].as_str();
-    let rest = &args[1..];
+/// 分派 clap 解析好的命令树。
+///
+/// 退出码口径与手写时代一致：**0 成功、1 运行期错误**（`error: …` 走 stderr）、
+/// 用法错误由 clap 在 `main` 里以 **2** 收尾。
+pub fn run_cmd(cmd: Cmd, lang: Lang, s: &Messages) -> i32 {
     let r = match cmd {
-        "help" => {
+        Cmd::Version => {
+            println!("dae {}", env!("GIT_VERSION"));
+            return 0;
+        }
+        Cmd::Help(h) => {
             println!(
                 "{}",
-                match rest.first() {
+                match h.cmd.as_deref() {
                     Some(c) => help_for(c, lang),
                     None => help(lang),
                 }
             );
-            Ok(())
+            return 0;
         }
-        "version" => {
-            println!("dae {}", env!("GIT_VERSION"));
-            Ok(())
+        Cmd::Export(a) => {
+            maybe_help(&a.common, "export", lang);
+            let o = opts_of(&a.common, a.binary, Vec::new());
+            cmd_export(o, &a.out_dir, a.decompile, s)
         }
-        "info" => cmd_info(rest, lang, s),
-        "libs" => cmd_libs(rest, lang, s),
-        "classes" => cmd_classes(rest, lang, s),
-        "functions" => cmd_functions(rest, lang, s),
-        "strings" => cmd_strings(rest, lang, s),
-        "fields" => cmd_fields(rest, lang, s),
-        "largest" => cmd_largest(rest, lang, s),
-        "callers" => cmd_callers(rest, lang, s),
-        "disasm" => cmd_disasm(rest, lang, s),
-        "getclass" | "getmethod" | "getlib" => cmd_get(cmd, rest, lang, s),
-        _ => {
-            eprintln!(
-                "{}",
-                tr(lang, &format!("未知子命令 {cmd}"), &format!("unknown subcommand {cmd}"))
-            );
-            println!("{}", help(lang));
-            std::process::exit(2);
-        }
+
+        // 清单类：`<binary> [pattern]`
+        Cmd::Info(a) => run_query(a, "info", lang, s, cmd_info),
+        Cmd::Libs(a) => run_query(a, "libs", lang, s, cmd_libs),
+        Cmd::Classes(a) => run_query(a, "classes", lang, s, cmd_classes),
+        Cmd::Functions(a) => run_query(a, "functions", lang, s, cmd_functions),
+        Cmd::Largest(a) => run_query(a, "largest", lang, s, cmd_largest),
+        Cmd::Strings(a) => run_query(a, "strings", lang, s, cmd_strings),
+        Cmd::Fields(a) => run_query(a, "fields", lang, s, cmd_fields),
+
+        // 单目标类：`<binary> <name>`
+        Cmd::Callers(a) => run_target(a, "callers", lang, s, cmd_callers),
+        Cmd::Disasm(a) => run_target(a, "disasm", lang, s, cmd_disasm),
+        Cmd::Getclass(a) => run_get(a, "getclass", lang, s),
+        Cmd::Getmethod(a) => run_get(a, "getmethod", lang, s),
+        Cmd::Getlib(a) => run_get(a, "getlib", lang, s),
     };
     match r {
         Ok(()) => 0,
@@ -431,6 +397,25 @@ pub fn dispatch(args: &[String], lang: Lang, s: &Messages) -> i32 {
         }
     }
 }
+
+type CmdFn = fn(Opts, Lang, &Messages) -> Result<(), String>;
+
+fn run_query(a: Query, cmd: &'static str, lang: Lang, s: &Messages, f: CmdFn) -> Result<(), String> {
+    maybe_help(&a.common, cmd, lang);
+    let rest = a.pattern.into_iter().collect();
+    f(opts_of(&a.common, a.binary, rest), lang, s)
+}
+
+fn run_target(a: Target, cmd: &'static str, lang: Lang, s: &Messages, f: CmdFn) -> Result<(), String> {
+    maybe_help(&a.common, cmd, lang);
+    f(opts_of(&a.common, a.binary, vec![a.name]), lang, s)
+}
+
+fn run_get(a: Target, cmd: &'static str, lang: Lang, s: &Messages) -> Result<(), String> {
+    maybe_help(&a.common, cmd, lang);
+    cmd_get(cmd, opts_of(&a.common, a.binary, vec![a.name]), lang, s)
+}
+
 
 /// 目标选择：子命令的第二个位置参数（模式串）
 #[cfg(feature = "asm")]
@@ -475,9 +460,235 @@ enum TargetKind {
     Any,
 }
 
+// ---- export（全量/筛选导出；也就是 `dae <binary> <out_dir>` 快捷形）----
+
+/// 全量导出。摘要走 **stdout**（这是全量模式的人读通道，`tests/dart_valid.rs` 与
+/// `tests/app_truth.rs` 都要解析其中 `dart/` 那一行的计数），告警与错误走 stderr。
+/// 与子命令的口径相反——子命令 stdout 只放数据，见 [`emit`]。
+fn cmd_export(o: Opts, out: &str, decompile: bool, s: &Messages) -> Result<(), String> {
+    let bin = o.bin("export", s.lang)?;
+    let sdk_override = o.sdk.as_deref();
+    let platform_override = o.platform.as_deref();
+    let sel = o.selection();
+    let since = std::time::Instant::now();
+    let bin_path = resolve_binary(bin, s)?;
+    let data = std::fs::read(&bin_path)
+        .map_err(|e| format!("{} {bin_path}: {e}", s.err_read_binary))?;
+    if std::env::var("DART_AOT_TIMINGS").is_ok() {
+        eprintln!("[timing] 读文件({} MB): {:?}", data.len() >> 20, since.elapsed());
+    }
+
+    // 平台 Profile：显式覆盖或按容器+架构自动选择（与渐进式子命令共用同一份逻辑）
+    let platform: PlatformProfile = resolve_platform(&data, platform_override, s)?;
+
+    // 快照偏移定位（自动识别与解析共用同一份结果）
+    let (snap_offs, used_fallback) = crate::platform::locate_snapshots(&data, &platform)?;
+
+    // SDK Profile：版本自动识别（hash 指纹 → 结构探针），--sdk-profile 强制覆盖
+    let sdk_storage;
+    let sdk: &SdkProfile = if let Some(p) = sdk_override {
+        let c = std::fs::read_to_string(p).map_err(|e| format!("读 --sdk-profile: {e}"))?;
+        sdk_storage = parse_sdk(&c)?;
+        &sdk_storage
+    } else {
+        crate::profile::detect::detect_or_default(&data, snap_offs, s)
+    };
+
+    if sdk.status != "verified" {
+        eprintln!(
+            "{}: {} {} {}",
+            s.warn_prefix, s.sdk_profile_label, sdk.abi, s.sdk_unverified
+        );
+    }
+    println!(
+        "{}: {} ({} {})",
+        s.target_label, bin_path, platform.container.kind, platform.arch
+    );
+    let analyzer = Analyzer::new_located(&data, sdk, &platform, snap_offs, used_fallback)?;
+    // 内部诊断（快照头/对象计数/指令表）：默认不刷屏，仅调试与回归时 DART_AOT_VERBOSE=1 展示
+    if std::env::var("DART_AOT_VERBOSE").is_ok() {
+        println!(
+            "VM kinds={}  ISO kinds={} (kind={})",
+            analyzer.vm.kind,
+            analyzer.iso.kind,
+            if analyzer.iso.kind == sdk.full_aot_kind { "FullAOT" } else { "?" }
+        );
+        println!(
+            "VM: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
+            analyzer.vm.hdr.get("num_base_objects"),
+            analyzer.vm.hdr.get("num_objects"),
+            analyzer.vm.hdr.get("num_clusters"),
+            analyzer.vm.hdr.get("instructions_table_len"),
+            analyzer.vm.hdr.get("instructions_table_rodata_offset"),
+        );
+        println!(
+            "ISO: base_obj={} obj={} clusters={} instr_tbl_len={} rodata={:#x}",
+            analyzer.iso.hdr.get("num_base_objects"),
+            analyzer.iso.hdr.get("num_objects"),
+            analyzer.iso.hdr.get("num_clusters"),
+            analyzer.iso.hdr.get("instructions_table_len"),
+            analyzer.iso.hdr.get("instructions_table_rodata_offset"),
+        );
+        println!(
+            "strings vm={} iso={} classes vm={} iso={} libs vm={} iso={} funcs vm={} iso={}",
+            analyzer.vm.strings.len(),
+            analyzer.iso.strings.len(),
+            analyzer.vm.classes.len(),
+            analyzer.iso.classes.len(),
+            analyzer.vm.libraries.len(),
+            analyzer.iso.libraries.len(),
+            analyzer.vm.functions.len(),
+            analyzer.iso.functions.len(),
+        );
+        println!(
+            "InstructionsTable: first_entry_with_code={} n_entries={} instr_base(file-offset)={:#x}",
+            analyzer.first_entry,
+            analyzer.pc_offsets.len(),
+            analyzer.instr_base
+        );
+    }
+
+    // 输出目录的绝对路径（不解析软链、不要求已存在，仅把相对路径接到 cwd 上），
+    // 便于调用方/脚本直接复制取用最终产物位置。
+    let out_abs = std::path::absolute(out)
+        .map_err(|e| format!("解析输出目录绝对路径 {out}: {e}"))?;
+    let out_display = out_abs.display().to_string();
+    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+        #[cfg(feature = "asm")]
+        {
+            crate::decompiler::pool_debug(&analyzer);
+        }
+    }
+    let filtered_libs = filter_libs(&analyzer.build_functions(true), &sel);
+    if !sel.is_empty() {
+        let (nl, nc, nf) = counts(&filtered_libs);
+        if nf == 0 {
+            return Err(format!(
+                "{}（筛选后库 0 / 类 0 / 函数 0）",
+                s.err_no_match
+            ));
+        }
+        println!(
+            "{}: {} {}, {} {}, {} {}",
+            s.target_label, nl, s.sum_libs, nc, s.sum_classes, nf, s.sum_funcs
+        );
+    }
+    // 解析漂移 = 快照布局与所选 Profile 不匹配（实测：移动端 product + compressed-pointers
+    // 产物会漂成 libraries=1/classes=1）。此时**所有**产物都不可信，但对象池/字符串这类
+    // 原始 dump 仍可人工核对，所以照常落盘、额外写一份 PARSE_DRIFT.txt，并以非零退出码收尾
+    // ——让脚本和人都不会把垃圾当成结果。
+    let drift: Vec<String> = analyzer
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("!!! drift") || w.starts_with("!! alloc mismatch"))
+        .cloned()
+        .collect();
+
+    let summary = crate::export::run_with(&analyzer, &out_abs, &sel)?;
+    println!("{} {}:", s.export_done, out_display);
+    println!("  r2_script/addNames.r2     {} {}", summary.r2_functions, s.sum_r2);
+    println!("  ida_script/addNames.py    {} {}", summary.ida_functions, s.sum_ida);
+    println!("  frida.js                  {} {}", summary.frida_classes, s.sum_frida);
+    if summary.asm_enabled {
+        println!("  asm/                      {} {}", summary.asm_functions, s.sum_asm);
+    }
+    println!("  text/pp.txt               {} {}", summary.pp_entries, s.sum_pp);
+    println!("  text/objs.txt             {} {}", summary.objs_instances, s.sum_objs);
+    println!("  text/strings.txt          {} {}", summary.textinfo.strings, s.sum_strings);
+    println!("  text/libs.txt             {} {}", summary.textinfo.libs, s.sum_libs);
+    println!("  text/classes.txt          {} {}", summary.textinfo.classes, s.sum_classes);
+    println!("  text/functions.txt        {} {}", summary.textinfo.functions, s.sum_funcs);
+    println!("  text/arrays.txt           {} {}", summary.textinfo.arrays, s.sum_arrays);
+    println!("  text/maps.txt             {} {}", summary.textinfo.maps, s.sum_maps);
+    if summary.textinfo.fields > 0 {
+        println!("  text/fields.txt           {} {}", summary.textinfo.fields, s.sum_fields);
+    }
+    if let Some((total, named)) = summary.stubs {
+        println!("  text/stubs.txt            {total} {}（{named} {}）", s.sum_stubs, s.sum_named);
+    }
+    if let Some((_f, d, dr, i)) = summary.callgraph {
+        println!(
+            "  call_edges.txt            {} {} + {} {}（{} {}）",
+            d, s.sum_cg_d, i, s.sum_cg_i, dr, s.sum_cg_r
+        );
+    }
+
+    if decompile {
+        #[cfg(feature = "asm")]
+        {
+            let st = crate::decompiler::write(&analyzer, &filtered_libs, &out_abs)?;
+            println!(
+                "  dart/                     {} {} ({} {} / {} {}; {} {}, {} {}; {} {} {}; {} {}, {} {})",
+                st.funcs,
+                s.sum_dart,
+                st.blocks,
+                s.sum_blocks,
+                st.stmts,
+                s.sum_stmts,
+                st.structured,
+                s.sum_structured,
+                st.fallback,
+                s.sum_unstructured,
+                st.unmapped,
+                s.sum_unmapped,
+                s.sum_lines,
+                st.calls,
+                s.sum_calls,
+                st.calls_named,
+                s.sum_named
+            );
+        }
+        #[cfg(not(feature = "asm"))]
+        eprintln!("note: --decompile needs the `asm` feature (capstone); rebuild with default features");
+    }
+
+    for w in &analyzer.warnings {
+        eprintln!("{}: {w}", s.warn_prefix);
+    }
+    if let Ok(dump) = std::env::var("DART_AOT_DUMP_STRINGS") {
+        let mut csv = String::new();
+        for (k, v) in analyzer.iso.strings.iter() {
+            let v = v.clone().unwrap_or_else(|| "<None>".to_string());
+            csv.push_str(&format!("{k}\t{}\n", v.replace('\t', "\\t").replace('\n', "\\n")));
+        }
+        std::fs::write(&dump, csv).map_err(|e| format!("dump strings: {e}"))?;
+        eprintln!("strings dumped to {dump}");
+    }
+    println!(
+        "{} ({} {:.3}s)",
+        s.done_label,
+        s.elapsed_label,
+        since.elapsed().as_secs_f64()
+    );
+    if !drift.is_empty() {
+        let mut body = String::from(
+            "Snapshot parse drifted: the SDK profile does not match this binary.\n\
+             Every artifact in this directory was produced from a mismatched parse and must not be trusted.\n\
+             The raw dumps (text/strings.txt, text/pp.txt) are still worth reading by hand.\n\n",
+        );
+        for w in &drift {
+            body.push_str(w);
+            body.push('\n');
+        }
+        body.push_str(
+            "\nCommon cause: a mobile/Android build (features string contains `compressed-pointers`,\n\
+             and often `dwarf_stack_traces_mode`) analyzed with a desktop profile.\n\
+             Run `dae info <binary>` to see the detected SDK and the warnings, then pass an\n\
+             explicit --sdk-profile if you have one for that build.\n",
+        );
+        let _ = std::fs::write(out_abs.join("PARSE_DRIFT.txt"), &body);
+        eprintln!("{}", s.parse_drift_fatal);
+        return Err(if s.lang == Lang::Zh {
+            format!("快照解析漂移（{} 条告警）——产物不可信，详见 {}/PARSE_DRIFT.txt", drift.len(), out_abs.display())
+        } else {
+            format!("parse drifted ({} warnings) -- artifacts not trustworthy, see {}/PARSE_DRIFT.txt", drift.len(), out_abs.display())
+        });
+    }
+    Ok(())
+}
+
 // ---- info ----
-fn cmd_info(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "info", lang)?;
+fn cmd_info(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("info", lang)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, false, |a, p, sdk| {
         let libs = a.build_functions(true);
@@ -566,8 +777,7 @@ fn cmd_info(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
 }
 
 // ---- libs ----
-fn cmd_libs(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "libs", lang)?;
+fn cmd_libs(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("libs", lang)?;
     let pat = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
@@ -611,8 +821,7 @@ fn cmd_libs(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
 }
 
 // ---- classes ----
-fn cmd_classes(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "classes", lang)?;
+fn cmd_classes(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("classes", lang)?;
     let pat = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
@@ -666,8 +875,7 @@ fn cmd_classes(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> 
 // ---- fields ----
 /// 字段清单：Field 簇里**直接写着**的字段名（AOT 会丢掉 97–99%，这里只列剩下的）。
 /// 偏移 = 字索引 × word_size；机器码里的位移比它小 1（tagged 折算）。
-fn cmd_fields(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "fields", lang)?;
+fn cmd_fields(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("fields", lang)?;
     let pat = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
@@ -707,8 +915,7 @@ fn cmd_fields(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
 }
 
 // ---- functions ----
-fn cmd_functions(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "functions", lang)?;
+fn cmd_functions(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("functions", lang)?;
     let pat = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
@@ -759,8 +966,7 @@ fn cmd_functions(args: &[String], lang: Lang, s: &Messages) -> Result<(), String
 }
 
 // ---- strings ----
-fn cmd_strings(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "strings", lang)?;
+fn cmd_strings(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("strings", lang)?;
     let needle = o
         .find
@@ -798,8 +1004,7 @@ fn cmd_strings(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> 
 }
 
 // ---- largest ----
-fn cmd_largest(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "largest", lang)?;
+fn cmd_largest(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("largest", lang)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
         let libs = filter_libs(&a.build_functions(true), &o.selection());
@@ -828,8 +1033,7 @@ fn cmd_largest(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> 
 
 // ---- callers ----
 #[cfg(feature = "asm")]
-fn cmd_callers(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "callers", lang)?;
+fn cmd_callers(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("callers", lang)?;
     let target = o.rest.first().cloned();
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
@@ -907,8 +1111,7 @@ fn cmd_callers(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> 
 
 // ---- disasm ----
 #[cfg(feature = "asm")]
-fn cmd_disasm(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, "disasm", lang)?;
+fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("disasm", lang)?;
     let sel = target_sel(&o, "disasm", lang, TargetKind::Any)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
@@ -959,8 +1162,7 @@ fn cmd_disasm(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
 
 // ---- getclass / getmethod / getlib ----
 #[cfg(feature = "asm")]
-fn cmd_get(cmd: &str, args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let o = parse_opts(args, cmd, lang)?;
+fn cmd_get(cmd: &str, o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin(cmd, lang)?;
     let kind = match cmd {
         "getclass" => TargetKind::Class,
@@ -1040,20 +1242,20 @@ fn cmd_get(cmd: &str, args: &[String], lang: Lang, s: &Messages) -> Result<(), S
 // 无 capstone 的构建（--no-default-features）：只读查询仍然可用，涉及反汇编的三个
 // 命令明确报「本构建不含反汇编」，而不是给出错误结果。
 #[cfg(not(feature = "asm"))]
-fn cmd_callers(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let _ = (args, s);
+fn cmd_callers(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
+    let _ = (o, s);
     Err(tr(lang, "callers：本构建未启用反汇编（capstone）", "callers: this build has no disassembler (capstone)"))
 }
 
 #[cfg(not(feature = "asm"))]
-fn cmd_disasm(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let _ = (args, s);
+fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
+    let _ = (o, s);
     Err(tr(lang, "disasm：本构建未启用反汇编（capstone）", "disasm: this build has no disassembler (capstone)"))
 }
 
 #[cfg(not(feature = "asm"))]
-fn cmd_get(cmd: &str, args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
-    let _ = (args, s);
+fn cmd_get(cmd: &str, o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
+    let _ = (o, s);
     Err(tr(
         lang,
         &format!("{cmd}：本构建未启用反编译器（capstone）"),
@@ -1256,27 +1458,63 @@ mod tests {
     fn subcommand_detection() {
         assert!(is_subcommand("getclass"));
         assert!(is_subcommand("libs"));
+        assert!(is_subcommand("export"));
         assert!(!is_subcommand("app.apk"));
         assert!(!is_subcommand("./info")); // 与本机文件同名时走全量导出
     }
 
+    /// clap 解析 → `Opts` 的转换必须把每个 flag 都带过去。
+    ///
+    /// 这条测试盯的是「解析了却没生效」这类 bug：参考项目 ddc 的 `callers` 解析了 `--dex`
+    /// 又在重建 argv 时丢掉，于是 `--dex 不存在的镜像` 照样返回结果。dae 现在只有一处
+    /// 转换（[`opts_of`]），所以要么全部带过去、要么编译不过。
     #[test]
     fn positional_parsing() {
-        let lang = Lang::En;
-        let args: Vec<String> = ["bin.so", "HomePage", "-n", "5", "--lib", "app"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let o = parse_opts(&args, "classes", lang).unwrap();
+        use clap::Parser;
+        let cli = crate::args::Cli::try_parse_from([
+            "dae", "classes", "bin.so", "HomePage", "-n", "5", "--lib", "app", "--fuzzy",
+        ])
+        .unwrap();
+        let Cmd::Classes(q) = cli.cmd else { panic!("expected classes") };
+        assert_eq!(q.binary, "bin.so");
+        assert_eq!(q.pattern.as_deref(), Some("HomePage"));
+        let o = opts_of(&q.common, q.binary, q.pattern.into_iter().collect());
         assert_eq!(o.bin.as_deref(), Some("bin.so"));
         assert_eq!(o.rest, vec!["HomePage".to_string()]);
         assert_eq!(o.n, Some(5));
         assert_eq!(o.libs, vec!["app".to_string()]);
+        assert!(o.fuzzy);
+    }
+
+    /// 位置参数与 flag 的相对顺序无关——手写解析器做不到这点（ddc 的 `info -d x app.apk`
+    /// 就是把 `-d` 的取值当成了输入路径）。
+    #[test]
+    fn flags_may_precede_positionals() {
+        use clap::Parser;
+        let cli = crate::args::Cli::try_parse_from([
+            "dae", "info", "-n", "3", "--lib", "app", "bin.so",
+        ])
+        .unwrap();
+        let Cmd::Info(q) = cli.cmd else { panic!("expected info") };
+        assert_eq!(q.binary, "bin.so");
+        assert_eq!(q.common.limit, Some(3));
+        assert_eq!(q.common.lib, vec!["app".to_string()]);
     }
 
     #[test]
     fn unknown_option_is_an_error() {
-        let args: Vec<String> = ["bin.so", "--nope"].iter().map(|s| s.to_string()).collect();
-        assert!(parse_opts(&args, "info", Lang::En).is_err());
+        use clap::Parser;
+        assert!(crate::args::Cli::try_parse_from(["dae", "info", "bin.so", "--nope"]).is_err());
+    }
+
+    /// `-o -`（stdout 记号）必须被当成取值而不是 flag——手写解析器为此专门写了
+    /// `a != "-"` 的例外，clap 天然如此，这里钉住它别退化。
+    #[test]
+    fn dash_is_a_value_not_a_flag() {
+        use clap::Parser;
+        let cli = crate::args::Cli::try_parse_from(["dae", "getclass", "bin.so", "Foo", "-o", "-"])
+            .unwrap();
+        let Cmd::Getclass(t) = cli.cmd else { panic!("expected getclass") };
+        assert_eq!(t.common.output.as_deref(), Some("-"));
     }
 }
