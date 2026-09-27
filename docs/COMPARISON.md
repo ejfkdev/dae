@@ -118,11 +118,11 @@ dae /tmp/android/libapp.so out/          # auto-detects dart/3.3.4 + w32-compres
 
 | App | SDK | dae now | aotopsy (same file) |
 |---|---|---|---|
-| Reqable (Android) | 3.3.4 | 57,960 table entries, 496 libs, 1,141 classes, **0 warnings** | 57,960 functions / 8,216 classes |
-| ChatGLM | 3.11.6 | 30,782 entries, 1,211 libs, 4,603 classes | 30,782 / 5,501 |
-| 学信网 (CHSI) | 3.7.2 | 19,752 entries, 875 libs, 3,256 classes | 19,752 / 3,819 |
-| 飞书 Lark | 3.6.1 | **79,327 entries**, 1,418 libs, 2,868 classes, **0 warnings** | 79,327 / 12,929 |
-| 微博 Weibo | 2.19.6 | **22,623 entries**, 750 libs, 3,671 classes, **0 warnings** | 22,623 / 4,232 |
+| Reqable (Android) | 3.3.4 | 57,960 table entries, **13,371 named functions**, 1,734 libs, 3,567 classes, **0 warnings** | 57,960 functions / 8,216 classes |
+| ChatGLM | 3.11.6 | 30,782 entries, **27,517 named functions**, 1,211 libs, 4,603 classes | 30,782 / 5,501 |
+| 学信网 (CHSI) | 3.7.2 | 19,752 entries, **17,438 named functions**, 875 libs, 3,256 classes | 19,752 / 3,819 |
+| 飞书 Lark | 3.6.1 | **79,327 entries**, **25,183 named functions**, 3,194 libs, 6,306 classes, **0 warnings** | 79,327 / 12,929 |
+| 微博 Weibo | 2.19.6 | **22,623 entries**, **19,807 named functions**, 750 libs, 3,671 classes, **0 warnings** | 22,623 / 4,232 |
 
 Both were fixed in v0.1.4; every one of the five now matches aotopsy's entry count exactly. Lark
 and Weibo also decompile end to end — 3,517 and 19,053 function blocks, 95.9% and 91.1% structured,

@@ -2,9 +2,9 @@
 //! 全部来自填解析阶段的既有数据，零额外解析：格式化写出、面向 grep / 无工具浏览。
 //! 产物字节确定（HashMap 来源 entry 先按 ref 升序排序），不含中文。
 
+use std::io::Write;
 use crate::analyzer::{Analyzer, LibGroups};
 use crate::export::ppobjs::describe_into;
-use std::fmt::Write as _;
 use std::path::Path;
 
 /// 六类文本产物的条数。
@@ -28,28 +28,28 @@ fn esc(s: &str) -> String {
 }
 
 fn write_strings(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
-    let mut of = String::with_capacity(analyzer.iso.strings.len() * 48);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "strings.txt")?;
     for (r, v) in &analyzer.iso.strings {
         let text = v.as_deref().map(esc).unwrap_or_else(|| "<undecoded>".into());
         let _ = writeln!(of, "0x{r:x}\t{text}");
     }
-    std::fs::write(out_dir.join("text").join("strings.txt"), of).map_err(|e| format!("写 strings.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "strings.txt")?;
     Ok(analyzer.iso.strings.len())
 }
 
 fn write_libs(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
-    let mut of = String::with_capacity(analyzer.iso.libraries.len() * 64);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "libs.txt")?;
     for (r, rec) in &analyzer.iso.libraries {
         let url = analyzer.sref(rec.url_ref).unwrap_or_default();
         let name = analyzer.sref(rec.name_ref).unwrap_or_default();
         let _ = writeln!(of, "0x{r:x}\t{}\t{}", esc(url.as_str()), esc(name.as_str()));
     }
-    std::fs::write(out_dir.join("text").join("libs.txt"), of).map_err(|e| format!("写 libs.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "libs.txt")?;
     Ok(analyzer.iso.libraries.len())
 }
 
 fn write_classes(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
-    let mut of = String::with_capacity(analyzer.iso.classes.len() * 80);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "classes.txt")?;
     for (r, rec) in &analyzer.iso.classes {
         let name = analyzer
             .cname_by_cid
@@ -69,13 +69,13 @@ fn write_classes(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
             esc(name.as_str())
         );
     }
-    std::fs::write(out_dir.join("text").join("classes.txt"), of).map_err(|e| format!("写 classes.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "classes.txt")?;
     Ok(analyzer.iso.classes.len())
 }
 
 fn write_functions(libs: &LibGroups, out_dir: &Path) -> Result<usize, String> {
     let mut count = 0usize;
-    let mut of = String::with_capacity(64 * 1024);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "functions.txt")?;
     for (lib_name, cls_map) in libs {
         for (cls_name, funcs) in cls_map {
             for f in funcs {
@@ -94,33 +94,33 @@ fn write_functions(libs: &LibGroups, out_dir: &Path) -> Result<usize, String> {
             }
         }
     }
-    std::fs::write(out_dir.join("text").join("functions.txt"), of).map_err(|e| format!("写 functions.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "functions.txt")?;
     Ok(count)
 }
 
 fn write_arrays(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     let mut keys: Vec<u64> = analyzer.iso.array_elements.keys().copied().collect();
     keys.sort_unstable();
-    let mut of = String::with_capacity(keys.len() * 48);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "arrays.txt")?;
     for r in &keys {
         let mut d = String::new();
         describe_into(analyzer, &mut d, *r, 0);
         let _ = writeln!(of, "0x{r:x}\t{d}");
     }
-    std::fs::write(out_dir.join("text").join("arrays.txt"), of).map_err(|e| format!("写 arrays.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "arrays.txt")?;
     Ok(keys.len())
 }
 
 fn write_maps(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     let mut keys: Vec<u64> = analyzer.iso.map_data.keys().copied().collect();
     keys.sort_unstable();
-    let mut of = String::with_capacity(keys.len() * 48);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "maps.txt")?;
     for r in &keys {
         let mut d = String::new();
         describe_into(analyzer, &mut d, *r, 0);
         let _ = writeln!(of, "0x{r:x}\t{d}");
     }
-    std::fs::write(out_dir.join("text").join("maps.txt"), of).map_err(|e| format!("写 maps.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "maps.txt")?;
     Ok(keys.len())
 }
 
@@ -131,12 +131,11 @@ fn write_maps(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
 /// 没解出来的字段不写占位行——AOT 丢掉了 97% 以上的字段名，凭空补名是编造。
 fn write_fields(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
     let rows = analyzer.field_rows();
-    let mut of = String::with_capacity(rows.len() * 32);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "fields.txt")?;
     for r in &rows {
         let _ = writeln!(of, "{}\t{}\t{}\t{:#x}", r.class, r.name, r.source, r.off);
     }
-    std::fs::write(out_dir.join("text").join("fields.txt"), of)
-        .map_err(|e| format!("写 fields.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "fields.txt")?;
     Ok(rows.len())
 }
 

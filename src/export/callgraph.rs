@@ -8,11 +8,11 @@
 //! - `text/call_edges.txt`  每行 `0xfrom <tab> from_name <tab> kind <tab> 0xto <tab> to_name`
 //! - `callgraph.dot`        直接调用图（仅含本二进制内已命名目标，边数有上限）
 
+use std::io::Write as _;
 use crate::analyzer::{Analyzer, LibGroups};
 use capstone::arch;
 use capstone::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::path::Path;
 
 /// DOT 里最多画多少个节点 / 边（真机产物可达十几万边，不设限没法用）
@@ -248,7 +248,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
     };
 
     // ---- text/call_edges.txt ----
-    let mut txt = String::with_capacity(edges.len() * 72);
+    let mut txt = crate::export::stream_writer(&text_dir, "call_edges.txt")?;
     let (mut n_direct, mut n_indirect, mut n_resolved) = (0usize, 0usize, 0usize);
     for e in &edges {
         match e.kind {
@@ -275,8 +275,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
             }
         }
     }
-    std::fs::write(text_dir.join("call_edges.txt"), txt)
-        .map_err(|e| format!("写 call_edges.txt 失败: {e}"))?;
+    crate::export::finish_writer(txt, "call_edges.txt")?;
 
     // ---- callgraph.dot（只画解析到名字的直接边，且按节点/边上限裁剪）----
     let mut nodes: BTreeSet<u64> = BTreeSet::new();
@@ -299,9 +298,9 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
             break;
         }
     }
-    let mut dot = String::with_capacity(dot_edges.len() * 48);
-    dot.push_str("// dae call graph — direct calls (bl / call imm) between named functions\n");
-    dot.push_str("digraph dae_callgraph {\n  rankdir=LR;\n  node [shape=box, fontsize=10];\n");
+    let mut dot = crate::export::stream_writer(out_dir, "callgraph.dot")?;
+    let _ = writeln!(dot, "// dae call graph — direct calls (bl / call imm) between named functions");
+    let _ = dot.write_all(b"digraph dae_callgraph {\n  rankdir=LR;\n  node [shape=box, fontsize=10];\n");
     for n in &nodes {
         let label = {
             let s = resolve(*n);
@@ -316,9 +315,8 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<Ca
     for (a, b) in &dot_edges {
         let _ = writeln!(dot, "  n{a:x} -> n{b:x};");
     }
-    dot.push_str("}\n");
-    std::fs::write(out_dir.join("callgraph.dot"), dot)
-        .map_err(|e| format!("写 callgraph.dot 失败: {e}"))?;
+    let _ = dot.write_all(b"}\n");
+    crate::export::finish_writer(dot, "callgraph.dot")?;
 
     Ok(CallGraphCounts {
         funcs: n_funcs,

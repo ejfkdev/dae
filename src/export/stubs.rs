@@ -9,8 +9,8 @@
 //! 这个产物把它们如实列出来：入口、字节数、能否解出分配 stub 的类名（能解就写名字，
 //! 解不出就留空——绝不为凑覆盖率编名字）。
 
+use std::io::Write as _;
 use crate::analyzer::Analyzer;
-use std::fmt::Write as _;
 use std::path::Path;
 
 pub struct StubCounts {
@@ -43,7 +43,7 @@ pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> 
     #[cfg(not(feature = "asm"))]
     let names: Vec<(u64, Option<String>)> = rows.iter().map(|(ep, _)| (*ep, None)).collect();
 
-    let mut of = String::with_capacity(rows.len() * 48);
+    let mut of = crate::export::stream_writer(&out_dir.join("text"), "stubs.txt")?;
     let _ = writeln!(
         of,
         "// instruction-table entries without a Code object (stub prefix): {}",
@@ -61,8 +61,7 @@ pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> 
         }
         let _ = writeln!(of, "{ep:#x}\t{size}\tstub\t{name}");
     }
-    std::fs::write(out_dir.join("text").join("stubs.txt"), of)
-        .map_err(|e| format!("写 stubs.txt 失败: {e}"))?;
+    crate::export::finish_writer(of, "stubs.txt")?;
     Ok(StubCounts {
         total: rows.len(),
         named,
