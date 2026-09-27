@@ -269,18 +269,28 @@ fn fold_cond(mnem: &str, last: &Option<(String, String)>) -> String {
 }
 
 /// 把寄存器名替换成框架名（PP/THR/SP/FP/LR），内存操作数内部同样替换。
-fn mask_regs(rl: &Roles, ops: &str) -> String {
-    let mut s = ops.to_string();
-    // 先按平台 profile 的 register_aliases 换（x15→SP、x29→FP、x26→THR…），
-    // 再补一组与平台无关的通用别名。**别名表按 key 长度倒序**：短名先换会把
-    // `x15` 里的 `x1` 之类误伤（历史上 arm64 的 `sp` 因此显示成裸 `x15`）。
-    let mut pairs: Vec<(String, String)> = rl
-        .aliases
+/// 构建寄存器别名表，并把**级联**解析成每个 token 的最终值。
+///
+/// 原先 `mask_regs` 每条指令都重建这张表（克隆 aliases + 追加 pp/thr + 10 个硬编码项、
+/// 再按 key 长度降序稳定排序），然后对每个 pair 各做一次「分配新 String + 全文扫描」的
+/// `replace_word`——约 100 万条指令 × 20 个 pair = 两千万次分配与扫描。表对整个 run 是常量，
+/// 所以只建一次。
+///
+/// 单遍查表**不能**直接替代顺序替换：替换会级联。实测 arm64 profile 的 aliases 里有
+/// `x29→fp`、`x30→lr`（小写），而硬编码表后面还有 `fp→FP`、`lr→LR`；按长度降序稳定排序后
+/// 3 字符键先跑、2 字符键后跑，于是 `x29 → fp → FP`。所以这里按**原有的 pair 顺序**
+/// 模拟整条链，把每个键解析到终值，单遍查表才与逐 pair 替换严格等价。
+fn build_mask_map(
+    aliases: &std::collections::HashMap<String, String>,
+    pp: &str,
+    thr: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut pairs: Vec<(String, String)> = aliases
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    pairs.push((rl.pp.clone(), "PP".into()));
-    pairs.push((rl.thr.clone(), "THR".into()));
+    pairs.push((pp.to_string(), "PP".into()));
+    pairs.push((thr.to_string(), "THR".into()));
     for (k, v) in [
         ("x29", "FP"),
         ("x30", "LR"),
@@ -295,11 +305,60 @@ fn mask_regs(rl: &Roles, ops: &str) -> String {
     ] {
         pairs.push((k.to_string(), v.to_string()));
     }
+    // 别名表按 key 长度倒序：短名先换会把 `x15` 里的 `x1` 之类误伤
+    // （历史上 arm64 的 `sp` 因此显示成裸 `x15`）。sort_by_key 是稳定排序，
+    // 等长的键保持插入顺序——这与旧实现一致，也是级联结果一致的前提。
     pairs.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
-    for (k, v) in &pairs {
-        s = replace_word(&s, k, v);
+
+    let mut map = std::collections::HashMap::with_capacity(pairs.len() * 2);
+    for (k, _) in &pairs {
+        if map.contains_key(k) {
+            continue;
+        }
+        // 按 pair 顺序模拟：当前值等于某个键就被替换，直到走完全部 pair
+        let mut cur = k.clone();
+        for (pk, pv) in &pairs {
+            if &cur == pk {
+                cur = pv.clone();
+            }
+        }
+        map.insert(k.clone(), cur);
     }
-    s
+    map
+}
+
+fn mask_regs(rl: &Roles, ops: &str) -> String {
+    // 单遍扫描：按 `replace_word` 的词边界定义（[A-Za-z0-9_] 的极大串）切出 token，
+    // 查预解析好的别名表。等价于旧的「按 key 长度降序逐 pair 做 replace_word」——
+    // 表里存的就是每个 token 走完全部 pair 后的终值（见 `build_mask_map`）。
+    let b = ops.as_bytes();
+    let mut out = String::with_capacity(ops.len() + 8);
+    let mut i = 0usize;
+    // 已拷贝到的位置：分隔符整段用 push_str 搬，而不是逐字节 push。
+    let mut last = 0usize;
+    while i < b.len() {
+        if is_word_byte(b[i]) {
+            let start = i;
+            while i < b.len() && is_word_byte(b[i]) {
+                i += 1;
+            }
+            if let Some(v) = rl.mask_map.get(&ops[start..i]) {
+                out.push_str(&ops[last..start]);
+                out.push_str(v);
+                last = i;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&ops[last..]);
+    out
+}
+
+/// `replace_word` / `mask_regs` 共用的词边界判据：字母数字与下划线。
+#[inline]
+fn is_word_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
 }
 
 /// 按「词边界」替换（前后不能是字母数字），避免 `r1` 命中 `r14`。
@@ -312,11 +371,9 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
     // 后者每个字节都要做一次 char 转换 + UTF-8 编码，在百万条语句量级上是主要开销。
     let mut last = 0usize;
     while i < s.len() {
-        if b[i..].starts_with(fb)
-            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-        {
+        if b[i..].starts_with(fb) && (i == 0 || !is_word_byte(b[i - 1])) {
             let j = i + from.len();
-            if j >= s.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            if j >= s.len() || !is_word_byte(b[j]) {
                 out.push_str(&s[last..i]);
                 out.push_str(to);
                 i = j;
@@ -346,6 +403,8 @@ struct Roles {
     aliases: std::collections::HashMap<String, String>,
     /// 平台 profile 的 non_field_base：不可能持有对象基址的寄存器（blutter 口径）
     non_field: BTreeSet<String>,
+    /// **预解析**的寄存器别名表：token → 最终替换值。见 `mask_regs`。
+    mask_map: std::collections::HashMap<String, String>,
 }
 
 impl Roles {
@@ -376,13 +435,17 @@ impl Roles {
 fn roles(analyzer: &Analyzer) -> Roles {
     let r = &analyzer.platform.registers;
     let g = |k: &str, d: &str| r.get(k).cloned().unwrap_or_else(|| d.to_string());
+    let aliases = analyzer.platform.register_aliases.clone();
+    let pp = g("pp", "pp");
+    let thr = g("thr", "thr");
     Roles {
-        pp: g("pp", "pp"),
-        thr: g("thr", "thr"),
         sp: g("sp", "sp"),
-        aliases: analyzer.platform.register_aliases.clone(),
         non_field: analyzer.platform.non_field_base.iter().cloned().collect(),
         pool: pool_map(analyzer),
+        mask_map: build_mask_map(&aliases, &pp, &thr),
+        aliases,
+        pp,
+        thr,
     }
 }
 
@@ -2030,19 +2093,26 @@ fn lift_chunks(
 /// 建 capstone 实例。**开 skipdata**：遇到非指令字节（函数入口前的 0 填充、对齐
 /// padding）不中断整段反汇编，而是还原成 `.byte ..` 继续走——否则一个坏字节会让
 /// 整个函数从产物里消失（实测 `dart compile exe` 的部分函数入口前就带 16 字节 0）。
+/// 建 capstone 引擎。
+///
+/// **`.detail(false)`**：全仓库只用 `mnemonic()` / `op_str()` / `address()` / `bytes()`，
+/// 从不调 `insn_detail()` / `arch_detail()` / `operands()`（已 grep 确认零处）。detail 模式会让
+/// capstone 为每条指令额外解析并存储完整操作数结构，是反汇编的主要开销之一，而 lift 在
+/// 33× 提速之后仍占 render 的 66.8%，所以这里不该付这笔钱。
+/// 改这一项必须用「产物逐字节对拍」验证，不能只看它编译过。
 fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
     let c = if is_arm64 {
         Capstone::new()
             .arm64()
             .mode(arch::arm64::ArchMode::Arm)
-            .detail(true)
+            .detail(false)
             .build()
     } else {
         Capstone::new()
             .x86()
             .mode(arch::x86::ArchMode::Mode64)
             .syntax(arch::x86::ArchSyntax::Intel)
-            .detail(true)
+            .detail(false)
             .build()
     }
     .map_err(|e| format!("capstone 初始化失败: {e}"))?;

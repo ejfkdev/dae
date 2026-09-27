@@ -140,14 +140,14 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
                     Capstone::new()
                         .arm64()
                         .mode(arch::arm64::ArchMode::Arm)
-                        .detail(true)
+                        .detail(false)
                         .build()
                 } else {
                     Capstone::new()
                         .x86()
                         .mode(arch::x86::ArchMode::Mode64)
                         .syntax(arch::x86::ArchSyntax::Intel)
-                        .detail(true)
+                        .detail(false)
                         .build()
                 };
                 let cs = match cs {
@@ -209,11 +209,20 @@ pub fn collect_edges(analyzer: &Analyzer, libs: &LibGroups) -> Vec<Edge> {
     for (pi, v, _err) in rx {
         parts[pi] = Some(v);
     }
-    let mut edges: Vec<Edge> = Vec::new();
+    // 先算总数再一次到位：`extend` 逐个分片追加会让这个 Vec 反复翻倍 realloc
+    // （material_3_demo 上约 9.7 万条边，每条含两个 String）。
+    let total: usize = parts.iter().flatten().map(|v| v.len()).sum();
+    let mut edges: Vec<Edge> = Vec::with_capacity(total);
     for p in parts.into_iter().flatten() {
         edges.extend(p);
     }
-    edges.sort_by_key(|a| (a.from, a.to, a.to_text.clone()));
+    // `sort_by_key` **不缓存键**——每次比较都重新调一次闭包，所以原来那个
+    // `a.to_text.clone()` 是「每次比较分配一个 String」：9.7 万条边 × O(log N)
+    // ≈ 160 万次克隆，大应用上更多。改成借用比较，序完全相同
+    // （`String` 与 `str` 都是逐字节字典序），`sort_by` 同样是稳定排序。
+    edges.sort_by(|a, b| {
+        (a.from, a.to, a.to_text.as_str()).cmp(&(b.from, b.to, b.to_text.as_str()))
+    });
     edges
 }
 
@@ -377,14 +386,14 @@ fn build_cs(is_arm64: bool) -> Result<Capstone, String> {
         Capstone::new()
             .arm64()
             .mode(arch::arm64::ArchMode::Arm)
-            .detail(true)
+            .detail(false)
             .build()
     } else {
         Capstone::new()
             .x86()
             .mode(arch::x86::ArchMode::Mode64)
             .syntax(arch::x86::ArchSyntax::Intel)
-            .detail(true)
+            .detail(false)
             .build()
     }
     .map_err(|e| format!("capstone 初始化失败: {e}"))

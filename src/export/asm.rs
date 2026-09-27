@@ -108,7 +108,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                 let cs = Capstone::new()
                     .arm64()
                     .mode(arch::arm64::ArchMode::Arm)
-                    .detail(true)
+                    .detail(false)
                     .build()
                     .map_err(|e| format!("capstone 初始化失败: {e}"));
                 // 开 skipdata：函数入口前常带 0 填充/对齐字节，遇到非指令字节要还原成
@@ -223,7 +223,7 @@ pub fn build_cs() -> Result<Capstone, String> {
     let mut c = Capstone::new()
         .arm64()
         .mode(arch::arm64::ArchMode::Arm)
-        .detail(true)
+        .detail(false)
         .build()
         .map_err(|e| format!("capstone 初始化失败: {e}"))?;
     c.set_skipdata(true)

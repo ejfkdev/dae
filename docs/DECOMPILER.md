@@ -185,6 +185,85 @@ This retires an earlier claim in this file's history that `--decompile` was domi
 `format!` calls. Rendering was 5.7% of render; the allocation-heavy profiler leaves were the pool
 map being rebuilt, not statement formatting.
 
+### Round two: the register-alias table
+
+With lift still at 66.8%, the next per-instruction cost was `mask_regs`, which rewrites capstone
+operand text (`x15` → `SP`, `x27` → `PP`). It rebuilt its alias table on *every* call: clone the
+profile's `register_aliases`, append `pp`/`thr` and nine hardcoded pairs, stable-sort by
+descending key length, then run one `replace_word` per pair — each of which allocates a fresh
+`String` and rescans the whole text. At ~1M instructions × 20 pairs that is ~20M allocations and
+~20M full-text scans. The table is invariant for the whole run, so it is now built once in `roles`
+and `mask_regs` is a single pass: tokenize on the same `[A-Za-z0-9_]` word boundary
+`replace_word` uses, look each token up, copy separators in slices.
+
+A single-pass lookup is **not** equivalent to sequential replacement in general, because the
+replacements cascade. The arm64 profile maps `x29` → `fp` and `x30` → `lr` (lowercase), and the
+hardcoded tail then maps `fp` → `FP` and `lr` → `LR`; after the descending-length stable sort the
+three-character keys run first, so `x29` reaches the output as `FP`, not `fp`. `build_mask_map`
+therefore resolves every key by *simulating the chain in the original pair order* rather than by
+graph reachability — reachability would also fire on a value that equals an *earlier* key, which
+the sequential algorithm never re-applies. Self-maps like `xzr` → `xzr` fall out correctly.
+
+| artifact | round 1 | round 2 | output |
+|---|---|---|---|
+| `material_3_demo` | 3.4 s, 217 MB | **2.1 s, 188 MB** | byte-identical |
+| ↳ `lift` phase | 1.95 s (66.7%) | **0.63 s (40.3%)** | 3.1× |
+| ↳ `emit_function` | 0.73 s | 0.71 s | unchanged (not on this path) |
+| Lark 8.0.2 (android arm64) | 1.56 s, 174 MB | **1.41 s, 167 MB** | byte-identical |
+
+Timings are three interleaved A/B rounds (3.51/3.67/3.45 → 2.08/2.29/2.13 s); the same binary
+varies ~35% under unrelated host load, so single runs are not evidence. Byte-identity was checked
+with `diff -rq` on the whole output tree for `material_3_demo`, Lark, and five corpus variants
+spanning Mach-O x64, ELF x64, ELF arm64 and SDK 2.10/2.14 — the arm64 corpus alone does not
+exercise the x64 alias table. Metrics match exactly on every one (181,504 blocks / 985,900
+statements / 13,950 structured / 1,132 unstructured / 3 unmapped lines).
+
+Also in this round: capstone's `.detail(true)` was switched to `.detail(false)` at all eight
+engine constructions. A grep confirms no detail API is used anywhere — only `mnemonic`, `op_str`,
+`address` and `bytes` — so this is strictly less work, but the A/B showed **no measurable speedup**
+(differences sat inside host noise). It is kept for that reason and is not credited with any of
+the numbers above.
+
+### Round three: memory, and where it actually is
+
+Peak RSS was attributed by measurement, not guesswork, and two hypotheses died on the way:
+
+- `dae info` (parse only) peaks at **41 MB**; the full export peaks at **151 MB**. So the decompiler
+  is *not* the memory problem — parse is cheap and the export pipeline holds ~110 MB.
+- Building with `--no-default-features` (which drops `asm` + `callgraph`) peaks at **60 MB**.
+  Those two exporters therefore account for ~91 MB of the peak.
+- The obvious suspect was wrong: `asm` writes each file from a `String::with_capacity(job.est)`
+  buffer with up to 8 threads in flight, but the largest single file is 1.3 MB, so concurrent
+  buffers cap near 10 MB — not the hog.
+
+What the eight exporters actually do is run **concurrently** (`std::thread::scope`, one thread
+each), so the peak is the sum of all their working sets, which is why RSS climbs monotonically and
+never falls during export.
+
+Inside `callgraph`, one real defect: edges were sorted with
+`sort_by_key(|a| (a.from, a.to, a.to_text.clone()))`. **`sort_by_key` does not cache its key** — it
+re-invokes the closure for every comparison — so this allocated a `String` per comparison:
+96,904 edges × O(log N) ≈ **1.6M clones** on this corpus, and proportionally more on larger apps.
+It now sorts by borrowed key (`to_text.as_str()`), which is the same order (`String` and `str` are
+both bytewise-lexicographic) under the same stable sort. The merge of the per-thread partial
+vectors also reserves its total length up front instead of doubling a ~14 MB `Vec`.
+
+| mode | HEAD | after rounds 2+3 | output |
+|---|---|---|---|
+| export only | 169/164/175 MB, ~0.48 s | **138/140/149 MB, ~0.48 s** | byte-identical (506 files) |
+| `--decompile` | 220/223/212 MB, 3.89/4.22/3.52 s | **180/180/173 MB, 2.55/2.08/2.31 s** | byte-identical |
+
+Three interleaved rounds each, host load ~7.5 — absolute numbers are inflated but the pairing is
+fair. Note what this does **not** claim: the callgraph fix bought memory and removed 1.6M
+allocations, but export wall time did not measurably move (sorting 96k edges is already fast).
+
+Byte-identity was re-checked with `diff -rq` on the whole tree for `material_3_demo` in *both*
+modes, for Lark, and for the five corpus variants; `call_edges.txt` matches line-for-line
+(96,904 / 12,011), which is the direct evidence that the new comparator orders identically.
+One false alarm worth recording: a `diff -rq z_old z_new` run with relative paths from the wrong
+cwd reported "differences" that were only `diff`'s exit code 2 for missing directories. Absolute
+paths, and checking that `diff` prints nothing, is the reliable form.
+
 ## The trap this table keeps springing
 
 Three times now the same failure mode has appeared, and it is worth stating plainly because the
