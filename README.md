@@ -40,9 +40,12 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
 - **Fast** — a 24 MB Flutter sample exports in ~0.07 s (~27× the Python reference);
   `--decompile` on a 26 MB macOS app takes ~1 s, and a real Lark/Weibo Android build 1.6 s / 5.6 s.
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
-- **Progressive mode** — `dae libs` / `classes` / `functions` / `strings` / `callers` to query the
-  snapshot like a database, then `dae getclass` / `getmethod` / `getlib` to decompile just that
-  one thing (`dae info` 0.03 s vs 1.9 s for a full export). See [Progressive mode](#progressive-mode-list-first-decompile-one-thing).
+- **Progressive mode** — 20 subcommands to query the snapshot like a database (`libs`, `classes`,
+  `functions`, `members`, `strings`, `findrefs`, `callers`, `callees`, `pp`, `objs`, `stubs`, ...)
+  and then decompile exactly one thing (`getclass` / `getmethod` / `getlib` / `decompile --app`).
+  Queries answer in 15–30 ms; a full export of a 15,796-function app takes ~2.1 s and ~1000 files.
+  Every command's output is pasteable into the next one.
+  See [Progressive mode](#progressive-mode-list-first-decompile-one-thing).
 - **Zero dependencies** — parses Mach-O/ELF/PE directly.
 
 ## Install
@@ -62,8 +65,13 @@ macOS prebuilt binaries are ad-hoc signed; if Gatekeeper blocks the first run: `
 
 ```bash
 dae <binary> <out_dir>                    # auto-detect the Dart version
+dae export <binary> <out_dir>             # same thing, explicit verb
 dae <binary> <out_dir> --sdk-profile P.json   # or force one
-dae help                                  # progressive subcommands (list, then decompile one)
+dae <binary> <out_dir> --app --decompile  # app-side code only (drops dart: and package:flutter)
+
+dae help                                  # every subcommand, grouped
+dae help findrefs                         # one command's options and output columns
+dae decompile <binary> | less             # whole app's pseudocode to stdout
 ```
 
 ```console
@@ -137,49 +145,105 @@ Spec: [`docs/PROFILES.md`](docs/PROFILES.md) · Decompiler baseline: [`docs/DECO
 
 ## Progressive mode (list first, decompile one thing)
 
-A full export writes thousands of files; often you only want one class or one package.
-Query first, decompile surgically (`dae help` has every option):
+A full export writes thousands of files; often you only want one class, one package, or just the
+answer to "where is this string used". Query first, decompile surgically (`dae help` has every
+option, `dae help <cmd>` has one command's):
 
 ```
-dae info      <binary>                        snapshot, SDK, sizes -- writes nothing
-dae libs      <binary> [pattern]              libraries (packages) with class/function counts
-dae classes   <binary> [pattern] [--lib P]    classes
-dae functions <binary> [pattern] [--lib P]    functions (entry, size, owner)
-dae strings   <binary> [-f TEXT]              snapshot string table
-dae fields    <binary> [pattern]              named fields (source + byte offset)
-dae largest   <binary> [-n N]                 biggest functions by code size
-dae callers   <binary> <NAME|0xADDR>          who calls it (static direct-call edges)
-dae disasm    <binary> <CLASS[.method]>       raw disassembly (arm64 keeps the IL comments)
-dae getclass  <binary> <CLASS>                decompile just this class
-dae getmethod <binary> <CLASS.method>         decompile just this method
-dae getlib    <binary> <LIB>                  decompile just this library (package)
+get oriented
+  dae info      <binary>                        snapshot, SDK, sizes -- writes nothing
+  dae libs      <binary> [pattern]              libraries (packages) with class/function counts
+  dae classes   <binary> [pattern] [--lib P]    classes
+  dae functions <binary> [pattern] [--lib P]    functions (entry, size, owner)
+  dae largest   <binary> [-n N]                 biggest functions by code size
+
+find things
+  dae strings   <binary> [-f TEXT]              snapshot string table
+  dae fields    <binary> [pattern]              named fields (source + byte offset)
+  dae members   <binary> [NAME] [--class X]     methods and fields in one search
+  dae findrefs  <binary> string TEXT            every code site that loads this literal
+  dae findrefs  <binary> kind NAME              ...or an object of this kind
+  dae callers   <binary> <NAME|0xADDR>          who calls it (static direct-call edges)
+  dae callees   <binary> <NAME|0xADDR>          what it calls (same columns as callers)
+
+object layer (same data as the text/ artifacts)
+  dae pp        <binary> [pattern]              object pool entries
+  dae objs      <binary> [pattern]              user class instances with field values
+  dae stubs     <binary> [pattern]              instruction-table entries with no Code object
+
+decompile
+  dae getclass  <binary> <CLASS>                just this class
+  dae getmethod <binary> <CLASS.method>         just this method
+  dae getlib    <binary> <LIB>                  just this library (package)
+  dae decompile <binary> [-o DIR|FILE.dart|-]   everything, or everything you scoped
+
+low level
+  dae disasm    <binary> <CLASS[.method]>       raw disassembly (arm64 keeps the IL comments)
+
+full export
+  dae export    <binary> <out_dir> [--decompile]
+  dae           <binary> <out_dir> [--decompile]   shortcut, exactly equivalent
 ```
 
 Conventions, chosen so the commands compose:
 
-- **stdout is the data channel.** Query results and `get*` pseudocode go to stdout with no
+- **stdout is the data channel.** Query results and decompiled pseudocode go to stdout with no
   stats or timing mixed in; every diagnostic (target, SDK profile, warnings, counts) goes to
   stderr, so `dae getclass app.apk Foo | less` and `dae classes app.apk > index.tsv` just work.
-  `-o FILE` writes to a file instead; `get*` with `-o FILE.dart` merges into one file and
-  `-o DIR` writes the same `<DIR>/dart/<lib>.dart` layout as a full export.
-- **Names you can guess.** A library can be written three ways — the `lib` column of
+  `-o FILE` writes to a file instead; `-o FILE.dart` merges into one file and `-o DIR` writes the
+  same `<DIR>/dart/<lib>.dart` layout as a full export. Full export is the one exception, and it
+  is deliberate: its summary goes to stdout because that is the human channel there.
+- **Names you can paste back.** A library can be written three ways — the `lib` column of
   `functions.txt` (`testing_app$screens$home`), the URL from `libs.txt`
   (`package:testing_app/screens/home.dart`), or the artifact file name
   (`testing_app_screens_home`) — and library names match by **prefix**, so
   `getlib testing_app` is the whole package. Classes are exact (case-insensitive fallback);
-  add `--fuzzy` for substring. Functions accept `Class.method`, a bare member, or the
-  artifact-style `Class_method` you just copied out of the output.
-- A miss is actionable: `getclass HomePag` suggests real names instead of silently doing nothing.
-- `--lib/--class/--func` also work on the full export, giving a **filtered** export: the
-  function-scoped artifacts (`functions.txt`, `asm/`, `dart/`, `call_edges.txt`,
-  `callgraph.dot`) shrink to the selection, while the object-layer dumps (`pp`, `objs`,
-  `strings`, `libs`, `classes`, `arrays`, `maps`) stay complete because they are the index you
-  pick from.
+  add `--fuzzy` for substring. Function names accept `Class.method`, a bare member, the
+  artifact-style `Class_method`, **and** the all-dots `lib.Class.method` that
+  `callers`/`callees`/`findrefs`/`call_edges.txt` print — so the output of one command can be fed
+  straight into the next without reformatting.
+- A miss is actionable: `getclass HomePag` suggests real names, and `findrefs kind NoSuchKind`
+  lists the object kinds that actually exist in that pool.
+- **Scope filters.** `--lib/--class/--func` narrow the function-scoped artifacts
+  (`functions.txt`, `asm/`, `dart/`, `call_edges.txt`, `callgraph.dot`); the object-layer dumps
+  (`pp`, `objs`, `strings`, `libs`, `classes`, `arrays`, `maps`) stay complete because they are
+  the index you pick from. Three more filters drop whole libraries:
+  `--exclude-lib PATTERN` (repeatable), `--no-sdk` (URLs starting with `dart:`), and `--app`
+  (also `package:flutter`). Those two are decided by the library's **original URL**, not by
+  guessing from the mangled name — `dart:core` mangles to `dart_core`, which a package named
+  `dart_core_extra` would also resemble. On a real Flutter app the three levels are
+  505 libraries / 15,796 functions → 489 / 11,016 (`--no-sdk`) → 56 / 765 (`--app`).
+- **Exit codes**: `0` ok; `1` runtime error (including a miss and parse drift); `2` usage error.
+- **Not provided, and why.** `findrefs` has no `field` kind: compiled code carries no symbolic
+  field reference, only a bare displacement, so matching on displacement would report unrelated
+  `[x, #0x18]` as hits — guessing, not querying. There is no `hierarchy`: the superclass chain
+  dae can read is not backed by ground truth (measured against an app's own source, `App extends
+  StatefulWidget` resolves to `SceneBuilder`), and a wrong inheritance chain is worse than none.
+  The same unresolved chain feeds `frida.js`'s `sid` field and the ancestor grouping inside
+  `text/objs.txt`, so treat both as unreliable; this is marked at their source sites. There is no
+  manifest-style `--app` that infers your package name, because a Dart snapshot has no manifest.
 
-Cost, measured on a real Flutter app (10,245 functions): a full `--decompile` export takes
-1.9s and writes ~1000 files; `dae info` / `dae getclass Foo` take 0.03s, `dae disasm` 0.05s,
-and `dae callers` (the one query that disassembles every function) 0.18s. Snapshot parsing
-itself is ~50ms — what progressive mode saves is the writing.
+### Why `dart/` is one file per library, not per class
+
+Because that is how Dart source is organized: a *library* is normally one `.dart` file and holds
+many classes, and Dart's privacy is **library-scoped**, not class-scoped. `_SliderState` is
+visible to `Slider` precisely because they share a library — in the decompiled output,
+`Slider_createState()` calls `SliderState_ctor()` (Flutter's `createState() => _SliderState()`).
+Per-library files mirror the original layout, so those references stay real definitions.
+
+Splitting per class would still pass `dart analyze` (the per-file preamble declares any identifier
+used but not defined in that file, so cross-class calls degrade to `dynamic` invocations), but it
+costs fidelity — definitions you could read become opaque stubs — multiplies the file count roughly
+eightfold (4,150 classes vs 535 libraries on one sample), and can collide, since `_SliderState`
+loses its underscore and could clash with a public `SliderState`. If you want a class-named file,
+`dae getclass App HomePage -o HomePage.dart` already gives you one; `-o DIR` deliberately keeps
+the full-export layout so "the selection is a subset of the full export" is literally checkable.
+
+Cost, measured: a full `--decompile` export of a 15,796-function Flutter app takes ~2.1s and
+writes ~1000 files. Queries are 15–30ms on a small corpus; on that same large app `findrefs` is
+0.21s, `callees` 0.30s, and `decompile --app` 0.20s. Snapshot parsing itself is ~50ms — what
+progressive mode saves is the writing.
+
 
 ## Decompiler (experimental)
 

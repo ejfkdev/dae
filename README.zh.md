@@ -38,8 +38,10 @@
 - **快**——24 MB 的 Flutter 样本约 0.07 s 导出（≈Python 参考实现的 27 倍）；26 MB 的 macOS 应用
   `--decompile` 约 1 s，真机飞书/微博安卓产物 1.6 s / 5.6 s。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
-- **渐进式模式**——`dae libs`/`classes`/`functions`/`strings`/`callers` 像查数据库一样查快照，
-  再用 `dae getclass`/`getmethod`/`getlib` 只反编译那一份（`dae info` 0.03 秒 vs 全量 1.9 秒），
+- **渐进式模式**——20 条子命令像查数据库一样查快照（`libs`/`classes`/`functions`/`members`/
+  `strings`/`findrefs`/`callers`/`callees`/`pp`/`objs`/`stubs`……），再只反编译你要的那一份
+  （`getclass`/`getmethod`/`getlib`/`decompile --app`）。查询 15–30 毫秒出结果，
+  而一个 15 796 函数的应用全量导出约 2.1 秒、上千个文件；每条命令的输出都能直接抄进下一条。
   见[渐进式](#渐进式先查清单再定点反编译)。
 - **零依赖**——直接解析 Mach-O/ELF/PE，无需 Dart SDK 或 Flutter 工具链。
 
@@ -60,8 +62,13 @@ macOS 预编译二进制是 ad-hoc 签名；首次被 Gatekeeper 拦截时执行
 
 ```bash
 dae <binary> <out_dir>                       # 自动识别 Dart 版本
+dae export <binary> <out_dir>                # 同上，显式动词
 dae <binary> <out_dir> --sdk-profile P.json  # 或强制指定
-dae help                                     # 渐进式子命令（先查清单，再定点反编译）
+dae <binary> <out_dir> --app --decompile     # 只要应用侧代码（排除 dart: 与 package:flutter）
+
+dae help                                     # 全部子命令（分组）
+dae help findrefs                            # 单条命令的选项与输出列
+dae decompile <binary> | less                # 整个应用的伪代码走 stdout
 ```
 
 ```console
@@ -135,44 +142,93 @@ export done -> /绝对路径/to/out:
 
 ## 渐进式（先查清单，再定点反编译）
 
-全量导出会写出上千个文件，但多数时候你只要一个类或一个包。先查、再定点反编译
-（`dae help` 有全部选项）：
+全量导出会写出上千个文件，但多数时候你只要一个类、一个包，或者只是想知道「这个字符串被谁用了」。
+先查、再定点反编译（`dae help` 有全部命令，`dae help <cmd>` 有单条命令的选项与输出列）：
 
 ```
-dae info      <binary>                        快照 / SDK / 规模——不写任何产物
-dae libs      <binary> [pattern]              库（包）清单 + 类数/函数数
-dae classes   <binary> [pattern] [--lib P]    类清单
-dae functions <binary> [pattern] [--lib P]    函数清单（入口 / 字节数 / 归属）
-dae strings   <binary> [-f TEXT]              快照字符串表检索
-dae fields    <binary> [pattern]              具名字段（来源 + 字节偏移）
-dae largest   <binary> [-n N]                 按代码字节数排前 N
-dae callers   <binary> <NAME|0xADDR>          谁调用了它（静态直接调用边）
-dae disasm    <binary> <CLASS[.method]>       原始反汇编（arm64 保留 IL 注释）
-dae getclass  <binary> <CLASS>                只反编译这个类
-dae getmethod <binary> <CLASS.method>         只反编译这个方法
-dae getlib    <binary> <LIB>                  只反编译这个库（包）
+先摸清全貌
+  dae info      <binary>                        快照 / SDK / 规模——不写任何产物
+  dae libs      <binary> [pattern]              库（包）清单 + 类数/函数数
+  dae classes   <binary> [pattern] [--lib P]    类清单
+  dae functions <binary> [pattern] [--lib P]    函数清单（入口 / 字节数 / 归属）
+  dae largest   <binary> [-n N]                 按代码字节数排前 N
+
+找东西
+  dae strings   <binary> [-f TEXT]              快照字符串表检索
+  dae fields    <binary> [pattern]              具名字段（来源 + 字节偏移）
+  dae members   <binary> [NAME] [--class X]     方法与字段的统一名字检索
+  dae findrefs  <binary> string TEXT            哪些代码位置加载了这个字面量
+  dae findrefs  <binary> kind NAME              ……或加载了这个种类的对象
+  dae callers   <binary> <NAME|0xADDR>          谁调用了它（静态直接调用边）
+  dae callees   <binary> <NAME|0xADDR>          它调用了谁（列与 callers 相同）
+
+对象层（与 text/ 里的同名产物同源）
+  dae pp        <binary> [pattern]              对象池条目
+  dae objs      <binary> [pattern]              用户类实例（含字段值）
+  dae stubs     <binary> [pattern]              指令表里没有 Code 对象的条目
+
+反编译
+  dae getclass  <binary> <CLASS>                只反编译这个类
+  dae getmethod <binary> <CLASS.method>         只反编译这个方法
+  dae getlib    <binary> <LIB>                  只反编译这个库（包）
+  dae decompile <binary> [-o DIR|FILE.dart|-]   全部，或你收窄后的全部
+
+低层
+  dae disasm    <binary> <CLASS[.method]>       原始反汇编（arm64 保留 IL 注释）
+
+全量导出
+  dae export    <binary> <out_dir> [--decompile]
+  dae           <binary> <out_dir> [--decompile]   快捷形，与上面完全等价
 ```
 
 几条为了「能组合」而定的口径：
 
-- **stdout 是数据通道**：查询结果与 `get*` 的伪代码走 stdout，不掺统计与耗时；目标、
-  SDK profile、告警、计数一律走 stderr。于是 `dae getclass app Foo | less`、
-  `dae classes app > index.tsv` 都能直接用。`-o FILE` 改为落盘；`get*` 的 `-o FILE.dart`
-  合并成单文件，`-o DIR` 则写成与全量导出同形的 `<DIR>/dart/<库>.dart`。
-- **名字要能猜中**：库名三种写法等价——`functions.txt` 的 lib 列（`testing_app$screens$home`）、
-  `libs.txt` 的 URL（`package:testing_app/screens/home.dart`）、产物文件名（`testing_app_screens_home`）；
-  且库名按**前缀**匹配，`getlib testing_app` 就是整个包。类名默认精确（大小写不敏感兜底），
-  `--fuzzy` 才子串。函数名收 `Class.method`、裸方法名，以及你刚从产物里抄出来的
-  `Class_method` 下划线形式。
-- 没命中会给提示：`getclass HomePag` 会列几个真名字，而不是静默什么都不做。
-- `--lib/--class/--func` 也能加在全量导出上，得到**筛选导出**：函数维度的产物
-  （`functions.txt`、`asm/`、`dart/`、`call_edges.txt`、`callgraph.dot`）缩到选中范围，
-  对象层产物（`pp`/`objs`/`strings`/`libs`/`classes`/`arrays`/`maps`）保持完整——它们是你
-  挑选时的索引。
+- **stdout 是数据通道**：查询结果与反编译伪代码走 stdout，不掺统计与耗时；目标、SDK profile、
+  告警、计数一律走 stderr。于是 `dae getclass app Foo | less`、`dae classes app > index.tsv`
+  都能直接用。`-o FILE` 改为落盘；`-o FILE.dart` 合并成单文件，`-o DIR` 写成与全量导出同形的
+  `<DIR>/dart/<库>.dart`。**唯一的例外是全量导出**，而且是有意的：它的摘要走 stdout，
+  因为那才是它的人读通道。
+- **名字要能抄回来**：库名三种写法等价——`functions.txt` 的 lib 列（`testing_app$screens$home`）、
+  `libs.txt` 的 URL（`package:testing_app/screens/home.dart`）、产物文件名
+  （`testing_app_screens_home`）；且库名按**前缀**匹配，`getlib testing_app` 就是整个包。
+  类名默认精确（大小写不敏感兜底），`--fuzzy` 才子串。函数名收 `Class.method`、裸方法名、
+  产物里的下划线形式 `Class_method`，**以及** `callers`/`callees`/`findrefs`/`call_edges.txt`
+  输出的全点号形式 `lib.Class.method`——所以上一条命令的输出能直接喂进下一条，不用改写。
+- 没命中会给可操作的提示：`getclass HomePag` 列几个真名字；`findrefs kind NoSuchKind`
+  列出这个池里真实存在过的对象种类。
+- **范围收窄**：`--lib/--class/--func` 作用于函数维度的产物（`functions.txt`、`asm/`、`dart/`、
+  `call_edges.txt`、`callgraph.dot`）；对象层 dump（`pp`/`objs`/`strings`/`libs`/`classes`/
+  `arrays`/`maps`）保持完整——它们是你挑选时的索引。另有三个**整库排除**：
+  `--exclude-lib PATTERN`（可重复）、`--no-sdk`（URL 以 `dart:` 开头的库）、`--app`
+  （再排除 `package:flutter`）。后两个按库的**原始 URL** 判，不按 mangled 名猜——
+  `dart:core` 会被 mangle 成 `dart_core`，而一个叫 `dart_core_extra` 的包长得几乎一样。
+  实测真实 Flutter 应用：505 库 / 15 796 函数 → `--no-sdk` 489 / 11 016 → `--app` 56 / 765。
+- **退出码**：`0` 成功；`1` 运行期错误（含没命中、解析漂移）；`2` 用法错误。
+- **不提供的，以及为什么**：`findrefs` 没有 `field` 这个 kind——编译后的机器码里没有符号化的
+  字段引用，只剩裸位移，按位移匹配会把大量无关的 `[x, #0x18]` 报成命中，那是猜不是查。
+  没有 `hierarchy`——dae 能读到的父类链没有真值支撑（拿应用自己的源码对照，
+  `App extends StatefulWidget` 被解成 `SceneBuilder`），而错的继承链比没有更糟。
+  同一条没解对的链还喂给 `frida.js` 的 `sid` 字段与 `text/objs.txt` 里的祖先分组，
+  所以那两处也请当作不可信；源码里已在对应位置标注。也没有 ddc 那种从 manifest 取应用包名的
+  `--app`——Dart 快照没有 manifest，猜包名就是编造。
 
-实测成本（真实 Flutter 应用 10 245 个函数）：全量 `--decompile` 导出 1.9 秒、写约 1000 个文件；
-`dae info` / `dae getclass Foo` 0.03 秒，`dae disasm` 0.05 秒，最贵的 `dae callers`
-（要扫全量调用点）0.18 秒。快照解析本身约 50 毫秒——渐进式省下的是写盘。
+### 为什么 dart/ 是一个库一个文件，而不是一个类一个文件
+
+因为 Dart 源码就是这么组织的：一个 *library* 通常就是一个 `.dart` 文件、里面放很多类，
+而 Dart 的私有性是**库级**的，不是类级。`_SliderState` 之所以对 `Slider` 可见，正因为它们
+同属一个库——反编译产物里 `Slider_createState()` 调的就是 `SliderState_ctor()`
+（对应 Flutter 的 `createState() => _SliderState()`）。按库分文件忠实镜像了原始布局，
+所以这些引用仍是**真定义**。
+
+按类拆也能过 `dart analyze`（每文件的前导会声明「本文件用到但没定义」的标识符，跨类调用于是
+退化成 `dynamic` 调用），但代价是保真度——本来能读到的定义变成不透明的桩；文件数约涨 8 倍
+（同一份样本 4 150 个类 vs 535 个库）；还会撞名，因为 `_SliderState` 去掉下划线后可能与
+公开的 `SliderState` 冲突。想要以类名命名的文件，`dae getclass App HomePage -o HomePage.dart`
+现在就能给；而 `-o DIR` 刻意保持与全量导出同形，好让「选出来的是全量的子集」这条能字面校验。
+
+实测成本：一个 15 796 函数的 Flutter 应用，全量 `--decompile` 约 2.1 秒、写约 1000 个文件；
+小语料上各查询 15–30 毫秒；同一个大应用上 `findrefs` 0.21 秒、`callees` 0.30 秒、
+`decompile --app` 0.20 秒。快照解析本身约 50 毫秒——渐进式省下的是写盘。
 
 ## 反编译器（实验性）
 
