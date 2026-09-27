@@ -124,6 +124,8 @@ fn lift(
     let Ok(insns) = cs.disasm_all(code, base) else {
         return (out, raw);
     };
+    // 每行注释约 40 字节；不预留就会随指令数反复扩容
+    raw.reserve(insns.len() * 40);
     for ins in insns.iter() {
         let mnem = ins.mnemonic().unwrap_or("").to_string();
         let ops_masked = mask_regs(&rl, ins.op_str().unwrap_or(""));
@@ -300,23 +302,29 @@ fn mask_regs(rl: &Roles, ops: &str) -> String {
 
 /// 按「词边界」替换（前后不能是字母数字），避免 `r1` 命中 `r14`。
 fn replace_word(s: &str, from: &str, to: &str) -> String {
-    let mut out = String::with_capacity(s.len());
     let b = s.as_bytes();
+    let fb = from.as_bytes();
+    let mut out = String::with_capacity(s.len() + to.len());
     let mut i = 0usize;
+    // 已拷贝到的位置：整段用 push_str 搬，而不是逐字节 `push(b[i] as char)`——
+    // 后者每个字节都要做一次 char 转换 + UTF-8 编码，在百万条语句量级上是主要开销。
+    let mut last = 0usize;
     while i < s.len() {
-        if b[i..].starts_with(from.as_bytes())
+        if b[i..].starts_with(fb)
             && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
         {
             let j = i + from.len();
             if j >= s.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                out.push_str(&s[last..i]);
                 out.push_str(to);
                 i = j;
+                last = j;
                 continue;
             }
         }
-        out.push(s.as_bytes()[i] as char);
         i += 1;
     }
+    out.push_str(&s[last..]);
     out
 }
 
@@ -1612,7 +1620,10 @@ fn emit_function(
     let nodes = s.seq(0, None, 0);
     let reason = s.reason.clone();
     let mut unstructured = s.unstructured;
-    let mut body = String::new();
+    // 预估容量：`body` 从 0 长起会反复 realloc + memmove（采样里 finish_grow 与
+    // _platform_memmove 是前几名）。每条语句渲染后约 56 字节，按语句数一次给足。
+    let n_stmts: usize = blocks.iter().map(|b| b.stmts.len()).sum();
+    let mut body = String::with_capacity(n_stmts * 56 + 256);
     render_nodes(&nodes, 0, &mut body, &mut unstructured, fa);
     if unstructured {
         *fallback += 1;
@@ -2145,7 +2156,9 @@ pub fn render(
                 file.clone()
             }
         };
-        let mut of = String::new();
+        // 按本库函数数预估：大的库（如 dart:core）产物可达数百 KB，从 0 长起要 realloc 十几次
+        let n_fns: usize = cls_map.iter().map(|(_, fs)| fs.len()).sum();
+        let mut of = String::with_capacity(n_fns * 768 + 4096);
         let _ = writeln!(of, "// dae decompiler output -- pseudocode that parses as Dart");
         let _ = writeln!(of, "// library: {lib_name}");
         let _ = writeln!(
@@ -3680,6 +3693,11 @@ fn subst_regs(text: &str, pending: &BTreeMap<String, (String, usize, u64)>, rl: 
         // 命中）。字面量在它被载入的那一行照常显示（`rax = " fib(20)=" /* pp+0x1e08 */`），
         // 那才是它该出现的地方；后续引用保持寄存器名。不含算术的引用（如 `call(x0)`）仍替换。
         if e.starts_with('"') && s.contains(['+', '*', '-']) {
+            continue;
+        }
+        // 早退：绝大多数待定寄存器并不出现在当前操作数文本里，而 replace_word 必然分配。
+        // 先用 contains（std 里是 memchr 优化的子串搜索）挡掉，省掉那次分配 + 整段拷贝。
+        if !s.contains(n.as_str()) {
             continue;
         }
         s = replace_word(&s, n, &format!("({e})"));

@@ -125,6 +125,39 @@ Other gates hold on the same corpora: structured-rate floor 0.70 (measured 0.87�
 corpora and 0.92 on the app), and address self-consistency (function ends look like terminators
 82–96%, direct calls land on function entries 70–96%).
 
+### Real applications (2026-09-27)
+
+Everything above is `hello`-scale: ~1 200 functions per sample. Real apps are two orders of
+magnitude larger, and `tests/app_truth.rs` covers three of them — the last two checked against
+their actual source, which no other gate can do.
+
+| artifact | Dart | functions | structured | unmapped | analyze errors |
+|---|---|---|---|---|---|
+| Reqable.app (macOS arm64, 26 MB) | 3.3.4 | 1 808 | 1 716 (94.9%) | 1 | 0 |
+| Weibo `libapp.so` (android arm64) | 2.19.6 | 19 053 | 17 351 (91.1%) | 1 | 0 |
+| Lark `libapp.so` (android arm64) | 3.6.1 | 3 517 | 3 374 (95.9%) | 1 | 0 |
+| `material_3_demo` (5 107 source lines) | 3.13.0 | 15 082 | 13 950 (92.5%) | 3 | 0 |
+| `animations` (2 108 source lines) | 3.13.0 | 11 102 | 10 264 (92.5%) | 3 | 0 |
+
+For the two demos the source is known, so the output is judged *against it* rather than only against
+itself:
+
+| check | material_3_demo | animations |
+|---|---|---|
+| public classes/mixins/enums in `lib/` recovered | 85/86 = **98.8%** | 35/35 = **100%** |
+| source string literals present in the output | 292/306 = **95.4%** | 111/114 = **97.4%** |
+| source files mapping to a recovered library | 18/18 = **100%** | 21/23 = 91% |
+
+The one missed type is `enum Value { first, second }` in `component_screen.dart`; that library *is*
+in the output, so the enum was tree-shaken or canonicalised away rather than misparsed. The two
+unmapped `animations` files are examples nothing references.
+
+`app_truth`'s fast half (plain export + source comparison) takes ~2 s and runs in the normal suite;
+the `--decompile` + `dart analyze` half is `#[ignore]`d because a million statements take minutes
+(247 s for both demos). Point `DAE_DEMO_ROOT` at a `flutter-samples` checkout built with
+`flutter build macos --release`. The same binaries can be folded into the scorecard with
+`DAE_SCORECARD_EXTRA=/path/to/App:/path/to/App2 cargo test --release --test dart_valid -- --ignored`.
+
 ## The trap this table keeps springing
 
 Three times now the same failure mode has appeared, and it is worth stating plainly because the

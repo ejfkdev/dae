@@ -15,7 +15,21 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
 
 ## Features
 
-- **Self-contained & auto-detecting** — all 26 SDK profiles plus **21 compressed-pointer variants** are embedded; the Dart version is matched by snapshot hash and the variant (`compressed-pointers`, i.e. every mobile Flutter build) from the snapshot's own features string, with a structural-probe fallback for custom/Flutter-engine builds. Verified against real Flutter apps: Android arm64 (Reqable 3.3.4, Lark 3.6.1, ChatGLM 3.11.6, CHSI 3.7.2, Weibo 2.19.6) and macOS arm64 — for the five Android builds the instructions-table entry count matches aotopsy exactly (57 960 / 79 327 / 30 782 / 19 752 / 22 623), all at zero warnings, and Lark and Weibo decompile to `dart analyze`-clean Dart.
+- **Self-contained & auto-detecting** — all 26 SDK profiles plus **21 compressed-pointer variants** are embedded; the Dart version is matched by snapshot hash and the variant (`compressed-pointers`, i.e. every mobile Flutter build) from the snapshot's own features string, with a structural-probe fallback for custom/Flutter-engine builds. Verified against real shipping apps, not just our own builds:
+
+  - **Android arm64** — Reqable 3.3.4, Lark 3.6.1, ChatGLM 3.11.6, CHSI 3.7.2, Weibo 2.19.6.
+    For all five the instructions-table entry count matches aotopsy exactly
+    (57 960 / 79 327 / 30 782 / 19 752 / 22 623), each at zero warnings, and Lark and Weibo
+    decompile to `dart analyze`-clean Dart (95.9% and 91.1% structured).
+  - **macOS arm64** — Reqable.app 3.3.4: 70 996 table entries, 0 warnings, 1 808 functions at
+    94.9% structured, `dart analyze` 0 errors.
+  - **flutter-samples demos built locally** (Dart 3.13.0) — `material_3_demo` (5 107 lines) and
+    `animations` (2 108 lines): 15 796 and 11 102 functions, both 92.5% structured, both
+    `dart analyze` 0 errors. Because the source is known, these are checked *against it*:
+    98.8% and 100% of the public classes/mixins/enums declared in `lib/` are recovered, 95.4% and
+    97.4% of its string literals appear in the output, and 18/18 and 21/23 source files map to a
+    recovered library. `tests/app_truth.rs` asserts those ratios (floor 0.90) so the chain cannot
+    silently rot.
 - **Decompiles to valid Dart** — lift → CFG → structured emission, not a disassembly dump: loops,
   `if/else`, `break`/`continue`, object-pool literals inlined at their load site, recovered field
   names as attribution comments. Across 26 artifacts (291 files, 24 253 functions) the output
@@ -215,7 +229,10 @@ recovery (everything is `dynamic`, field access is `mem(base, disp)`). Unrecogni
 are emitted verbatim as `// unmapped:` rather than approximated, and the count is printed in the
 run summary — treat it as the quality dial.
 
-Gates run on every change: `tests/source_truth.rs` (compiles `tests/fixtures/truth.dart` with the
+Gates run on every change: `tests/app_truth.rs` (decompiles locally built **flutter-samples** apps
+and checks the result against their real source — recovered public types, string literals and
+library mapping, floors at 0.90; point `DAE_DEMO_ROOT` at a checkout),
+`tests/source_truth.rs` (compiles `tests/fixtures/truth.dart` with the
 local `dart`, decompiles it, and checks the result against the source — plus the same battery on a
 compressed-pointer arm64 build under `DAE_TRUTH_ANDROID=1`), `tests/dart_valid.rs` (real
 `dart analyze`, zero errors),
@@ -269,6 +286,17 @@ Android source-truth chain, which needs `DAE_TRUTH_ANDROID=1`) are not affected.
 
 ## Known limitations
 
+- **Out of scope: non-standard and placeholder artifacts.** Of the 41 APKs in the local corpus
+  exactly 8 ship a `lib/arm64-v8a/libapp.so`. Three of those eight are not standard Flutter AOT
+  snapshots and dae says so rather than guessing: WeChat's `libapp.so` is a **21-byte `CSOS`
+  placeholder inside the APK itself** (not an extraction artifact — the real payload lives
+  elsewhere), and DingTalk's carries `enable_aion` + `llvm_compiler` in its features string, i.e.
+  a vendor fork that replaced the AOT compiler with an LLVM backend; its snapshot version hash
+  matches no known SDK, so detection falls back to a low-confidence structural probe.
+  Tonghuashun is a genuine Dart **2.7.2** build and behaves *identically to the reference
+  `hello_2.7.2` sample*: strings and the object layer export, but the instruction table is
+  recoverable neither from the snapshot header nor from Code-cluster text offsets, so there are no
+  function addresses. That is the documented ≤2.9 ceiling, not an artifact-specific failure.
 - **Dart 2.18.1 is not usable.** Its fill layout has a second, still-unlocated error: with the
   source-correct `Function` shape (which 2.19.6 and real 2.19.6 artifacts confirm) the parse
   collapses to `libraries=1 / classes=1`. The previous layout scored better on `hello_2.18.1.aot`

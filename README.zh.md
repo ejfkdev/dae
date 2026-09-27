@@ -15,7 +15,20 @@
 
 ## 特性
 
-- **开箱即用、自动识别**——26 份 SDK profile + **21 份压缩指针变体**内嵌进二进制；按快照哈希匹配版本，变体（`compressed-pointers`，即所有移动端 Flutter 构建）按快照自带的 features 串自动选中，自定义/Flutter 引擎构建走结构探针兜底。已在真机应用上实测：Android arm64（Reqable 3.3.4、飞书 3.6.1、ChatGLM 3.11.6、学信网 3.7.2、微博 2.19.6）与 macOS arm64——五个安卓产物的指令表表项数与 aotopsy **完全一致**（57 960 / 79 327 / 30 782 / 19 752 / 22 623），全部 0 警告；飞书与微博的反编译产物还能通过 `dart analyze`（0 错误）。
+- **开箱即用、自动识别**——26 份 SDK profile + **21 份压缩指针变体**内嵌进二进制；按快照哈希匹配版本，变体（`compressed-pointers`，即所有移动端 Flutter 构建）按快照自带的 features 串自动选中，自定义/Flutter 引擎构建走结构探针兜底。验证用的是**真实上线应用**，不只是我们自己编的样本：
+
+  - **Android arm64**——Reqable 3.3.4、飞书 3.6.1、ChatGLM 3.11.6、学信网 3.7.2、微博 2.19.6。
+    五个产物的指令表表项数与 aotopsy **完全一致**（57 960 / 79 327 / 30 782 / 19 752 / 22 623），
+    全部 0 警告；飞书与微博还能端到端反编译成 `dart analyze` **0 错误**的 Dart
+    （结构化 95.9% 与 91.1%）。
+  - **macOS arm64**——Reqable.app 3.3.4：70 996 表项、0 警告、1 808 个函数结构化 94.9%、
+    `dart analyze` **0 错误**。
+  - **本地构建的 flutter-samples demo**（Dart 3.13.0）——`material_3_demo`（5 107 行）与
+    `animations`（2 108 行）：15 796 与 11 102 个函数，结构化都是 92.5%，`dart analyze` 都 **0 错误**。
+    因为源码已知，这两个是**对着源码判**的：`lib/` 里声明的公开 class/mixin/enum 分别恢复出
+    98.8% 与 100%，源码字符串字面量分别有 95.4% 与 97.4% 出现在产物里，源文件到恢复出的库
+    分别映射 18/18 与 21/23。`tests/app_truth.rs` 会断言这些比率（下限 0.90），
+    链路一旦悄悄退化就会失败。
 - **反编译产出合法 Dart**——lift → CFG → 结构化发射，不是反汇编转储：循环、`if/else`、
   `break`/`continue`、对象池字面量在其载入处内联、恢复出的字段名以归属注释形式标注。
   26 份语料（291 个文件、24 253 个函数）的产物 **`dart analyze` 错误为 0**；真机应用同样站得住——
@@ -199,7 +212,9 @@ dae getlib    <binary> <LIB>                  只反编译这个库（包）
 补法与 aotopsy 的 `typetrack` 同源）。认不出的指令原样输出为 `// unmapped:`，不做近似；
 运行摘要里会打印这个行数——可以把它当质量刻度看。
 
-每次改动都有门禁：`tests/source_truth.rs`（用本机 `dart` 现编 `tests/fixtures/truth.dart`，
+每次改动都有门禁：`tests/app_truth.rs`（反编译本地构建的 **flutter-samples** 应用，并**对其真实源码判**——
+恢复出的公开类型、字符串字面量、库映射，下限 0.90；用 `DAE_DEMO_ROOT` 指向检出目录）、
+`tests/source_truth.rs`（用本机 `dart` 现编 `tests/fixtures/truth.dart`，
 反编译后**对源码判**；`DAE_TRUTH_ANDROID=1` 时再对压缩指针 arm64 产物跑同一套）、
 `tests/dart_valid.rs`（真跑 `dart analyze`，要求零错误）、
 `tests/decompiler_shape.rs`（产物文件花括号必须配平（不配平=静默丢分支）、函数体内语句必须正常
@@ -243,6 +258,14 @@ DAE_REQUIRE_GATES=1 cargo test --release
 
 ## 已知限制
 
+- **范围外：非标准产物与占位文件。** 本地 41 个 APK 里恰好 8 个带 `lib/arm64-v8a/libapp.so`，
+  其中三个**不是标准 Flutter AOT 快照**，dae 会明确说明而不是猜：微信的 `libapp.so` 在 APK 内部
+  **本身就是 21 字节的 `CSOS` 占位**（不是我提取错，真载荷在别处）；钉钉的 features 串带
+  `enable_aion` + `llvm_compiler`，即厂商分支把 AOT 编译器换成了 LLVM 后端，其快照版本哈希
+  对不上任何已知 SDK，只能退到低置信度的结构探针。同花顺是**真正的 Dart 2.7.2** 产物，
+  表现与参考样本 `hello_2.7.2` **完全一致**：字符串与对象层能导出，但指令表既不在快照头里、
+  也无法从 Code 簇的 text-offset 累加得到，因此没有函数地址。这是 ≤2.9 的已知上限，
+  不是该产物特有的失败。
 - **Dart 2.18.1 不可用。** 它的 fill 布局还有第二处**尚未定位**的错误：按源码判定的正确
   `Function` 形状（2.19.6 样本与真机 2.19.6 产物双重印证）解析会塌陷成 `libraries=1 / classes=1`。
   旧布局在 `hello_2.18.1.aot` 上分数更好，只是因为多读的那个 varint 在**补偿**另一处错——它同样
