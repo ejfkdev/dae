@@ -538,7 +538,30 @@ fn cmd_info(args: &[String], lang: Lang, s: &Messages) -> Result<(), String> {
             tr(lang, "告警", "warnings"),
             a.warnings.len()
         );
-        emit(&o, &out, lang, "info")
+        emit(&o, &out, lang, "info")?;
+        // 与全量导出同一条纪律：漂移时所有派生数字都不可信，退出码必须非零，
+        // 否则脚本会把「libraries=1 / classes=1」的垃圾当成功结果收下。
+        // info 的价值恰恰在于诊断，所以先把信息全部打印完，再以错误收尾。
+        let drift = a
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("!!! drift") || w.starts_with("!! alloc mismatch"))
+            .count();
+        if drift > 0 {
+            return Err(tr(
+                lang,
+                &format!(
+                    "解析漂移（{drift} 条）：上面的库/类/函数计数不可信。\
+                     多半是快照布局与所选 profile 不匹配（自定义引擎、或版本/构建开关判定错了）"
+                ),
+                &format!(
+                    "parse drift ({drift} entries): the library/class/function counts above are \
+                     not trustworthy. Usually a snapshot layout that does not match the selected \
+                     profile (custom engine, or a wrong version/build-flag match)"
+                ),
+            ));
+        }
+        Ok(())
     })
 }
 

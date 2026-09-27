@@ -349,7 +349,15 @@ impl<'a> Snapshot<'a> {
                 ((head >> 1) as u64, head & 1 != 0)
             };
             if cid > 60000 {
-                warn(format!("!!! drift cluster {i} cid={cid}"));
+                // `head` 是 read_signed 的 i64；为负时 `as u64` 会回绕成 1.8e19 量级的数，
+                // 直接印出来没法诊断（实测钉钉那个 LLVM 自定义引擎产物报的就是
+                // cid=18446744073709551553，其实是 -63）。同时给出原始 head 的有符号值，
+                // 这样「读到垃圾」与「cid 真的很大」两种情况一眼可分。
+                warn(format!(
+                    "!!! drift cluster {i} cid={cid} (cluster header decoded to {head} signed; \
+                     a negative or out-of-range cid means the stream is misaligned, not that \
+                     the class id is large)"
+                ));
                 break;
             }
             if profile.alloc.cid_only_alloc_cids.contains(&cid) {
