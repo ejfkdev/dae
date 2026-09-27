@@ -2294,9 +2294,23 @@ pub fn render(
     };
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut used: BTreeMap<String, u32> = BTreeMap::new();
-    // 入口地址 → 显示名（与产物里的函数标题一致，首见生效），供 `bl` 目标命名
+    // 入口地址 → 显示名（与产物里的函数标题一致，首见生效），供 `bl` 目标命名。
+    //
+    // ⚠️ 这张表必须按**未筛选的完整函数表**建，不能按传进来的 `libs` 建。
+    // `libs` 是发射集合（`--lib` / `--app` / `getclass` 会把它收窄），而**调用目标的命名
+    // 与「发射哪些函数」无关**：按收窄后的表建名字，会让每一个跨库调用退化成 `sub_0x…`。
+    // 实测 testing_app：`Favorites.remove` 里的 `_favoriteItems.remove(itemNo)` 与
+    // `notifyListeners()` 在全量反编译下是 `GrowableList_remove()` 与
+    // `ChangeNotifier_notifyListeners()`，而 `--lib testing_app` 下变成
+    // `sub_0x8a1b8()` / `sub_0x6d60()`——恰好把语义最重要的两个调用弄丢了，
+    // 而「只看应用自有代码」正是 `--app` 推荐的用法。
+    //
+    // 全量导出时 `libs` 本来就等于完整表，所以这一改对全量产物**逐字节无影响**
+    // （已用 `diff -rq` 验证）；只有收窄时命名变全。收窄后这些名字在本文件里没有定义，
+    // 由 `dart_preamble` 声明成 `dynamic`，调用它是合法的动态调用，产物仍能过 `dart analyze`。
+    let all_libs = analyzer.build_functions(true);
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
-    for (_lib, cls_map) in libs {
+    for (_lib, cls_map) in &all_libs {
         for (_cls, funcs) in cls_map {
             for f in funcs {
                 if f.ep == 0 || names.contains_key(&f.ep) {

@@ -503,3 +503,96 @@ fn same_tree(a: &Path, b: &Path) -> bool {
     }
     walk(a, a) == walk(b, b)
 }
+
+/// 按库收窄反编译时，**跨库调用目标不许退化成匿名 `sub_0x…`**。
+///
+/// 这条门禁存在的原因是一次真实回归：`render` 的「入口地址 → 显示名」表原本按传进来的
+/// `libs`（= 发射集合）建，于是 `--lib X` / `--app` 一收窄，所有调进别的库的目标都掉进
+/// `sub_0x…` 兜底。实测 testing_app 的 `Favorites.remove`：全量下是
+/// `GrowableList_remove()` 与 `ChangeNotifier_notifyListeners()`，收窄后变成
+/// `sub_0x8a1b8()` / `sub_0x6d60()`——恰好丢掉语义最重要的两个调用，而「只看应用自有代码」
+/// 正是 `--app` 的推荐用法。具名率 26.6% → 54.0%（修好后）。
+///
+/// **为什么需要专门的门禁**：这个缺陷对既有门禁全部隐形——产物照样过 `dart analyze`
+/// （名字都是 `dynamic`）、结构化率不变、地址自洽性不变、`regress_all` 也不变（它跑的是全量）。
+/// 判据取「收窄产物的匿名调用集合 ⊆ 全量产物的匿名调用集合」，与语料无关：
+/// 收窄只应该**减少**发射的函数，不应该让任何原本有名字的调用变成没名字。
+#[test]
+fn scoped_decompile_keeps_cross_library_call_names() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过收窄命名门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let tmp = root.join("target").join("cli_query_names");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (full, scoped) = (tmp.join("full"), tmp.join("scoped"));
+
+    // 取一个真实的库名
+    let (libs_out, _e, rc) = run(bin, &["libs", &s]);
+    assert_eq!(rc, 0);
+    let lib = libs_out
+        .lines()
+        .next()
+        .and_then(|l| l.split('\t').next())
+        .expect("libs 没有输出")
+        .to_string();
+
+    let f = full.to_string_lossy().to_string();
+    let c = scoped.to_string_lossy().to_string();
+    assert_eq!(run(bin, &["decompile", &s, "-o", &f]).2, 0, "全量 decompile 失败");
+    assert_eq!(
+        run(bin, &["decompile", &s, "--lib", &lib, "-o", &c]).2,
+        0,
+        "收窄 decompile 失败"
+    );
+
+    // 收集两边产物里出现的匿名调用目标地址（`sub_0x…`）。手写扫描而不引正则依赖：
+    // 只为一条门禁加一个 crate 不划算，而且这里的模式简单到不需要正则。
+    let subs = |d: &Path| -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        let dart = d.join("dart");
+        let Ok(rd) = std::fs::read_dir(&dart) else {
+            return set;
+        };
+        for e in rd.flatten() {
+            let Ok(t) = std::fs::read_to_string(e.path()) else {
+                continue;
+            };
+            let mut rest = t.as_str();
+            while let Some(i) = rest.find("sub_0x") {
+                let tail = &rest[i + "sub_0x".len()..];
+                let hex: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                if !hex.is_empty() {
+                    set.insert(hex);
+                }
+                rest = &rest[i + "sub_0x".len()..];
+            }
+        }
+        set
+    };
+    let (in_full, in_scoped) = (subs(&full), subs(&scoped));
+    assert!(
+        !in_full.is_empty() || !in_scoped.is_empty(),
+        "两边都没有匿名调用，门禁会空过——换语料或换判据"
+    );
+    let leaked: Vec<&String> = in_scoped.difference(&in_full).collect();
+    assert!(
+        leaked.is_empty(),
+        "收窄到 --lib {lib} 后有 {} 个调用目标变成匿名（全量下它们是有名字的）：{:?}\n\
+         说明 render 的命名表又是按发射集合建的了——它必须按未筛选的完整函数表建",
+        leaked.len(),
+        leaked.iter().take(6).map(|x| x.as_str()).collect::<Vec<_>>()
+    );
+    println!(
+        "收窄命名: 全量匿名 {} 个地址，收窄后 {} 个，无新增（leaked=0）",
+        in_full.len(),
+        in_scoped.len()
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
