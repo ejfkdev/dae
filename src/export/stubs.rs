@@ -18,7 +18,11 @@ pub struct StubCounts {
     pub named: usize,
 }
 
-pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> {
+/// 一行 = `(入口, 字节数, 解出的名字)`；名字解不出就是空串（**绝不为凑覆盖率编名字**）。
+///
+/// `write`（产物 `text/stubs.txt`）与 `dae stubs`（查询命令）共用这一处，所以两边看到的
+/// 一定是同一批条目、同一套名字。
+pub fn stub_rows(analyzer: &Analyzer) -> Vec<(u64, u64, String)> {
     // 「没有被任何 Code 对象认领」的表项：直接按 func_eps 的 idx 集合取补集，
     // 不依赖 first_entry / code_base_ref 的语义（实测那两个字段在本语料上都不指向 stub 段：
     // base_ref 之前的 167 个 Code 对象其实都是分配 stub，first_entry 却是 0）。
@@ -43,6 +47,22 @@ pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> 
     #[cfg(not(feature = "asm"))]
     let names: Vec<(u64, Option<String>)> = rows.iter().map(|(ep, _)| (*ep, None)).collect();
 
+    // 原来是每行都 `names.iter().find(...)` 线性找一遍（O(n²)：2757 条 stub 就是 760 万次
+    // 比较）。换成查表；**首个命中优先**（`or_insert`）以保持与 `find` 完全相同的语义——
+    // 同一地址若出现两次，取的是先出现的那个。
+    let mut by_ep: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    for (a, n) in names {
+        if let Some(n) = n {
+            by_ep.entry(a).or_insert(n);
+        }
+    }
+    rows.into_iter()
+        .map(|(ep, size)| (ep, size, by_ep.get(&ep).cloned().unwrap_or_default()))
+        .collect()
+}
+
+pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> {
+    let rows = stub_rows(analyzer);
     let mut of = crate::export::stream_writer(&out_dir.join("text"), "stubs.txt")?;
     let _ = writeln!(
         of,
@@ -50,12 +70,7 @@ pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> 
         rows.len()
     );
     let mut named = 0usize;
-    for (ep, size) in &rows {
-        let name = names
-            .iter()
-            .find(|(a, _)| a == ep)
-            .and_then(|(_, n)| n.clone())
-            .unwrap_or_default();
+    for (ep, size, name) in &rows {
         if !name.is_empty() {
             named += 1;
         }

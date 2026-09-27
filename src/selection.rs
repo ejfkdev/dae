@@ -54,13 +54,24 @@ impl Selection {
         }
         // 候选写法要覆盖「用户看到什么就抄什么」：
         //   mangled（deposit）、Class.method（Account.deposit）、lib/Class.method、
-        //   以及**产物里的下划线形式**（Account_deposit，dart/ 与 asm/ 的函数标题）。
-        // 少最后一种，用户从输出里复制函数名回来查就会落空（门禁 tests/cli.rs 抓到过）。
+        //   **产物里的下划线形式**（Account_deposit，dart/ 与 asm/ 的函数标题），
+        //   以及 **call_edges.txt / callers / findrefs 的全点号形式**（lib.Class.method）。
+        // 少最后一种，用户从那些输出里复制函数名回来查就会落空——实测
+        // `dae findrefs … | 取 from 列` 喂给 `dae disasm` 会报 nothing matched，下钻链就断了。
+        // 少下划线那种同样会断（门禁 tests/cli.rs 抓到过）。
         let full_lib = norm_lib(lib);
         let mut cands: Vec<String> = vec![mangled.to_string()];
         if !cls.is_empty() {
             cands.push(format!("{cls}.{mangled}"));
             cands.push(format!("{full_lib}/{cls}.{mangled}"));
+            // 全点号：`plan_functions` 就是用这个形式造名字的，所以它进了
+            // text/call_edges.txt 与 callers/callees/findrefs 的输出。
+            // 两种库名写法都收：原样的（testing_app$screens$home）与规范化的
+            // （testing_app/screens/home，即 URL 去掉 package: 后的样子）。
+            // 注意 `dart:` 库不适用后者——library_name 把 dart:core 写成 dart_core，
+            // 而 norm_lib 又会把 `dart:` 前缀剥掉，所以只能用原样那一支。
+            cands.push(format!("{lib}.{cls}.{mangled}"));
+            cands.push(format!("{full_lib}.{cls}.{mangled}"));
             let artifacts = format!("{}_{}", cls.replace(['.', ':'], "_"), mangled);
             cands.push(artifacts.trim_start_matches('_').to_string());
             cands.push(format!(
@@ -72,6 +83,7 @@ impl Selection {
             .to_string());
         } else {
             cands.push(format!("{full_lib}.{mangled}"));
+            cands.push(format!("{lib}.{mangled}"));
         }
         let cands: Vec<String> = cands.into_iter().filter(|c| !c.is_empty()).collect();
         self.funcs
@@ -190,6 +202,33 @@ mod tests {
         assert!(name_hit("homepage", "HomePage", false)); // 大小写不敏感
         assert!(!name_hit("Home", "HomePage", false)); // 非模糊不子串
         assert!(name_hit("Home", "HomePage", true));
+    }
+
+    /// callers / callees / findrefs / text/call_edges.txt 输出的是**全点号**形式
+    /// （`plan_functions` 造的），用户会把它抄回来喂给 disasm / getmethod / callers。
+    /// 少这一种写法，下钻链就断在那里（实测断过：`dae disasm` 报 nothing matched）。
+    #[test]
+    fn func_hit_accepts_all_dots_form() {
+        // SDK 库：内部名就是 `dart_core`（library_name 把 `dart:core` 写成 `dart_core`），
+        // 与 findrefs 打出来的完全一致
+        let sel = Selection {
+            funcs: vec!["dart_core.RangeError.checkValidRange".to_string()],
+            ..Default::default()
+        };
+        assert!(sel.any_func("dart_core", "RangeError", "checkValidRange"));
+        // 包库：内部名用 `$` 分隔，规范化后用 `/`——两种写法都要认
+        let sel2 = Selection {
+            funcs: vec!["testing_app$screens$home.HomePage.build".to_string()],
+            ..Default::default()
+        };
+        assert!(sel2.any_func("testing_app$screens$home", "HomePage", "build"));
+        let sel3 = Selection {
+            funcs: vec!["testing_app/screens/home.HomePage.build".to_string()],
+            ..Default::default()
+        };
+        assert!(sel3.any_func("testing_app$screens$home", "HomePage", "build"));
+        // 不该误命中别的类
+        assert!(!sel.any_func("dart_core", "ArgumentError", "checkValidRange"));
     }
 
     #[test]

@@ -448,6 +448,142 @@ fn roles(analyzer: &Analyzer) -> Roles {
     }
 }
 
+/// 对象池引用的查询门面（`dae findrefs` 用）。
+///
+/// 它不重新实现任何解析：值文本来自 `pool_map`（与 `text/pp.txt` 同源），
+/// 操作数→池偏移来自 `mask_regs` + `mem_parts` + `pool_key`（与反编译产物里
+/// `x0 = "Hello" /* pp+0x17f8 */` 那条注释同源）。所以 findrefs 报出的偏移
+/// **就是**产物里注释的那个偏移，这条等价关系是可以断言的（见 tests/cli_query.rs），
+/// 不需要相信实现。
+pub struct PoolRefs {
+    rl: Roles,
+    /// 偏移 → 与 `text/pp.txt` **同形**的完整描述（`dae pp` 用的也是这个）。
+    ///
+    /// 之所以要单独存一份，而不是直接用 `rl.pool`：`pool_map` 的值是「可内联进 Dart 代码的
+    /// 形式」，而 `dart_literal` 会在 **60 字符处截断**并加 `...`。拿截断形去检索会
+    /// **静默漏掉**落在后半段的子串——实测语料里就有
+    /// `"Error handler must accept one Object or one Object and a Sta..."`，
+    /// 搜 `StackTrace as arguments` 一个都命中不了。对一个搜索命令来说这不可接受。
+    /// 顺带也让 `findrefs` 的值列与 `dae pp` / `text/pp.txt` 一致，不再是两套文本。
+    full: BTreeMap<u64, String>,
+}
+
+impl PoolRefs {
+    pub fn new(analyzer: &Analyzer) -> Self {
+        let mut full = BTreeMap::new();
+        if let Some(entries) = analyzer.iso.objectpool_entries.as_ref() {
+            for (i, ent) in entries.iter().enumerate() {
+                let mut t = String::new();
+                crate::export::ppobjs::pp_describe(analyzer, &mut t, ent);
+                full.insert(crate::export::ppobjs::pp_offset(i), t);
+            }
+        }
+        Self {
+            rl: roles(analyzer),
+            full,
+        }
+    }
+
+    /// 池条目总数。
+    pub fn len(&self) -> usize {
+        self.rl.pool.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rl.pool.is_empty()
+    }
+
+    /// 含 `needle` 的条目：`(偏移, 完整描述, 是不是字符串字面量)`。
+    ///
+    /// 大小写不敏感子串，与 `dae strings -f` 同口径。**完整描述与内联形都要搜**：
+    /// 前者可能带 `String: ` 这类前缀，后者可能截断，只搜一边都会漏。
+    ///
+    /// 第三个字段用来区分 kind，判据是内联形的形状而不是猜：`pool_map` 把字符串字面量
+    /// 写成 `"…"`（带引号），把其它对象写成 `/* 类名 */` 注释。
+    pub fn values_containing(&self, needle: &str) -> Vec<(u64, String, bool)> {
+        let n = needle.to_lowercase();
+        self.rl
+            .pool
+            .iter()
+            .filter_map(|(k, inline)| {
+                let full = self.full.get(k).cloned().unwrap_or_else(|| inline.clone());
+                if !full.to_lowercase().contains(&n) && !inline.to_lowercase().contains(&n) {
+                    return None;
+                }
+                Some((*k, full, inline.starts_with('"')))
+            })
+            .collect()
+    }
+
+    /// 某个偏移的值文本。
+    pub fn value_at(&self, off: u64) -> Option<&str> {
+        self.rl.pool.get(&off).map(|s| s.as_str())
+    }
+
+    /// 对象种类恰为 `name` 的条目：`(偏移, 完整描述)`。大小写不敏感、**整名精确**。
+    ///
+    /// 「种类」就是 `pool_map` 给非字符串条目生成的那个 `/* X */` 注释里的 X
+    /// （实测语料里有 ImmutableArray / Type / Field / Function / TypeParameter /
+    /// SubtypeTestCache / TypeArguments / Stub），也就是反编译产物里
+    /// `x1 = mem((PP + 0x18000), 0x768) /* TypeArguments */` 那个词。
+    ///
+    /// ⚠️ 这**不是**类型名。`describe_into` 写的是 `Kind: 内容`，所以种类前缀是对象自身的
+    /// 类别；拿它当「按类型名检索」会既漏又误（搜 `Field` 命中的是所有 Field 对象，
+    /// 与具体哪个字段无关）。命令因此叫 `kind` 而不叫 `type`。
+    pub fn entries_of_kind(&self, name: &str) -> Vec<(u64, String)> {
+        let want = name.to_lowercase();
+        self.rl
+            .pool
+            .iter()
+            .filter_map(|(k, inline)| {
+                let inner = inline
+                    .strip_prefix("/* ")
+                    .and_then(|s| s.strip_suffix(" */"))?
+                    .trim();
+                if !inner.eq_ignore_ascii_case(&want) {
+                    return None;
+                }
+                Some((
+                    *k,
+                    self.full.get(k).cloned().unwrap_or_else(|| inline.clone()),
+                ))
+            })
+            .collect()
+    }
+
+    /// 池里实际出现过的对象种类（按条数降序），用于没命中时给可操作提示。
+    pub fn kinds(&self) -> Vec<(String, usize)> {
+        let mut m: BTreeMap<&str, usize> = BTreeMap::new();
+        for inline in self.rl.pool.values() {
+            if let Some(inner) = inline
+                .strip_prefix("/* ")
+                .and_then(|s| s.strip_suffix(" */"))
+                .map(|s| s.trim())
+            {
+                if !inner.is_empty() {
+                    *m.entry(inner).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut v: Vec<(String, usize)> = m.into_iter().map(|(k, n)| (k.to_string(), n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// 这条**原始 capstone 操作数文本**是否在读某个池槽；是则返回偏移。
+    ///
+    /// 先过 `mask_regs`（把 `x27`/`r15` 之类还原成角色名 `PP`）再解析，与反编译器
+    /// 走同一条路。没有 `[` 的操作数不可能是内存引用，直接早退——扫全量指令时
+    /// 绝大多数指令走这条，省掉一次 String 分配。
+    pub fn offset_in_operand(&self, raw_ops: &str) -> Option<u64> {
+        if !raw_ops.contains('[') {
+            return None;
+        }
+        let masked = mask_regs(&self.rl, raw_ops);
+        pool_key(&self.rl, &mem_parts(&masked))
+    }
+}
+
 #[cfg(feature = "asm")]
 pub fn pool_debug(analyzer: &Analyzer) -> usize {
     let m = pool_map(analyzer);
@@ -1430,6 +1566,28 @@ fn mem_read(rl: &Roles, operand: &str) -> String {
 /// 带 tag 的情况不靠平台知识判断，直接 `off` 与 `off + 1` 各试一次——池条目间距 8 字节，
 /// 相邻两个都是条目的概率为零，不会误命中。
 fn pool_value(rl: &Roles, m: &MemOperand) -> Option<String> {
+    let key = pool_key(rl, m)?;
+    let v = rl.pool.get(&key)?.clone();
+    // 字符串字面量后面留一个池偏移注释：`x0 = "key" /* pp+0x78 */`——
+    // 值可以直接读，但读者仍能顺着偏移回到 pp.txt 对照原始条目。
+    if v.starts_with('"') {
+        return Some(format!("{v} /* pp+{key:#x} */"));
+    }
+    // 非字符串对象条目只带一个类型注释（`/* Field */`）：它自己不是表达式，
+    // 直接当值会把产物写成 `x9 = /* Field */;`（语法错误）——补上内存读法。
+    if v.starts_with("/*") {
+        return Some(format!("mem({}) {v}", m.args()));
+    }
+    Some(v)
+}
+
+/// 这条内存操作数读的是哪个池槽。
+///
+/// 从 `pool_value` 里抽出来，是为了让 `dae findrefs` 与反编译产物**共用同一份解析**：
+/// 产物里 `x0 = "Hello" /* pp+0x17f8 */` 那个偏移，和 findrefs 报出来的偏移，
+/// 必须是同一个函数算出来的——这样「findrefs 的每个命中都能在 dart/ 里找到对应注释」
+/// 就成了可断言的判据（门禁盯着），而不是靠人相信。
+fn pool_key(rl: &Roles, m: &MemOperand) -> Option<u64> {
     if rl.pool.is_empty() {
         return None;
     }
@@ -1439,19 +1597,8 @@ fn pool_value(rl: &Roles, m: &MemOperand) -> Option<String> {
             continue;
         }
         let key = cand as u64;
-        if let Some(v) = rl.pool.get(&key) {
-            let v = v.clone();
-            // 字符串字面量后面留一个池偏移注释：`x0 = "key" /* pp+0x78 */`——
-            // 值可以直接读，但读者仍能顺着偏移回到 pp.txt 对照原始条目。
-            if v.starts_with('"') {
-                return Some(format!("{v} /* pp+{key:#x} */"));
-            }
-            // 非字符串对象条目只带一个类型注释（`/* Field */`）：它自己不是表达式，
-            // 直接当值会把产物写成 `x9 = /* Field */;`（语法错误）——补上内存读法。
-            if v.starts_with("/*") {
-                return Some(format!("mem({}) {v}", m.args()));
-            }
-            return Some(v);
+        if rl.pool.contains_key(&key) {
+            return Some(key);
         }
     }
     None

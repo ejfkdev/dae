@@ -53,8 +53,21 @@ pub enum Cmd {
     /// named fields (source + byte offset)
     Fields(Query),
 
+    /// object pool entries (what `text/pp.txt` dumps)
+    Pp(Query),
+    /// user class instances with their field values
+    Objs(Query),
+    /// instruction-table entries with no Code object
+    Stubs(Query),
+
+    /// method/field name search, optionally scoped to one class
+    Members(Members),
     /// who calls it
     Callers(Target),
+    /// what it calls
+    Callees(Target),
+    /// every code site that loads a given string literal / object kind from the pool
+    Findrefs(FindRefs),
 
     /// raw disassembly (arm64 with IL comments)
     Disasm(Target),
@@ -167,6 +180,56 @@ pub struct Export {
     /// also emit dart/ pseudocode
     #[arg(long = "decompile")]
     pub decompile: bool,
+}
+
+/// `members <binary> [NAME] [--class X] [--method|--field]`
+///
+/// `--class` 复用共享选项（与其它命令的筛选语义一致），`--method`/`--field` 互斥。
+#[derive(Args)]
+#[command(disable_help_flag = true)]
+pub struct Members {
+    #[command(flatten)]
+    pub common: Common,
+
+    /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
+    pub binary: String,
+
+    /// optional name filter (substring)
+    pub pattern: Option<String>,
+
+    /// only methods
+    #[arg(long = "method", conflicts_with = "field")]
+    pub method: bool,
+
+    /// only fields
+    #[arg(long = "field")]
+    pub field: bool,
+}
+
+/// `findrefs <binary> <kind> <query>`
+///
+/// kind 只有两种，都是**可证**的检索面：`string TEXT`（池里的字符串字面量，按子串）与
+/// `kind NAME`（对象种类，即反编译产物里 `/* TypeArguments */` 那个词，整名精确）。
+///
+/// **不提供 `field`**：编译后的机器码里没有符号化的字段引用，只剩裸位移，按位移匹配会把
+/// 大量无关的 `[x, #0x18]` 当成命中——那是猜，不是查。
+/// **也不叫 `type`**：池条目的描述形是 `Kind: 内容`，那个前缀是对象**类别**而不是类型名；
+/// 拿它当类型名检索会既漏又误（搜 `Field` 命中的是所有 Field 对象，与具体哪个字段无关）。
+/// 宁可少一个 kind，也不给一个会骗人的结果。
+#[derive(Args)]
+#[command(disable_help_flag = true)]
+pub struct FindRefs {
+    #[command(flatten)]
+    pub common: Common,
+
+    /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
+    pub binary: String,
+
+    /// what to look for: `string` (pool string literals) or `kind` (object kind)
+    pub kind: String,
+
+    /// the text to search (substring) or the object kind name (exact)
+    pub query: String,
 }
 
 /// `help [cmd]`

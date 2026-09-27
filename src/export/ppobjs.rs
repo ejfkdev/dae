@@ -3,7 +3,7 @@
 //! 输出全部直接写入预分配缓冲（sink 式），field 递归不克隆字符串、不建临时 Vec。
 
 use crate::analyzer::Analyzer;
-use crate::engine::snapshot::PoolKind;
+use crate::engine::snapshot::{PoolEntry, PoolKind};
 use crate::engine::snapshot::FieldVal;
 use crate::export::hex_py;
 use std::fmt::Write as _;
@@ -16,6 +16,54 @@ fn t(name: &str, since: &mut std::time::Instant) {
         eprintln!("[timing] {name}: {:?}", now.duration_since(*since));
         *since = now;
     }
+}
+
+/// 池条目偏移：`0x10 + i * 8`（前 16 字节是 ObjectPool 对象头，槽间距 8 字节）。
+///
+/// 槽间距是「带 tag 的 x64 池指针试 `off` 与 `off+1` 不会双双命中」这条推理的前提，
+/// 改它要同时看 `decompiler::pool_value`。
+pub fn pp_offset(i: usize) -> u64 {
+    0x10 + i as u64 * 8
+}
+
+/// 把一个池条目的描述写进 `w`，返回它的种类（`obj` / `imm` / `stub`）。
+///
+/// `write_pp`（产物 `text/pp.txt`）与 `dae pp`（查询命令）共用这一处，免得两边的描述
+/// 格式各自漂移——产物是给人对照反编译输出里的 `/* pp+0x… */` 注释用的，查询结果必须
+/// 能对上同一份文本，否则「在 pp.txt 里看到的」与「查出来的」会变成两套东西。
+///
+/// 写成 sink 式（写进调用方缓冲、只返回种类）而不是返回 `String`，是为了不给导出路径
+/// 每个条目多加一次分配：Reqable.app 有 122 064 个池条目。与本文件其余部分同口径。
+pub fn pp_describe(analyzer: &Analyzer, w: &mut String, ent: &PoolEntry) -> &'static str {
+    if ent.typ == PoolKind::Obj {
+        describe_into(analyzer, w, ent.value.unwrap_or(0) as u64, 0);
+        "obj"
+    } else if ent.typ == PoolKind::Imm {
+        let _ = write!(w, "{}", hex_py(ent.value.unwrap_or(0)));
+        "imm"
+    } else {
+        w.push_str("Stub");
+        "stub"
+    }
+}
+
+/// `objs.txt` / `dae objs` 的候选实例：`instance_fields` 里 cid 达到阈值的那些。
+///
+/// 现代系沿用历史基线 176 阈值（与各版本对拍存档一致）；≤2.14 时代按
+/// `profile.alloc.instance_min`（2.14=152）。
+pub fn obj_candidates(analyzer: &Analyzer) -> Vec<u64> {
+    let imin = if analyzer.profile.format.string_clusters_separate {
+        analyzer.profile.alloc.instance_min
+    } else {
+        176
+    };
+    analyzer
+        .iso
+        .instance_fields
+        .iter()
+        .filter(|(_, (cid, _))| *cid >= imin)
+        .map(|(r, _)| *r)
+        .collect()
 }
 
 /// 返回 (pp 条目数, objs 实例数)
@@ -51,17 +99,11 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
             scope.spawn(move || {
                 let mut of = String::with_capacity((e - b) * 48);
                 for (k, ent) in entries[b..e].iter().enumerate() {
-                    let i = b + k;
-                    let off = 0x10 + i * 8;
-                    if ent.typ == PoolKind::Obj {
-                        let _ = write!(of, "[pp+{off:#x}] ");
-                        describe_into(analyzer, &mut of, ent.value.unwrap_or(0) as u64, 0);
-                        of.push('\n');
-                    } else if ent.typ == PoolKind::Imm {
-                        let _ = writeln!(of, "[pp+{off:#x}] {}", hex_py(ent.value.unwrap_or(0)));
-                    } else {
-                        let _ = writeln!(of, "[pp+{off:#x}] Stub");
-                    }
+                    let off = pp_offset(b + k);
+                    let _ = write!(of, "[pp+{off:#x}] ");
+                    // 描述文本与 `dae pp` 同源（见 pp_describe）
+                    pp_describe(analyzer, &mut of, ent);
+                    of.push('\n');
                 }
                 let _ = tx.send((pi, of));
             });
@@ -95,20 +137,8 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
 }
 
 fn write_objs(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
-    // 候选实例：现代系沿用历史基线 176 阈值（与各版本对拍存档一致）；
-    // ≤2.14 时代按 profile.alloc.instance_min（2.14=152）
-    let imin = if analyzer.profile.format.string_clusters_separate {
-        analyzer.profile.alloc.instance_min
-    } else {
-        176
-    };
-    let cands: Vec<u64> = analyzer
-        .iso
-        .instance_fields
-        .iter()
-        .filter(|(_, (cid, _))| *cid >= imin)
-        .map(|(r, _)| *r)
-        .collect();
+    // 候选实例与 `dae objs` 同源（阈值口径见 obj_candidates）
+    let cands: Vec<u64> = obj_candidates(analyzer);
     let n_threads = crate::analyzer::n_threads();
     let n = cands.len();
     let chunk = n.div_ceil(n_threads).max(1);

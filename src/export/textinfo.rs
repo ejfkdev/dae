@@ -20,7 +20,11 @@ pub struct TextInfoCounts {
 }
 
 /// Tab / 换行 / 反斜杠转义，保证一行一条、可安全粘贴/检索。
-fn esc(s: &str) -> String {
+///
+/// `pub(crate)` 是为了让渐进式子命令（`dae pp` / `dae objs` 等）用**同一份**转义：
+/// 池条目的值就是字符串字面量，里面带 tab 和换行是常态，各自实现一遍必然漂移，
+/// 而漂移的后果是 TSV 列数对不上——那是本项目门禁明确断言的东西。
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\r', "\\r")

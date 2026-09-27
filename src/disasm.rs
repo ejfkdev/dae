@@ -15,6 +15,8 @@
 use capstone::arch::{BuildsCapstone, BuildsCapstoneSyntax};
 #[cfg(feature = "asm")]
 use capstone::{arch, Capstone};
+#[cfg(feature = "asm")]
+use crate::analyzer::Analyzer;
 
 /// 建 capstone 引擎（arm64 或 x86-64 Intel 语法）。
 ///
@@ -72,4 +74,98 @@ pub fn function_code(
         return None;
     }
     Some((foff, &data[foff as usize..end as usize]))
+}
+
+/// 扫描时回调拿到的「当前函数」。按值传给回调（每条指令一次），所以要 `Copy`。
+#[derive(Clone, Copy)]
+pub struct ScanFn<'a> {
+    /// 运行时入口地址
+    pub ep: u64,
+    /// 完整名（`lib/Class.member`）
+    pub name: &'a str,
+}
+
+/// 并行扫描一批函数的每条指令。
+///
+/// `plan` 的每条是 `(ep, payload, csize, full_name)`，即 `callgraph::plan_functions` 的形状。
+/// `visit` 对每条指令调一次，返回 `Some(T)` 就收下。
+///
+/// **并行但确定**：按 plan 切成连续区间、每线程一段，回收时按区间序号拼接，所以同一份输入
+/// 永远得到同一份输出。查询命令的结果要能进对拍与门禁，这条性质是前提。
+///
+/// 线程数、capstone 构造、边界检查都走本模块的共享基元——`export::callgraph::collect_edges`
+/// 是同一套逻辑的另一份消费者（它因为要按区间回收 `Vec<Edge>` 而保留自己的循环，
+/// 但引擎与边界检查已经共用）。
+pub fn scan_instructions<T, F>(
+    analyzer: &Analyzer,
+    plan: &[(u64, u64, u64, String)],
+    visit: F,
+) -> Result<Vec<T>, String>
+where
+    T: Send + 'static,
+    F: Fn(ScanFn<'_>, &capstone::Insn) -> Option<T> + Sync,
+{
+    let is_arm64 = analyzer.platform.arch == "arm64";
+    let n_threads = crate::analyzer::n_threads();
+    let chunk = plan.len().div_ceil(n_threads).max(1);
+    let ranges: Vec<(usize, usize)> = (0..plan.len())
+        .step_by(chunk)
+        .map(|b| (b, (b + chunk).min(plan.len())))
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for (pi, &(b, e)) in ranges.iter().enumerate() {
+            let tx = tx.clone();
+            let visit = &visit;
+            scope.spawn(move || {
+                let cs = match build_cs(is_arm64) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let _ = tx.send((pi, Vec::new(), Some(err)));
+                        return;
+                    }
+                };
+                let mut out: Vec<T> = Vec::new();
+                for (ep, payload, csize, name) in &plan[b..e] {
+                    let Some((_foff, code)) =
+                        function_code(analyzer.data, analyzer.slice_off, *payload, *csize)
+                    else {
+                        continue;
+                    };
+                    // 反汇编地址是 payload（运行时入口），不是文件偏移——见 function_code
+                    let Ok(insns) = cs.disasm_all(code, *payload) else {
+                        continue;
+                    };
+                    let ctx = ScanFn {
+                        ep: *ep,
+                        name: name.as_str(),
+                    };
+                    for ins in insns.iter() {
+                        if let Some(v) = visit(ctx, ins) {
+                            out.push(v);
+                        }
+                    }
+                }
+                let _ = tx.send((pi, out, None));
+            });
+        }
+        drop(tx);
+    });
+    let mut parts: Vec<Option<Vec<T>>> = (0..ranges.len()).map(|_| None).collect();
+    let mut err: Option<String> = None;
+    for (pi, v, e) in rx {
+        parts[pi] = Some(v);
+        if e.is_some() && err.is_none() {
+            err = e;
+        }
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let total: usize = parts.iter().flatten().map(|v| v.len()).sum();
+    let mut all = Vec::with_capacity(total);
+    for p in parts.into_iter().flatten() {
+        all.extend(p);
+    }
+    Ok(all)
 }

@@ -836,6 +836,15 @@ impl<'a> Analyzer<'a> {
             return Some(format!("{{id:{cid},name:\"{name}\"}}"));
         }
         // 用户类
+        // ⚠️ 已知问题：这个 `sid`（父类 cid）**目前是错的**，别信它。
+        // 它来自 `super_type_ref → type_cids`，而那条解析没有真值验过。实测 material_3_demo
+        // （源码可对照）：`App extends StatefulWidget`（cid 2285），这里却给 sid=1142
+        // （SceneBuilder）；`BrightnessButton extends StatelessWidget`（2115），这里给 1057。
+        // 同一个 `parent_of` 还被 `ppobjs::instance_block` 用来给继承字段分组，所以
+        // `objs.txt` 的祖先分组同样不可靠。定位过程与下一步要查什么写在 `src/cli.rs` 的
+        // 「hierarchy：本轮不提供」那段——`dae hierarchy` 就是因为这个才没发出去。
+        // 之所以没有就地删掉这个字段：它会改变 frida.js 的字节，而 25 份对拍存档要跟着重验，
+        // 那是独立的一轮；先如实标注，别让人拿着错值去用。
         let sid = if c.super_type_ref <= self.num_base {
             self.vm.type_cids.get(&c.super_type_ref).copied().unwrap_or(0)
         } else {

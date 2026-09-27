@@ -82,7 +82,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("dae {} — Dart AOT 快照调试信息静态导出工具（支持 Dart 2.7–3.14β；Mach-O/ELF/PE，x64/arm64）", env!("GIT_VERSION"));
         println!("https://github.com/ejfkdev/dae");
         println!();
-        println!("用法: dae <binary> <out_dir> [选项]        # 全量或筛选导出");
+        println!("用法: dae <binary> <out_dir> [选项]        # 全量或筛选导出（快捷形）");
+        println!("      dae export <binary> <out_dir> [选项] # 同上，显式动词（两者完全等价）");
         println!("      dae <子命令> <binary> [选项]        # 渐进式：先查清单，再定点反编译");
         println!("                                          （dae help 看全部子命令）");
         println!();
@@ -103,6 +104,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  -h, --help            显示此帮助");
         println!("  -V, --version         显示版本");
         println!();
+        println!("退出码: 0 成功；1 运行期错误（含没命中、解析漂移）；2 用法错误");
+        println!();
         println!("输出:");
         println!("  ida_script/    IDA 命名脚本 + 结构头（addNames.py / ida_dart_struct.h）");
         println!("  r2_script/     radare2 命名脚本 + 结构头（addNames.r2 / r2_dart_struct.h）");
@@ -120,7 +123,8 @@ fn print_help(s: &dae::locale::Messages) {
         println!("dae {} — static Dart AOT snapshot debug-info exporter (Dart 2.7–3.14β; Mach-O/ELF/PE, x64/arm64)", env!("GIT_VERSION"));
         println!("https://github.com/ejfkdev/dae");
         println!();
-        println!("usage: dae <binary> <out_dir> [options]        # full or filtered export");
+        println!("usage: dae <binary> <out_dir> [options]        # full or filtered export (shortcut)");
+        println!("       dae export <binary> <out_dir> [options] # same thing, explicit verb (equivalent)");
         println!("       dae <subcommand> <binary> [options]     # progressive: list first, then");
         println!("                                               decompile one class/library");
         println!("                                               (`dae help` lists every subcommand)");
@@ -141,8 +145,14 @@ fn print_help(s: &dae::locale::Messages) {
         println!("  -h, --help            show this help");
         println!("  -V, --version         show version");
         println!();
-        println!("progressive (writes no full export): dae info | libs | classes | functions |");
-        println!("  strings | fields | largest | callers | disasm | getclass | getmethod | getlib -- see `dae help`");
+        println!("exit codes: 0 ok; 1 runtime error (including a miss and parse drift); 2 usage error");
+        println!();
+        println!("progressive (writes no full export):");
+        println!("  get oriented   dae info | libs | classes | functions | largest");
+        println!("  find things    dae strings | fields | members | findrefs | callers | callees");
+        println!("  object layer   dae pp | objs | stubs");
+        println!("  decompile one  dae getclass | getmethod | getlib");
+        println!("  low-level      dae disasm                  -- see `dae help` for each");
         println!();
         println!("outputs:");
         println!("  ida_script/    IDA naming script + struct header (addNames.py / ida_dart_struct.h)");
