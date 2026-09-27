@@ -76,7 +76,19 @@ fn write_pp(analyzer: &Analyzer, out_dir: &Path) -> Result<usize, String> {
         parts[pi] = Some(s);
     }
     let mut of = String::with_capacity(n * 48);
-    of.push_str("pool heap offset: 0x10f000080\n");
+    // 这一行曾是硬编码的 `0x10f000080`——从 Python 参考实现原样移植来的，而参考实现
+    // 自己也是写死的。blutter 是**算**出来的（DartDumper.cpp：
+    // `raw_addr - app.heap_base()`，即 ObjectPool 对象在 image 里的地址减堆基址），
+    // 它有完整的对象图 walker；dae 解析的是快照流，既不重建 image 布局也没有 heap_base
+    // （r2 脚本里 heap_base 一直是 0x0 占位）。
+    // 实测这个常量对 macOS Reqable.app、安卓飞书、安卓微博三个不同架构/不同指针模式的产物
+    // 印出**同一个值**，说明它对其中至少两个是错的。既然算不出来，就不编：
+    // 保留键名以维持与 blutter 的 pp.txt 行结构对齐，值如实写成 unavailable 并说明缘由。
+    of.push_str(
+        "pool heap offset: unavailable (dae parses the snapshot stream, not the loaded \
+         image layout, so it has neither the pool's image address nor the heap base; \
+         blutter derives this as pool_addr - heap_base)\n",
+    );
     for part in parts.into_iter().flatten() {
         of.push_str(&part);
     }

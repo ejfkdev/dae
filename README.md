@@ -9,7 +9,7 @@
 [![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTE4IiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDI1NiAyMTgiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMzQuNCAwLjEzMDE1MkwxMTEuNDggMjUuNjAyMkMxMTEuNjY1IDI5LjU2OTkgMTA5LjA1NCAzMi4wMDE5IDEwNC4wNjQgMzIuMDAxOUg2LjM5OTlWMEM2LjM5OTkgMC4xMzAxNDkgMTM0LjQgMC4xMzAxNTIgMTM0LjQgMC4xMzAxNTJaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTI1NiAwLjEzMDEyN0wxMDIuNDAxIDIxNy43MzJIMDBMMTUzLjU5OSAwLjEzMDEyN0gyNTZaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEyMS42MDEgMjE3LjczMkwxMzkuNjUgMTkyLjEzNEMxNDIuNDY1IDE4OC4xNjYgMTQ3LjA3NiAxODUuNzM0IDE1Mi4wNjcgMTg1LjczNEgyNDkuNjA0VjIxNy43MzZIMTIxLjYwMVYyMTcuNzMyWiIvPjwvc3ZnPg==)](https://zcode.z.ai/)
 
-> Config-driven **Dart AOT snapshot** analyzer and debug-info exporter. No Dart SDK, never runs the target: locates the embedded snapshot inside Mach-O / ELF / PE, exports the same symbols and structs as [blutter](https://github.com/worawit/blutter) for IDA / radare2 / Frida, and **decompiles functions into Dart that `dart analyze` accepts**. Covers desktop *and* real-device mobile (compressed-pointer) builds.
+> Config-driven **Dart AOT snapshot** analyzer and debug-info exporter. No Dart SDK, never runs the target: locates the embedded snapshot inside Mach-O / ELF / PE, exports the same symbols and structs as [blutter](https://github.com/worawit/blutter) for IDA / radare2 / Frida (with four deliberate corrections where the reference it was ported from was wrong — see `src/export/mod.rs`), and **decompiles functions into Dart that `dart analyze` accepts**. Covers desktop *and* real-device mobile (compressed-pointer) builds.
 
 Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `dart compile aot-snapshot` (Dart 2.7+ cluster snapshots).
 
@@ -286,6 +286,12 @@ Android source-truth chain, which needs `DAE_TRUTH_ANDROID=1`) are not affected.
 
 ## Known limitations
 
+- `text/pp.txt`'s first line reports `pool heap offset: unavailable`. blutter computes that value
+  as `pool_address - heap_base`, which needs the loaded image layout; dae parses the snapshot
+  stream and has neither, so it says so instead of printing a number. (It used to print a hardcoded
+  `0x10f000080` inherited from the Python reference implementation — the same value for macOS and
+  Android, compressed and uncompressed alike. `tests/cli.rs::pp_header_is_not_fabricated` keeps it
+  from coming back.) Object-pool *entries* are unaffected: `pp.txt` still resolves all of them.
 - **Out of scope: non-standard and placeholder artifacts.** Of the 41 APKs in the local corpus
   exactly 8 ship a `lib/arm64-v8a/libapp.so`. Three of those eight are not standard Flutter AOT
   snapshots and dae says so rather than guessing: WeChat's `libapp.so` is a **21-byte `CSOS`

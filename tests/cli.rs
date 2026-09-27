@@ -223,3 +223,48 @@ fn progressive_cli() {
     let _ = std::fs::remove_dir_all(&full);
     let _ = std::fs::remove_dir_all(&sel);
 }
+
+/// pp.txt 的首行**不许**是一个编造出来的十六进制数。
+///
+/// 这一行曾经硬编码为 `0x10f000080`（从 Python 参考实现原样移植，而参考实现自己也写死）。
+/// blutter 是真算的（`raw_addr - app.heap_base()`），dae 既没有 image 里 ObjectPool 的地址、
+/// 也没有 heap_base，所以算不出来；实测那个常量对 macOS 与安卓、压缩与非压缩指针的产物
+/// 印出同一个值。这条测试守住「算不出来就不编」——一旦有人把数字塞回去，它就失败。
+#[test]
+fn pp_header_is_not_fabricated() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("pp_header_is_not_fabricated: 无语料——跳过");
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let out = std::env::temp_dir().join("dae_pp_header_check");
+    let _ = std::fs::remove_dir_all(&out);
+    let (_, e, rc) = run(
+        bin,
+        &[sample.display().to_string().as_str(), out.display().to_string().as_str()],
+    );
+    assert_eq!(rc, 0, "全量导出应成功：{e}");
+    let pp = out.join("text").join("pp.txt");
+    assert!(pp.exists(), "应产出 text/pp.txt");
+    let first = std::fs::read_to_string(&pp)
+        .expect("读 pp.txt")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        first.starts_with("pool heap offset:"),
+        "pp.txt 首行应保持与 blutter 对齐的键名，实得：{first}"
+    );
+    let value = first.trim_start_matches("pool heap offset:").trim();
+    assert!(
+        !value.starts_with("0x"),
+        "pp.txt 又出现了具体的 pool heap offset 数值（{value}）——dae 没有 image 布局也没有 \
+         heap_base，算不出这个值；写死一个数字就是编造，请改回 `unavailable` 并说明缘由"
+    );
+    assert!(
+        value.starts_with("unavailable"),
+        "pool heap offset 应如实写成 unavailable，实得：{value}"
+    );
+}

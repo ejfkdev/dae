@@ -2,10 +2,14 @@
 //! r2_script/addNames.r2、ida_script/addNames.py、frida.js、asm/、pp.txt、objs.txt
 //! （另附 r2/ida 共用的 Dart 结构头 r2_dart_struct.h / ida_dart_struct.h）。
 //!
-//! 与 Python 参考实现的三处有意修正（README 有说明）：
+//! 与 Python 参考实现的四处有意修正（README 有说明）：
 //! 1. addNames.r2 的 Library()/Class() 编号正确自增（参考实现漏了自增）；
 //! 2. addNames.r2 的 app.base 取容器 __TEXT 段 VM 地址（参考实现硬编码 0x106484000）；
-//! 3. frida 模板的 PointerCompressedEnabled/CompressedWordSize/HeapAddressReg 按 Profile 重写。
+//! 3. frida 模板的 PointerCompressedEnabled/CompressedWordSize/HeapAddressReg 按 Profile 重写；
+//! 4. pp.txt 首行的 `pool heap offset` 不再硬编码 0x10f000080（参考实现写死的值，
+//!    对 macOS/安卓、压缩/非压缩指针的产物都印同一个数）。blutter 是算出来的
+//!    （`raw_addr - app.heap_base()`），dae 既不重建 image 布局也没有 heap_base，
+//!    算不出来就如实写 unavailable——见 `tests/cli.rs::pp_header_is_not_fabricated`。
 
 /// 流式写产物文件：返回 BufWriter，写完调 [`finish_writer`]。
 ///

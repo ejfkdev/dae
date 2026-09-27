@@ -9,7 +9,7 @@
 [![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTE4IiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDI1NiAyMTgiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMzQuNCAwLjEzMDE1MkwxMTEuNDggMjUuNjAyMkMxMTEuNjY1IDI5LjU2OTkgMTA5LjA1NCAzMi4wMDE5IDEwNC4wNjQgMzIuMDAxOUg2LjM5OTlWMEM2LjM5OTkgMC4xMzAxNDkgMTM0LjQgMC4xMzAxNTIgMTM0LjQgMC4xMzAxNTJaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTI1NiAwLjEzMDEyN0wxMDIuNDAxIDIxNy43MzJIMDBMMTUzLjU5OSAwLjEzMDEyN0gyNTZaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEyMS42MDEgMjE3LjczMkwxMzkuNjUgMTkyLjEzNEMxNDIuNDY1IDE4OC4xNjYgMTQ3LjA3NiAxODUuNzM0IDE1Mi4wNjcgMTg1LjczNEgyNDkuNjA0VjIxNy43MzZIMTIxLjYwMVYyMTcuNzMyWiIvPjwvc3ZnPg==)](https://zcode.z.ai/)
 
-> 配置驱动的 **Dart AOT 快照**分析与调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位内嵌快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的符号与结构供 IDA / radare2 / Frida 使用，并**把函数反编译成 `dart analyze` 认可的 Dart**。覆盖桌面**与**真机移动端（压缩指针）产物。
+> 配置驱动的 **Dart AOT 快照**分析与调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位内嵌快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的符号与结构供 IDA / radare2 / Frida 使用（对移植来源的参考实现有四处有意修正，见 `src/export/mod.rs`），并**把函数反编译成 `dart analyze` 认可的 Dart**。覆盖桌面**与**真机移动端（压缩指针）产物。
 
 适用于任意 Dart AOT 产物——Flutter release 构建、`dart compile exe`、`dart compile aot-snapshot`（Dart 2.7+ cluster 快照）。
 
@@ -258,6 +258,12 @@ DAE_REQUIRE_GATES=1 cargo test --release
 
 ## 已知限制
 
+- `text/pp.txt` 首行报的是 `pool heap offset: unavailable`。blutter 这个值是算出来的
+  （`pool 地址 - heap_base`），需要加载后的 image 布局；dae 解析的是快照流，两样都没有，
+  于是如实说明而不是印个数字。（它曾经印硬编码的 `0x10f000080`，那是从 Python 参考实现
+  继承来的——对 macOS 与安卓、压缩与非压缩指针都印同一个值。
+  `tests/cli.rs::pp_header_is_not_fabricated` 防止它回来。）对象池**条目**不受影响：
+  `pp.txt` 照旧解析全部条目。
 - **范围外：非标准产物与占位文件。** 本地 41 个 APK 里恰好 8 个带 `lib/arm64-v8a/libapp.so`，
   其中三个**不是标准 Flutter AOT 快照**，dae 会明确说明而不是猜：微信的 `libapp.so` 在 APK 内部
   **本身就是 21 字节的 `CSOS` 占位**（不是我提取错，真载荷在别处）；钉钉的 features 串带
