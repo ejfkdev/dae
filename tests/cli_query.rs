@@ -1401,19 +1401,24 @@ fn empty_if_without_else_does_not_grow() {
 
 /// 棘轮门禁：**栈溢出检查守卫**缺失的数量不许增长。
 ///
-/// Dart 的每次调用/循环回边前有一段固定序列：`ldr BARRIER, [THR, #stack_limit]` 然后
-/// `cmp SP, BARRIER; b.ls <溢出 stub>`。产物里前者渲染成 `BARRIER = mem(THR, 0x…)`、
-/// 后者渲染成 `if (SP <= BARRIER) { sub_0x…(); }`。
+/// Dart 在调用与循环回边前有一段固定序列：`ldr BARRIER, [THR, #stack_limit]`、
+/// `cmp SP, BARRIER`、`b.ls <溢出 stub>`。产物里守卫形态是
+/// `BARRIER = mem(THR, 0x48); if (SP <= BARRIER) { sub_0x…(); }`。
 ///
-/// 已知缺陷：**循环体里**的那一段会丢掉守卫——两条指令（`cmp` 与 `b.ls`）在正文里完全
-/// 消失，于是溢出 stub 从「仅 SP<=BARRIER 时调用」变成**每圈无条件调用**。同一函数的
-/// **序言**守卫渲染是正确的，所以 `lift` 没问题，问题在结构化器发射循环体那一步。
-/// material_3_demo 上 69 处（该 stub 全库被调 1218 次、其中 1149 次有守卫）。
+/// 已知缺陷：**`cmp` 与 `b.ls` 两条指令在正文里完全消失**，溢出 stub 于是从
+/// 「仅 SP<=BARRIER 时调用」变成**无条件调用**。注意那个调用是 out-of-line 的
+/// `b.ls` 目标块（实例里加载在 0x4bbdac、调用在 0x4bbe30），结构化器把它当直线语句
+/// 接在了加载后面。同一函数的**序言**守卫渲染是正确的，所以 `lift` 没问题，
+/// 丢失发生在结构化器发射那一步。material_3_demo 上按 stub 调用点算是 69 处。
 ///
-/// 判据用「栈限加载次数 − 守卫次数」：加载来自 `THR` 的那个偏移只可能是栈限，
-/// 而守卫形态是固定的 `if (SP <= BARRIER)`。这个差值会**高估**真实缺陷数（结构化器
-/// 有时把同一个加载发射两遍），但作为棘轮够用：任何让守卫丢得更多的改动都会让它上涨。
-/// 修好之后应当把上限往下调。
+/// **判据必须是「加载之后紧跟一个未命名 stub 调用」**，不能只数 `BARRIER = mem(THR,`：
+/// THR 的其它偏移也被加载进 BARRIER 用于别的比较（实测 `mem(THR, 0x88)` 后面跟的是
+/// `x0 = mem(...); if (x0 != BARRIER)`，与栈检查无关）。sample_arm64 上宽松判据给
+/// 1007 次加载 / 差值 249，收紧后是 **113 处 / 99 个函数**，且三例的偏移都是 0x48、
+/// 紧跟同一个 stub 地址——宽松判据会把真值淹没在 2 倍多的噪声里。
+///
+/// 这条门禁**不断言已经修好**，只钉住当前数量。修好之后应当把上限往下调，
+/// 并且调之前先确认下降来自真的补回了守卫。
 #[test]
 fn stack_check_guards_do_not_regress() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1429,38 +1434,79 @@ fn stack_check_guards_do_not_regress() {
     let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
     assert_eq!(rc, 0, "全量导出失败: {se}");
 
-    // 2026-09-28 sample_arm64 实测：加载 1007、守卫 758 ⇒ 差值 249
-    const CEIL_UNGUARDED: usize = 249;
+    // 2026-09-28 sample_arm64 实测：113 处 / 99 个函数；守卫形态 758 处
+    const CEIL_UNGUARDED: usize = 113;
+    /// 未命名 stub 调用：`sub_0x4c3c40();`
+    fn is_stub_call(t: &str) -> bool {
+        let Some(h) = t.strip_prefix("sub_0x") else { return false };
+        let Some(k) = h.find("();") else { return false };
+        let hex = &h[..k];
+        !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
     let dart = out.join("dart");
     let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
-    let (mut loads, mut guards) = (0usize, 0usize);
+    let mut unguarded = 0usize;
+    let mut guarded = 0usize;
+    let mut fns_hit = 0usize;
+    let mut examples: Vec<String> = Vec::new();
     for e in rd.flatten() {
         let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        // 收集每个函数的**语句行**（跳过 raw 注释、局部声明、空行）
+        let mut stmts: Vec<&str> = Vec::new();
+        let mut fname = String::new();
+        let mut hit_here = 0usize;
         for line in text.lines() {
-            if line.trim_start().starts_with("//") {
-                continue; // 只看正文，不看 raw 反汇编注释
+            let t = line.trim();
+            if line.starts_with("dynamic ") && line.trim_end().ends_with(") {") {
+                fname = line
+                    .trim_start_matches("dynamic ")
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                stmts.clear();
+                continue;
             }
-            if line.contains("BARRIER = mem(THR,") {
-                loads += 1;
+            // 只认**第 0 列**的 `}` 作为函数结束（体内 if/while 的闭合是缩进的）
+            if line == "}" {
+                for w in stmts.windows(2) {
+                    if w[0].contains("BARRIER = mem(THR,") && is_stub_call(w[1]) {
+                        unguarded += 1;
+                        hit_here += 1;
+                        if examples.len() < 5 {
+                            examples.push(format!("{fname}: {} | {}", w[0], w[1]));
+                        }
+                    }
+                }
+                guarded += stmts
+                    .iter()
+                    .filter(|l| l.contains("if (SP <= BARRIER)"))
+                    .count();
+                if hit_here > 0 {
+                    fns_hit += 1;
+                }
+                stmts.clear();
+                hit_here = 0;
+                continue;
             }
-            if line.contains("if (SP <= BARRIER)") {
-                guards += 1;
+            if t.is_empty() || t.starts_with("//") || t.starts_with("dynamic ") {
+                continue;
             }
+            stmts.push(t);
         }
     }
     assert!(
-        loads >= 500 && guards >= 300,
-        "只解析出 {loads} 次栈限加载 / {guards} 个守卫——判据大概没匹配上\
-         （sample_arm64 实测 1007 / 758），差值不可信"
+        guarded >= 300,
+        "只解析出 {guarded} 个 `if (SP <= BARRIER)` 守卫——判据大概没匹配上         （sample_arm64 实测 758），无守卫计数不可信"
     );
-    let unguarded = loads.saturating_sub(guards);
     assert!(
         unguarded <= CEIL_UNGUARDED,
-        "无守卫的栈检查从 {CEIL_UNGUARDED} 涨到 {unguarded}（加载 {loads} − 守卫 {guards}）——\
-         结构化器丢了更多 `cmp SP, BARRIER; b.ls` 守卫，溢出 stub 会变成无条件调用"
+        "无守卫的栈检查从 {CEIL_UNGUARDED} 涨到 {unguarded}（{fns_hit} 个函数，样例 {examples:?}）——         结构化器丢了更多 `cmp SP, BARRIER; b.ls`，溢出 stub 变成无条件调用"
     );
     println!(
-        "栈检查守卫棘轮: 加载 {loads} − 守卫 {guards} = 无守卫 {unguarded} / 上限 {CEIL_UNGUARDED}"
+        "栈检查守卫棘轮: 无守卫 {unguarded} / 上限 {CEIL_UNGUARDED}（{fns_hit} 个函数）；有守卫 {guarded}"
     );
     let _ = std::fs::remove_dir_all(&out);
 }
