@@ -1398,3 +1398,141 @@ fn empty_if_without_else_does_not_grow() {
     );
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// 棘轮门禁：**栈溢出检查守卫**缺失的数量不许增长。
+///
+/// Dart 的每次调用/循环回边前有一段固定序列：`ldr BARRIER, [THR, #stack_limit]` 然后
+/// `cmp SP, BARRIER; b.ls <溢出 stub>`。产物里前者渲染成 `BARRIER = mem(THR, 0x…)`、
+/// 后者渲染成 `if (SP <= BARRIER) { sub_0x…(); }`。
+///
+/// 已知缺陷：**循环体里**的那一段会丢掉守卫——两条指令（`cmp` 与 `b.ls`）在正文里完全
+/// 消失，于是溢出 stub 从「仅 SP<=BARRIER 时调用」变成**每圈无条件调用**。同一函数的
+/// **序言**守卫渲染是正确的，所以 `lift` 没问题，问题在结构化器发射循环体那一步。
+/// material_3_demo 上 69 处（该 stub 全库被调 1218 次、其中 1149 次有守卫）。
+///
+/// 判据用「栈限加载次数 − 守卫次数」：加载来自 `THR` 的那个偏移只可能是栈限，
+/// 而守卫形态是固定的 `if (SP <= BARRIER)`。这个差值会**高估**真实缺陷数（结构化器
+/// 有时把同一个加载发射两遍），但作为棘轮够用：任何让守卫丢得更多的改动都会让它上涨。
+/// 修好之后应当把上限往下调。
+#[test]
+fn stack_check_guards_do_not_regress() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过栈检查守卫门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_stackck");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    // 2026-09-28 sample_arm64 实测：加载 1007、守卫 758 ⇒ 差值 249
+    const CEIL_UNGUARDED: usize = 249;
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let (mut loads, mut guards) = (0usize, 0usize);
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        for line in text.lines() {
+            if line.trim_start().starts_with("//") {
+                continue; // 只看正文，不看 raw 反汇编注释
+            }
+            if line.contains("BARRIER = mem(THR,") {
+                loads += 1;
+            }
+            if line.contains("if (SP <= BARRIER)") {
+                guards += 1;
+            }
+        }
+    }
+    assert!(
+        loads >= 500 && guards >= 300,
+        "只解析出 {loads} 次栈限加载 / {guards} 个守卫——判据大概没匹配上\
+         （sample_arm64 实测 1007 / 758），差值不可信"
+    );
+    let unguarded = loads.saturating_sub(guards);
+    assert!(
+        unguarded <= CEIL_UNGUARDED,
+        "无守卫的栈检查从 {CEIL_UNGUARDED} 涨到 {unguarded}（加载 {loads} − 守卫 {guards}）——\
+         结构化器丢了更多 `cmp SP, BARRIER; b.ls` 守卫，溢出 stub 会变成无条件调用"
+    );
+    println!(
+        "栈检查守卫棘轮: 加载 {loads} − 守卫 {guards} = 无守卫 {unguarded} / 上限 {CEIL_UNGUARDED}"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 棘轮门禁：`local_0` 的出现次数不许增长。
+///
+/// `local_0` = 「相对 SP/FP 位移为 0 的栈槽」。它本身合法（`str x0, [SP]` 传参就是它），
+/// 但**post-index 的栈操作会错误地落在这里**：
+///
+/// ```text
+/// str q0, [SP, #-0x10]!   ->  local_m10 = q0     pre-index：先 SP -= 0x10 再存 ⇒ 槽位 -0x10
+/// ldr q0, [SP], #0x10     ->  q0 = local_0       post-index：先在 SP 处取、再 SP += 0x10
+/// ```
+///
+/// 机器层面这两条访问**同一个槽位**，产物却给了两个名字，读者无法把它们对上。
+/// 根因不是命名规则错：dae 按**方括号内的位移**命名槽位，而 `[SP]` 没有位移，
+/// 所以 `local_0` 在这个模型下是自洽的。要让两个名字一致，必须**跨指令跟踪 SP 的增减**
+/// （pre-index 减、post-index 加）——那是真实状态，不是改名；在没有它之前强行统一
+/// 就是把猜测当事实写进产物。material_3_demo 上 51 个函数是这个形态。
+///
+/// 所以这条门禁只钉住数量：真做了 SP 跟踪之后 `local_0` 应当**下降**，届时把上限调低。
+/// 上限涨了就说明有别的东西也开始把栈访问错误地归到位移 0。
+#[test]
+fn post_index_stack_slots_do_not_regress() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 post-index 槽位门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_postidx");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    // 2026-09-28 sample_arm64 实测：local_0 出现 942 次、分布在 518 个函数
+    const CEIL_LOCAL0: usize = 942;
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut n = 0usize;
+    let mut slots = 0usize; // 所有 local_* 槽位引用，作非空断言的分母
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let b = text.as_bytes();
+        let mut i = 0usize;
+        while i + 7 <= b.len() {
+            if &b[i..i + 7] == b"local_0"
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                && (i + 7 >= b.len() || !(b[i + 7].is_ascii_alphanumeric() || b[i + 7] == b'_'))
+            {
+                n += 1;
+                i += 7;
+                continue;
+            }
+            if &b[i..i + 6] == b"local_" {
+                slots += 1;
+            }
+            i += 1;
+        }
+    }
+    assert!(
+        slots >= 5000,
+        "只解析出 {slots} 处 local_* 槽位引用——分母太小，门禁会空过"
+    );
+    assert!(
+        n <= CEIL_LOCAL0,
+        "local_0 从 {CEIL_LOCAL0} 涨到 {n} 处——更多栈访问被错误地归到「位移 0」。\
+         post-index 形态（`ldr q0, [SP], #0x10`）本应与配对的 pre-index `local_m10` 同名，\
+         那需要跨指令跟踪 SP，见本测试的文档注释"
+    );
+    println!("post-index 槽位棘轮: local_0 {n} / 上限 {CEIL_LOCAL0}（local_* 引用共 {slots}）");
+    let _ = std::fs::remove_dir_all(&out);
+}
