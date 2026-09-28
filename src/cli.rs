@@ -912,8 +912,22 @@ fn cmd_classes(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
             }
         }
         let mut rows: Vec<(String, Option<i64>, String, usize)> = Vec::new();
+        // 类名为空的那一组**不是类**，是该库的顶层函数（`build_functions` 把没有 owner
+        // 类的函数归到空类名下）。在一条叫 `classes` 的命令里列出来是噪声，而且有害：
+        // 空名按字典序**排在最前**，于是 `dae classes x | head -1 | cut -f3` 拿到空串
+        // （实测就是这样把评估脚本打断的），计数也失真（本语料 300 行里 12 行是空名，
+        // 而 text/classes.txt 是 544 条真 Class 记录——两个不同的集合）。
+        // 跳过它们，但**如实报出跳过了多少**，不静默隐藏；顶层函数在 `dae functions`
+        // （类列为空）与 `dae members` 里照常可见。
+        let mut skipped_fn = 0usize;
+        let mut skipped_libs = 0usize;
         for (lib, cls_map) in &libs {
             for (cls, funcs) in cls_map {
+                if cls.is_empty() {
+                    skipped_fn += funcs.len();
+                    skipped_libs += 1;
+                    continue;
+                }
                 if let Some(p) = &pat {
                     if !name_hit(p, cls, true) {
                         continue;
@@ -931,12 +945,33 @@ fn cmd_classes(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
             };
             let _ = writeln!(out, "{cid}\t{lib}\t{cls}\t{nf}");
         }
+        // 计数必须说清口径：这里列的是**至少有一个函数**的类（走 build_functions），
+        // 而 text/classes.txt 列的是**全部 Class 记录**。两者能差很多——实测 animations
+        // 是 2177 vs 3358，差的 1181 个类的方法全被 AOT 内联/树摇了，只剩 Class 记录。
+        // 不说清就会让人以为 dae 漏了三分之一的类（评估时我自己就被这个骗了一次）。
+        let n_all = a.iso.classes.len();
+        let skip_zh = if skipped_fn > 0 {
+            format!("；另跳过 {skipped_libs} 个库的 {skipped_fn} 个顶层函数（没有所属类，见 dae functions）")
+        } else {
+            String::new()
+        };
+        let skip_en = if skipped_fn > 0 {
+            format!("; also skipped {skipped_fn} top-level function(s) across {skipped_libs} librar(ies) -- they have no class, see dae functions")
+        } else {
+            String::new()
+        };
         eprintln!(
             "{}",
             tr(
                 lang,
-                &format!("dae：命中 {} 个类", rows.len()),
-                &format!("dae: {} classes", rows.len())
+                &format!(
+                    "dae：命中 {} 个类（只含**有函数**的类；快照里共 {n_all} 条 Class 记录，其余的函数被内联/树摇，见 text/classes.txt）{skip_zh}",
+                    rows.len()
+                ),
+                &format!(
+                    "dae: {} classes (only those with at least one function; the snapshot has {n_all} Class records in all -- the rest had their methods inlined/tree-shaken, see text/classes.txt){skip_en}",
+                    rows.len()
+                )
             )
         );
         emit(&o, &out, lang, "classes")
@@ -1890,9 +1925,19 @@ fn help_for(cmd: &str, lang: Lang) -> String {
         ),
         "classes" => format!(
             "{}\n\n  dae classes <binary> [pattern] [--lib P] [-n N] [-o FILE]\n\n{}\n{}",
-            t("classes —— 类清单", "classes -- class listing"),
+            t("classes —— 类清单（**只含有函数的类**）", "classes -- class listing (only classes that own at least one function)"),
             t("列：cid \\t lib \\t 类名 \\t 函数数", "columns: cid \\t lib \\t class \\t functions"),
-            t("pattern 子串匹配；--lib 限定库。", "pattern is a substring match; --lib narrows to a library.")
+            t(
+                "pattern 子串匹配；--lib 限定库。\n\
+                 口径：本命令走 build_functions，所以只列**至少有一个函数**的类；\n\
+                 `text/classes.txt` 列的是全部 Class 记录，两者能差很多（实测 animations\n\
+                 2177 vs 3358——差的那些类方法全被内联/树摇，只剩记录）。要全量看 classes.txt。",
+                "pattern is a substring match; --lib narrows to a library.\n\
+                 Scope: this command goes through build_functions, so it lists only classes that\n\
+                 own at least one function; `text/classes.txt` lists every Class record. The two\n\
+                 can differ a lot (measured on animations: 2177 vs 3358 -- the rest had their\n\
+                 methods inlined/tree-shaken). Use classes.txt for the complete inventory."
+            )
         ),
         "functions" => format!(
             "{}\n\n  dae functions <binary> [pattern] [--lib P] [--class P] [-n N] [-o FILE]\n\n{}\n{}",

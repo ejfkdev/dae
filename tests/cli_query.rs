@@ -596,3 +596,182 @@ fn scoped_decompile_keeps_cross_library_call_names() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// 反编译正文对**指令地址**的覆盖率。
+///
+/// 守的是「待定值被静默丢弃」这类 bug：`nest_block` 曾在遇到 `Op::Note` / `Op::Cmp` 等语句时
+/// `pending.clear()`（而不是先落地），于是 x64 上 `mov rcx,rax; sub rcx,1; push rcx; call fib`
+/// 折成的 `rcx = rax - 1` 被扔掉——产物里 `fib()` 既看不到实参、也没有任何一行提到 `n - 1`，
+/// 而且**不计入 unmapped**（指令是认得的，只是结果被扔了）。所以 analyze 错误数、结构化率、
+/// 地址自洽性、regress 对拍**全都看不见它**：那次修复前后 `DecompileStats` 的语句数一字未变
+/// （统计发生在 `nest_block` 之前）。
+///
+/// 判据：`asm/` 里出现的真指令地址，有多少能在 `dart/` 的语句地址注释里找到。
+/// 实测同一语料：修复前 **70.1%**（129/184），修复后 **78.3%**（144/184），门槛取 **0.75**
+/// 落在两者之间——回退修复即失败（已负测）。不到 100% 是正常的：`cmp` 折进条件、
+/// 分支目标折进 `if`、`frame/align` 只出注释，这些都不带语句地址。
+#[test]
+fn decompiled_body_covers_instruction_addresses() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过指令覆盖率门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_cov");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    // 一次全量导出同时给出 asm/（真指令地址）与 dart/（语句地址）
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    // asm/ 的指令行长这样：`    //     0x481dac: ldr          r0, [PP, #0x1f0]`
+    // 只取**小写助记符**的行——IL 注释行是 `// 0x…: LoadField: …`（首字母大写），要排除，
+    // 否则同一条指令会被数两次。
+    let mut ins: BTreeSet<String> = BTreeSet::new();
+    collect_addrs(&out.join("asm"), &mut ins, &|line| {
+        let t = line.trim_start();
+        let t = match t.strip_prefix("// ") {
+            Some(x) => x.trim_start(),
+            None => return None,
+        };
+        let hex = t.strip_prefix("0x")?;
+        let end = hex.find(':')?;
+        let (addr, rest) = hex.split_at(end);
+        if !addr.chars().all(|c| c.is_ascii_hexdigit()) || addr.is_empty() {
+            return None;
+        }
+        let mnem = rest[1..].trim_start().chars().next()?;
+        if !mnem.is_ascii_lowercase() {
+            return None;
+        }
+        Some(addr.to_string())
+    });
+    // dart/ 的语句地址在行尾：`  x0 = mem(x1, 7); // 0x4bc0f8`
+    let mut emit: BTreeSet<String> = BTreeSet::new();
+    collect_addrs(&out.join("dart"), &mut emit, &|line| {
+        let t = line.trim_end();
+        let i = t.rfind("// 0x")?;
+        let addr = &t[i + "// 0x".len()..];
+        if addr.is_empty() || !addr.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(addr.to_string())
+    });
+
+    assert!(
+        ins.len() >= 100,
+        "asm/ 里只解析出 {} 条指令地址，分母太小、门禁会空过",
+        ins.len()
+    );
+    let hit = ins.intersection(&emit).count();
+    let ratio = hit as f64 / ins.len() as f64;
+    println!(
+        "指令地址覆盖率: {hit}/{} = {:.1}%（门槛 75%；修复前实测 70.1%）",
+        ins.len(),
+        ratio * 100.0
+    );
+    assert!(
+        ratio >= 0.75,
+        "反编译正文只覆盖了 {hit}/{} = {:.1}% 的指令地址（门槛 75%；修复后应为 78.3%，\"
+         退回 70.1% 就说明待定值又被静默丢弃了）——见本测试的文档注释",
+        ins.len(),
+        ratio * 100.0
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 递归收集目录下所有文件里、经 `pick` 判定为地址的字符串。
+fn collect_addrs(dir: &Path, into: &mut BTreeSet<String>, pick: &dyn Fn(&str) -> Option<String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_addrs(&p, into, pick);
+            continue;
+        }
+        let Ok(t) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for l in t.lines() {
+            if let Some(a) = pick(l) {
+                into.insert(a);
+            }
+        }
+    }
+}
+
+/// `condFlag(...)` 只允许包**裸条件码**，不许包已经是合法 Dart 布尔表达式的东西。
+///
+/// 曾经的 bug：`cbz`/`cbnz`/`tbz`/`tbnz` 在 lift 阶段就生成了完整表达式（`x2 != 0`、
+/// `w1 & (1 << 0) != 0`），但分支统一又过一遍 `fold_cond`，而 `fold_cond` 是按**助记符**
+/// 匹配的，匹配不到就落到兜底 `condFlag("{mnem}")` —— 于是合法表达式被包成
+/// `condFlag("x2 != 0")`。信息没丢，但读的人得自己把引号里的东西抄出来，
+/// 一个 `switch` 会变成三处 `condFlag`。实测 material_3_demo 上这类占位 14 886 处，
+/// 其中 **12 550（84.3%）的参数本身就是合法表达式**；修好后只剩 2 336 处真占位
+/// （`vc` 1782 / `vs` 293 / `eq` 162 / `ne` 90 / `hs` 5 / `lo` 3）。
+///
+/// 判据与语料无关：**参数里出现比较/位运算就说明它本该直接当条件用**。
+/// 真占位只有 `vc`/`vs`/`eq`/`ne`/`hs`/`lo` 这类两三个字符的条件码。
+#[test]
+fn condflag_only_wraps_bare_condition_codes() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 condFlag 门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_condflag");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    let mut total = 0usize;
+    let mut wrapped_expr: Vec<String> = Vec::new();
+    let mut codes: BTreeSet<String> = BTreeSet::new();
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    for e in rd.flatten() {
+        let Ok(t) = std::fs::read_to_string(e.path()) else { continue };
+        let mut rest = t.as_str();
+        while let Some(i) = rest.find("condFlag(\"") {
+            let tail = &rest[i + "condFlag(\"".len()..];
+            let arg = match tail.find('"') {
+                Some(j) => &tail[..j],
+                None => break,
+            };
+            total += 1;
+            // 含比较/逻辑/位运算符，或含空格 ⇒ 它是一个表达式，不该被包起来
+            if arg.contains(' ')
+                || arg.contains("==")
+                || arg.contains("!=")
+                || arg.contains('<')
+                || arg.contains('>')
+                || arg.contains('&')
+                || arg.contains('|')
+            {
+                if wrapped_expr.len() < 6 {
+                    wrapped_expr.push(arg.to_string());
+                }
+            } else {
+                codes.insert(arg.to_string());
+            }
+            rest = &tail[arg.len() + 1..];
+        }
+    }
+    assert!(
+        total > 0,
+        "一处 condFlag 都没有——门禁会空过（语料里应当有标志位条件）"
+    );
+    assert!(
+        wrapped_expr.is_empty(),
+        "有 condFlag 包着**已经是合法 Dart 布尔表达式**的东西（样例 {:?}）。\
+         自带条件的分支（cbz/cbnz/tbz/tbnz）不该再过 fold_cond——见本测试的文档注释",
+        wrapped_expr
+    );
+    println!("condFlag: 共 {total} 处，全是裸条件码 {:?}", codes);
+    let _ = std::fs::remove_dir_all(&out);
+}

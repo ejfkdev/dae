@@ -174,7 +174,25 @@ fn lift(
             Op::Branch { cond: Some(c), target } => {
                 // 条件已被这次分支消费：不清空的话，隔着若干条不设标志位的指令后
                 // 再来一个 `b.eq` 会错误复用**上一条**比较（拼出假条件）。
-                let cond = Some(fold_cond(&c, &last_cmp));
+                //
+                // ⚠️ 只有「lift 时如实记下助记符」的分支才需要折叠（`b.eq`/`je` 那一路，
+                // 见下面的 `mnem.starts_with("b.")` 分支）。`cbz`/`cbnz`/`tbz`/`tbnz`
+                // **自带条件**，lift 时已经生成完整的 Dart 布尔表达式（`x2 != 0`、
+                // `w1 & (1 << 0) != 0`）；把它们再喂给 `fold_cond` 会因为匹配不到助记符而
+                // 落到兜底分支 `condFlag("{mnem}")`，于是合法表达式被包成
+                // `condFlag("x2 != 0")` —— 信息还在，但读的人得自己把引号里的东西抄出来。
+                // 实测 material_3_demo 上这类占位有 14 886 处，其中 **84.3%（12 550）的
+                // 参数本身就是合法布尔表达式**，只有 `vc`/`vs`/`eq`/`ne` 那 15.7% 是真需要占位的。
+                //
+                // 判据用「含不含空格」：助记符（`b.eq`/`jne`/`jle`…）从不含空格，而两条
+                // 自带条件的生成式（`"{a} {op} 0"` 与 `"{} & (1 << {}) {op} 0"`）一定含空格。
+                // 不认得的裸标识符仍走 fold_cond → condFlag，避免把 `if (eq)` 这种
+                // 过不了分析的写法放进产物。
+                let cond = Some(if c.contains(' ') {
+                    c.clone()
+                } else {
+                    fold_cond(&c, &last_cmp)
+                });
                 last_cmp = None;
                 Op::Branch { cond, target }
             }
@@ -3866,8 +3884,19 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
             | Op::IndirectJump(_)
             | Op::Helper(_)
             | Op::PairLoad { .. } => {
+                // **落地而不是丢弃**。这里原先是 `pending.clear()`，会把待定值静默扔掉——
+                // 而这些指令里的 `push`/`pop`（归类成 `Op::Note` 的 `frame/align:`）恰恰是
+                // 调用实参准备链的终点：x64 上 `mov rcx,rax; sub rcx,1; push rcx; call fib`
+                // 折成待定值 `rcx = rax - 1` 后，一遇到 `push rcx` 就被清掉，于是产物里的
+                // `fib()` 既看不到实参、也没有任何一行提到 `n - 1`，而且**不计入 unmapped**
+                // （指令是认得的，只是结果被扔了），所以既有门禁全都看不见。
+                // 实测 G_class_args_branch 的 `fib` 因此少 3 条语句（两次递归调用的实参准备）。
+                //
+                // 与 `Call`/`Store`/`Branch`/`Return` 分支保持一致（它们本来就是 flush）。
+                // 对折叠质量没有损失：`Cmp` 原本也清空 pending，所以后续 `Branch` 的
+                // `subst_regs` 本来就拿不到东西——这一改只是把「丢掉」换成「写出来」。
+                flush(&mut pending, &mut out, st.addr);
                 out.push(Stmt { addr: st.addr, op: st.op.clone() });
-                pending.clear();
                 continue;
             }
             Op::Assign { dst, src } => {

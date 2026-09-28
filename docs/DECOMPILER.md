@@ -272,6 +272,65 @@ One false alarm worth recording: a `diff -rq z_old z_new` run with relative path
 cwd reported "differences" that were only `diff`'s exit code 2 for missing directories. Absolute
 paths, and checking that `diff` prints nothing, is the reliable form.
 
+## Three defects found by reading source against output (2026-09-28, all fixed)
+
+Comparing decompiled output with the source of our own example programs, function by function,
+found three defects that **every existing gate was blind to**.
+
+1. **Pending values were silently discarded** (`nest_block`). On `Op::Note` / `Op::Cmp` and friends
+   the code did `pending.clear()`. `push`/`pop` are `Op::Note`, and they are exactly where the
+   call-argument preparation chain ends: on x64, `mov rcx,rax; sub rcx,1; push rcx; call fib` folds
+   into `rcx = rax - 1`, which was thrown away -- so the output showed `fib()` with no argument and
+   no line anywhere mentioning `n - 1`, and it did **not** count as unmapped (the instruction was
+   recognised; only its result was dropped). Now flushed, matching `Call`/`Store`/`Branch`/`Return`.
+   Measured: dart/ for material_3_demo grew 1,998,350 -> 2,165,737 lines (+8.4%) while
+   `DecompileStats` did not move at all (it is computed before `nest_block`) -- which is why the
+   summary metrics could not see it. Gate: `decompiled_body_covers_instruction_addresses`, counting
+   how many real instruction addresses from `asm/` appear as statement addresses in `dart/`:
+   70.1% before, 78.3% after, floor 0.75 (negative-tested). A narrower variant (flush only on
+   `Op::Note`, +3.0% lines) was measured and rejected: it still dropped parameter loads such as
+   `rax = mem(FP+0x10)` that are cleared at a `Cmp`.
+2. **`condFlag` wrapped expressions that were already valid Dart.** `cbz`/`cbnz`/`tbz`/`tbnz`
+   produce a complete boolean expression at lift time, but every branch then went through
+   `fold_cond`, which matches on *mnemonics* and falls back to `condFlag("{mnem}")`. The fix
+   distinguishes them by "contains a space" (mnemonics never do; both self-conditioning forms
+   always do). Measured: 14,886 -> **2,841** occurrences, and the remainder are all genuine bare
+   condition codes (`vc`/`vs`/`eq`/`ne`/`hs`/`lo`). Gate:
+   `condflag_only_wraps_bare_condition_codes` (negative-tested). Example from a purpose-built
+   stress sample (`switch` + ternary): `if (condFlag("w1 & (1 << 0) != 0"))` became
+   `if (w1 & (1 << 0) != 0)`, which reads directly as the source's `n.isEven ? 'even' : 'odd'`.
+3. **`dae classes` listed each library's top-level functions as a class with an empty name.** Empty
+   sorts first, so `dae classes x | head -1 | cut -f3` returned an empty string (this actually broke
+   an evaluation script), and the count was misleading (300 rows for this corpus, 12 of them
+   nameless, while `text/classes.txt` holds 544 real Class records). They are now skipped and the
+   count line states exactly how many were skipped and where to find them (`dae functions`,
+   `dae members`). The same line now states the scope: this command lists only classes that own at
+   least one function, whereas `text/classes.txt` lists every Class record -- the two differ a lot
+   (animations: 2177 vs 3358, the rest having had their methods inlined or tree-shaken).
+
+## Known gaps (measured, not fixed)
+
+* **Statement order does not follow address order**: 21,826 sites = **2.74% of statements**,
+  touching **36.1% of functions**. Criterion: a statement reading a register appears earlier in the
+  text than the assignment that defines it, *and* that assignment has a lower machine address --
+  which excludes live-in parameters (a first version of the metric counted them and overstated the
+  rate as 5.52%). **This cannot be fixed by sorting on address**: a folded expression is only
+  correct because it appears *before* the statement it folded (`rax = rcx + rax // 0x5e3a4` reads
+  the pre-add `rcx`), so reordering would double-count. Fixing it means choosing between liveness
+  analysis to suppress redundant landings, or dropping expression folding altogether.
+* **Return values are mostly not recovered**: bare `return;` 17,238 vs `return <expr>;` 790 (95.6%).
+  Not "never": both case branches of `classify` emit `return x0;`. The statistic is dominated by
+  void functions and epilogues.
+* **Calls carry no arguments**: every call renders as `f()`. Argument-preparation instructions now
+  land (defect 1), so the arguments are recoverable from context, but the call line itself has none.
+  **Not a new finding** -- item 5 of the backlog below already lists it, and records that it was
+  **attempted and reverted**: without a verified per-ABI clobbered-register table there is no real
+  liveness, so writing arguments would pass off a register written before an *earlier* call as this
+  call's argument (the truth corpus caught exactly that: x0 written 8 instructions and one call
+  earlier).
+* **Object-pool names are still not projected into the IDA/r2 scripts** (blutter emits ~52,700
+  `pp.*` flags). The data exists and `dae pp` / `dae findrefs` query it.
+
 ## The trap this table keeps springing
 
 Three times now the same failure mode has appeared, and it is worth stating plainly because the
@@ -454,6 +513,13 @@ corpora both tools read, 0 `dart analyze` errors vs ~70k — see [`COMPARISON.md
    earlier).
 6. The preamble is per file and mechanical; a smarter version would only declare what is used
    and give the helpers real signatures.
+7. **Statement order does not follow address order** (measured 2026-09-28 by reading source against
+   output): 21,826 sites = 2.74% of statements, touching 36.1% of functions. **Sorting by address
+   would not fix it** -- a folded expression is only correct because it appears before the statement
+   it folded. See "Known gaps" above.
+8. **Return values are mostly not recovered**: bare `return;` is 95.6% of returns (17,238 vs 790).
+   Not "never" -- both case branches of `classify` in the stress sample emit `return x0;` -- the
+   statistic is dominated by void functions and epilogues.
 
 ## Adding a corpus
 
