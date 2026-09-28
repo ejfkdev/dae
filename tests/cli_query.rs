@@ -1314,3 +1314,87 @@ fn bit_test_conditions_use_the_64bit_view() {
     println!("位测试用 64 位视图: {x_form} 处 xN、0 处 wN（修复前 Reqable 实测 1690 处读 wN）");
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// 棘轮门禁：**无 else 的空 `if`** 数量不许增长。
+///
+/// 形态判据（两种必须分开数，混在一起这个门禁就没有意义）：
+/// * 闭合行**正好是** `}` ⇒ then 分支是空的**且没有 else** —— 机器码里那条条件分支的
+///   目标处理块没有落到 then 里，是**真丢了分支边**。实例：`Glb.anon_closure_2` 的
+///   `cmp x0, BARRIER; b.eq #0xf00bdc` 渲染成 `if (x0 == BARRIER) { }` 然后直接落下去，
+///   而 0xf00bdc 的 lazy-field 处理块确实存在于同一文件里、却挂在另一条守卫下。
+/// * 闭合行以 `} else` 开头 ⇒ 空 then + 有 else，这是**良性**的跳跃形态（语句都在 else
+///   或共享尾部里）。已抽查对照 raw 反汇编确认没有丢东西，**不要把它当 bug 修**——
+///   在 sample_arm64 上它是 2560 处 vs 真丢的 109 处，一起「修」会把产物改坏。
+///
+/// 这条门禁**不断言已经修好**，只钉住当前数量：改结构化器时任何让分支边丢得更多的副作用
+/// 会立刻报红。修好之后应当把上限往下调（并且调之前先确认下降来自真的补回了分支，
+/// 而不是来自把 `} else` 那种形态误判掉）。
+#[test]
+fn empty_if_without_else_does_not_grow() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过空 if 棘轮门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_emptyif");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    // 2026-09-28 在 sample_arm64 上实测：无 else 空 if = 109，空 then 有 else = 2560，
+    // `if (` 总数 5445。上限取实测值，即「不许变差」。
+    const CEIL_NO_ELSE: usize = 109;
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut no_else = 0usize;
+    let mut with_else = 0usize;
+    let mut ifs = 0usize;
+    let mut examples: Vec<String> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("if (") {
+                ifs += 1;
+            }
+            if i == 0 {
+                continue;
+            }
+            let prev = lines[i - 1].trim();
+            if !prev.ends_with('{') || !prev.contains("if (") {
+                continue;
+            }
+            let t = line.trim();
+            if t == "}" {
+                no_else += 1;
+                if examples.len() < 5 {
+                    examples.push(format!("{}: {prev}", e.file_name().to_string_lossy()));
+                }
+            } else if t.starts_with("} else") {
+                with_else += 1;
+            }
+        }
+    }
+    assert!(
+        ifs >= 1000,
+        "只解析出 {ifs} 个 `if (`——分母太小，门禁会空过（sample_arm64 实测 5445）"
+    );
+    assert!(
+        with_else >= 500,
+        "只解析出 {with_else} 个「空 then + 有 else」——判据大概没匹配上良性形态，\
+         那么 no_else 的计数也不可信（sample_arm64 实测 2560）"
+    );
+    assert!(
+        no_else <= CEIL_NO_ELSE,
+        "无 else 的空 if 从 {CEIL_NO_ELSE} 涨到 {no_else}（样例 {examples:?}）——\
+         结构化器丢了更多分支边。注意别把「空 then + 有 else」（{with_else} 处，良性跳跃形态）\
+         算进来，也不要为了压低这个数字去改判据"
+    );
+    println!(
+        "空 if 棘轮: 无 else {no_else} / 上限 {CEIL_NO_ELSE}；空 then 有 else {with_else}（良性）；`if (` 共 {ifs}"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
