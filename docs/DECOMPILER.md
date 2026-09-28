@@ -700,6 +700,51 @@ alone does not determine whether it copies up or down. Rendering it as a forward
 guess; and relabelling the prefixes from `// unmapped:` to `// note:` would cut the headline number
 by 85% while adding no information, so that is off the table too.
 
+## Root cause of the lost loop-header stack guard (2026-09-28, diagnosed, not yet fixed)
+
+Instrumenting the structurer settled it. A temporary `DAE_DBG_ARM` print at the conditional-branch
+arm fired for blocks 0x4bbdb8 and 0x4bbdc0 of `main` but **never for 0x4bbdac** -- the block that
+holds the guard. So the guard's `b.ls` is not mishandled; it is never examined at all. The reason is
+the loop-header path in `Structurer::seq`:
+
+```rust
+if let Some(&(_, exit)) = self.loops.get(&b) {
+    let (cond, body_entry) = self.loop_shape(b);
+    let mut body = self.body_lines(b);                      // non-terminator statements only
+    body.extend(self.seq(body_entry, Some(b), depth + 1));  // header terminator never revisited
+    out.push(Node::While { cond, body });
+    cur = Some(exit);
+    continue;                                               // skips the whole Branch match
+}
+```
+
+`loop_shape` assumes the loop header's terminating branch **is** the loop condition. In Dart's
+codegen the loop header is the **stack-overflow check**, and the real condition is one block later:
+
+```
+block 10 (header):  ldr BARRIER,[THR,#0x48]; cmp SP,BARRIER; b.ls 0x4bbe30   <- the guard
+block 11:           cmp r1, #4; b.ge 0x4bbdf0                                <- the loop condition
+0x4bbdec:           b 0x4bbdac                                               <- back edge to the header
+```
+
+So the header's `b.ls` is absorbed as the loop condition, `body_lines` emits only the `ldr`, and the
+guard disappears -- leaving the out-of-line handler's `bl <overflow stub>` to be emitted inline right
+after the load (which is why the two statements in the output are 0x64 apart). Confirmed on a second
+function (`total`: header 0x4bbe4c, guard `b.ls 0x4bbe84`, back edge `b 0x4bbe4c`), and the handler
+blocks are tail-duplicated (`main` has three copies at 0x4bbe28 / 0x4bbe30 / 0x4bbe38, all
+`bl 0x4c3c40`).
+
+**The fix has to distinguish "header's branch is the loop condition" from "header's branch is an
+ordinary guard"**, and the natural discriminator is already available: `self.loops.get(&b)` yields the
+exit block, so compare the header's branch target against it -- equal means condition, different
+means a guard that must be emitted as an `if` at the top of the body. It is not applied yet because
+this is the most regression-prone code in the project: the comment right below records that an earlier
+over-eager `bail` here cost 713 branches their structure and dropped the structured rate from ~88% to
+34% on an arm64 ELF corpus. Any change needs the structured rate re-measured on every corpus, not
+just the gates. `stack_check_guards_do_not_regress` (113) and
+`empty_if_without_else_does_not_grow` (109) are in place to catch the attempt getting worse; if this
+and the empty-`if` defect share the root cause, one fix should lower **both**.
+
 ## Known gaps (measured, not fixed)
 
 * **Statement order does not follow address order**: 21,826 sites = **2.74% of statements**,

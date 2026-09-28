@@ -611,6 +611,46 @@ ldr q0, [SP], #0x10     ->  q0 = local_0        （post-index：先在 SP 处取
 固定套路，所以单看 `rep movsb` **无法断定**它是向上还是向下拷。渲染成正向 `memcpy` 就是猜；
 而把前缀从 `// unmapped:` 改标成 `// note:` 能让数字掉 85% 却信息量为零，同样不做。
 
+## 循环头栈守卫丢失的根因（2026-09-28，已定位、未修）
+
+插桩把问题定死了。在条件分支那条臂上加临时 `DAE_DBG_ARM` 打印，`main` 里 0x4bbdb8 与 0x4bbdc0
+两个块都打印了，**唯独 0x4bbdac（守卫所在块）一次都没有**——所以那条 `b.ls` 不是被处理错了，
+而是**从未被检查过**。原因在 `Structurer::seq` 的循环头路径：
+
+```rust
+if let Some(&(_, exit)) = self.loops.get(&b) {
+    let (cond, body_entry) = self.loop_shape(b);
+    let mut body = self.body_lines(b);                      // 只取非终止符语句
+    body.extend(self.seq(body_entry, Some(b), depth + 1));  // 头块的 terminator 再没人回头看
+    out.push(Node::While { cond, body });
+    cur = Some(exit);
+    continue;                                               // 整个 Branch match 被跳过
+}
+```
+
+`loop_shape` 假定**循环头的终止分支就是循环条件**。而 Dart 的代码生成里循环头是**栈溢出检查**，
+真正的条件在下一个块：
+
+```
+块10（循环头）: ldr BARRIER,[THR,#0x48]; cmp SP,BARRIER; b.ls 0x4bbe30   ← 守卫
+块11:           cmp r1, #4; b.ge 0x4bbdf0                                ← 循环条件
+0x4bbdec:       b 0x4bbdac                                               ← 回边指向循环头
+```
+
+于是头块的 `b.ls` 被当成循环条件吸收掉、`body_lines` 只发射那条 `ldr`，守卫就此消失——
+而 out-of-line 处理块的 `bl <溢出 stub>` 被内联发射在加载之后（这正是产物里两条语句地址相差
+0x64 的原因）。第二个函数 `total` 上形状相同（头 0x4bbe4c、守卫 `b.ls 0x4bbe84`、回边
+`b 0x4bbe4c`），且处理块是**尾复制**的（`main` 里有三份：0x4bbe28 / 0x4bbe30 / 0x4bbe38，
+都是 `bl 0x4c3c40`）。
+
+**修法必须区分「头块的分支是循环条件」与「头块的分支只是普通守卫」**，而判据现成就有：
+`self.loops.get(&b)` 已经给出 exit 块，所以把头块的分支目标与它比一下——相等就是条件，
+不等就是守卫、必须在 body 顶部发成 `if`。之所以还没动手：这是全项目**回归风险最高**的一段，
+紧接着的注释就记着此前一次过于激进的 `bail` 让 713 个分支失去结构、arm64 ELF 语料的结构化率
+从 ~88% 掉到 34%。任何改动都要在**每个语料**上重量结构化率，不能只看门禁。
+`stack_check_guards_do_not_regress`（113）与 `empty_if_without_else_does_not_grow`（109）
+已经就位，可以抓住「越改越坏」；如果这两个缺陷同源，一次修复应当让**两条棘轮同时下降**。
+
 ## 已知缺口（量化过，未修）
 
 * **语句顺序与地址顺序不一致**：21,826 处 = **2.74% 的语句**，波及 **36.1% 的函数**
