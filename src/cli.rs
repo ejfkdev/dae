@@ -1762,6 +1762,53 @@ fn cmd_get(cmd: &str, o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     })
 }
 
+/// 把 `render` 的多份「前导 + 正文」合并成 `(单份前导, 带分隔符的正文)`。
+///
+/// 单库时**逐字节**返回原样（前导本来就是对的），保证改前改后对单库目标的输出完全一致；
+/// 多库时才重算前导。分隔符 `// ===== <库文件名> =====` 与 stdout 既有格式一致。
+/// `with_separators`：stdout 走 `true`（既有格式是「每文件一段 `// ===== 名字 =====`」，
+/// 这个契约要保住）；`-o FILE.dart` 走 `false`（落盘文件靠正文里的 `// library: X` 区分，
+/// 且单库时必须与原样逐字节一致，才能和全量导出的 `<库>.dart` 对得上）。
+///
+/// ⚠️ 分隔符的位置相对旧实现**变了**：旧的是「分隔符 → 前导 → 正文」，于是命中多库时
+/// 前导被重复了 N 份（`mem`/`memSet` 重复定义 ⇒ 产物非法）。合法的单份前导只能放在
+/// 最前面，所以现在是「前导 → (分隔符 → 正文) × N」。
+#[cfg(feature = "asm")]
+fn merge_rendered(files: &[(String, String)], with_separators: bool) -> (String, String) {
+    use crate::decompiler::{dart_preamble_for, split_rendered};
+    // 单库且不要分隔符：逐字节原样返回（改前改后完全一致）
+    if files.len() <= 1 && !with_separators {
+        return match files.first() {
+            Some((_, text)) => match split_rendered(text) {
+                Some((pre, body)) => (pre.to_string(), body.to_string()),
+                None => (String::new(), text.clone()),
+            },
+            None => (String::new(), String::new()),
+        };
+    }
+    let mut bodies = String::new();
+    for (name, text) in files {
+        let body = match split_rendered(text) {
+            Some((_, b)) => b,
+            // 找不到标记就原样保留（不猜、不丢内容）
+            None => text.as_str(),
+        };
+        if with_separators {
+            let _ = writeln!(bodies, "// ===== {name} =====");
+        }
+        bodies.push_str(body);
+    }
+    // 单库时前导本来就是对的，不必重算（也保证与全量导出逐字节一致）
+    if files.len() == 1 {
+        if let Some((_, text)) = files.first() {
+            if let Some((pre, _)) = split_rendered(text) {
+                return (pre.to_string(), bodies);
+            }
+        }
+    }
+    (dart_preamble_for(&bodies), bodies)
+}
+
 /// `getclass` / `getmethod` / `getlib` / `decompile` 共用的输出路由：
 /// * 无 `-o` 或 `-o -` → **stdout**，每文件一段 `// ===== name =====`，不掺时间与统计（可管道）；
 /// * `-o FILE.dart` → 合并成单文件；
@@ -1780,18 +1827,20 @@ fn emit_decompiled(
 ) -> Result<(), String> {
     match o.out.as_deref() {
         None | Some("-") => {
-            let mut body = String::new();
-            for (name, text) in files {
-                let _ = writeln!(body, "// ===== {name} =====");
-                body.push_str(text);
-            }
+            // 多库合并时前导只能有**一份**，否则占位函数重复定义、产物过不了 analyze。
+            // 分隔符与「每文件一段」的格式保持不变。详见 decompiler::dart_preamble_for。
+            let (pre, bodies) = merge_rendered(files, true);
+            let mut body = String::with_capacity(pre.len() + bodies.len());
+            body.push_str(&pre);
+            body.push_str(&bodies);
             print!("{body}");
         }
         Some(p) if p.ends_with(".dart") => {
-            let mut body = String::new();
-            for (_, text) in files {
-                body.push_str(text);
-            }
+            // 同上：合并成一份合法 Dart（单份前导）
+            let (pre, bodies) = merge_rendered(files, false);
+            let mut body = String::with_capacity(pre.len() + bodies.len());
+            body.push_str(&pre);
+            body.push_str(&bodies);
             if let Some(parent) = Path::new(p).parent() {
                 if !parent.as_os_str().is_empty() {
                     let _ = std::fs::create_dir_all(parent);
@@ -1988,7 +2037,7 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             )
         }
         "decompile" => format!(
-            "{}\n\n  dae decompile <binary> [-o DIR|FILE.dart|-] [--lib P] [--class P] [--func P]\n                [--exclude-lib P] [--no-sdk] [--app] [--fuzzy]\n\n{}\n{}\n{}\n{}",
+            "{}\n\n  dae decompile <binary> [-o DIR|FILE.dart|-] [--lib P] [--class P] [--func P]\n                [--exclude-lib P] [--no-sdk] [--app] [--fuzzy]\n\n{}\n{}\n{}\n{}\n{}",
             t("decompile —— 只反编译，不写其它产物", "decompile -- decompile only, writing no other artifact"),
             t(
                 "输出路由与 getclass/getmethod/getlib **同一份代码**：无 -o 或 -o - 走 stdout\n（每库一段 `// ===== name =====`）；-o FILE.dart 合并成单文件；-o DIR 写\n<DIR>/dart/<库>.dart，与全量导出同形。实测 `getlib X -o D` 与 `decompile --lib X -o D`\n产物逐字节相同。",
@@ -2001,6 +2050,10 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             t(
                 "范围收窄：--lib P（库名前缀=整个包）、--no-sdk（排除 URL 以 dart: 开头的库）、\n--app（再排除 package:flutter）。后两个按**库的原始 URL 前缀**判定，不是按 mangled\n名猜——library_name 把 dart:core 写成 dart_core，一个叫 dart_core_extra 的包会长得很像。\n实测 Flutter 应用：505 库/15796 函数 → --no-sdk 489/11016 → --app 56/765。",
                 "Scope: --lib P (a lib prefix = whole package), --no-sdk (drop libraries whose URL\nstarts with dart:), --app (also drop package:flutter). The last two are decided by the\nlibrary's **original URL prefix**, not by guessing from the mangled name -- library_name\nwrites dart:core as dart_core, and a package called dart_core_extra would look similar.\nMeasured on a Flutter app: 505 libs/15796 functions -> --no-sdk 489/11016 -> --app 56/765.",
+            ),
+            t(
+                "并行与合并输出：各库并发渲染（默认 n_threads()，即核数、上限 8），\n`DAE_DEC_THREADS=N` 可覆盖——**任何设置下产物逐字节一致**，因为文件名与「每个入口地址\n归哪个库发射」都由一趟顺序预扫描先定死。合并输出（stdout 与 -o FILE.dart）只发\n**一份**前导声明：一个目标命中多个库时（混淆过的短类名很常见），逐库拼前导会让\nmem/memSet 等占位函数重复定义，产物直接过不了 dart analyze。",
+                "Parallelism and merged output: libraries are rendered concurrently (default\nn_threads(), i.e. core count capped at 8); override with `DAE_DEC_THREADS=N`. Output is\n**byte-identical at any setting**, because file names and \"which library emits each entry\npoint\" are settled by a sequential pre-pass first. Merged output (stdout and -o FILE.dart)\nemits exactly **one** preamble: when a target matches several libraries (common with short\nobfuscated class names), concatenating per-library preambles redefines the mem/memSet\nplaceholders and the result fails dart analyze.",
             ),
             t(
                 "不做 ddc 的 `pkg --app`（从 manifest 取应用包名）：Dart 快照没有 manifest，\n猜包名就是编造。要更窄用 --lib <你的包> 或 --exclude-lib <不想要的包>。",

@@ -272,6 +272,98 @@ One false alarm worth recording: a `diff -rq z_old z_new` run with relative path
 cwd reported "differences" that were only `diff`'s exit code 2 for missing directories. Absolute
 paths, and checking that `diff` prints nothing, is the reliable form.
 
+### Round four: streaming the artifacts, then parallelising the decompiler (2026-09-28)
+
+Rounds one to three made the decompiler itself fast. This round went after the two things that were
+still holding the *whole export* back: artifacts being buffered in memory, and the decompiler being
+single-threaded on an 18-core machine.
+
+**Where the memory actually was** (measured, not guessed -- `DAE_SKIP_ASM` / `DAE_SKIP_CG`
+isolation runs on material_3_demo, 15,082 functions):
+
+| what is disabled | peak RSS | attribution |
+|---|---|---|
+| nothing | 137.6 MB | -- |
+| `asm` | 100.0 MB | asm exporter ≈ **37.6 MB** |
+| `callgraph` | 107.5 MB | callgraph ≈ **30.1 MB** |
+| `--no-default-features` build | 60.5 MB | parse + object layer ≈ 41.9 MB (`dae info`) |
+
+Two guesses were **wrong** and are worth recording. (a) It is not capstone: `dae disasm` on one
+function is 42.8 MB vs `dae info` at 41.9 MB, so an instance costs ~0.9 MB and eight of them are
+~7 MB. (b) It is not the artifact size either: the ten largest `asm/` files add up to 8.6 MB. The
+bulk was **allocation high-water** -- `asm::write` accumulated each library into
+`String::with_capacity(est)` where `est = 96 + mangled.len() + csize*12` *under*-estimates arm64 by
+~2× (every 4-byte instruction renders as one machine-code comment plus one IL comment, ~90-100
+chars), so each buffer grew by doubling, eight threads cycled through 489 jobs, and freed pages are
+not returned to the OS.
+
+**Fix 1 -- stream the artifacts.** `asm::write` now writes through a fixed 256 KB `BufWriter`
+(per-thread cost independent of file size) instead of building the whole file. The decompiler was
+worse: `render` returned `Vec<(String, String)>` holding **all 505 files = 63.2 MB** at once, and
+`full = preamble + of` copied the largest one (4.2 MB) again. `render_into` now takes a sink, so
+`write()` streams each library straight to disk while the stdout subcommands keep collecting.
+Measured: 183.2-186.9 → 141.3-157.6 MB with `--decompile` (-18%), 140.0-144.1 → 128.0-131.2 MB
+without (-9%).
+
+> ⚠️ `write()` must still `create_dir_all(dart/)` **unconditionally**, even when it produces zero
+> files. `hello_2.10.4.exe` / `hello_2.7.2.exe` have an object layer but no instruction table, so by
+> design they emit no pseudocode -- and `dart_valid::full_scorecard` runs `dart analyze` on every
+> sample's `dart/` directory, where "0 files, 0 errors" is a legal result and "directory missing" is
+> a failure. Moving directory creation into the sink made the scorecard fail immediately.
+
+**Fix 2 -- parallelise per library.** `render` was a single-threaded loop over 505 libraries:
+2.49 s of the 3.0 s wall clock. Libraries are independent *except* for two first-wins rules, so
+both are now settled by a cheap sequential pre-pass before any rendering starts:
+
+* **file names** -- de-duplicated case-insensitively, second collision gets a `_2` suffix;
+* **which library emits each entry point** -- code sharing means one machine-code address can back
+  several `Function` objects, and the old code emitted it only in the first library that claimed it
+  (a global `seen: BTreeSet`). The pre-pass freezes that into `owner: ep -> library index`.
+
+Getting `owner` right needed one more piece: the single global `seen` was doing *two* jobs. Replacing
+it with `owner` alone made the same library emit an address twice when two `FuncEntry` rows in it
+shared one `ep` (a batch of identical getters), which showed up as **15,082 -> 15,367 functions** --
+285 duplicates. A per-task `seen_local` restores the exact semantics.
+
+Concurrency is the full `n_threads()` (= 8 here), the same knob every other exporter uses. The
+per-thread working set *is* a whole library body -- the preamble can only be computed after the body
+is rendered, so it cannot be streamed away, and library sizes are very uneven (largest 4.2 MB) -- so
+the curve was measured rather than assumed (three runs per setting):
+
+| concurrency | wall (s) | peak RSS (MB, mean) |
+|---|---|---|
+| serial (before) | 2.98-3.03 | 184.3 |
+| 1 | 3.09 | 159.7 (streaming alone) |
+| 2 | 1.83-1.90 | 175.0 |
+| 3 | 1.43-1.51 | 178.7 |
+| 4 | 1.23-1.25 | 205.0 |
+| **8** | **0.96** | **206-235** |
+| 12 | 1.12-1.24 | 235-241 |
+| 18 | 1.08-1.15 | 267 |
+
+Wall clock is stable; RSS carries ±25 MB of noise. **8 is the sweet spot and going past it makes
+both axes worse**: this machine has 18 logical cores but only 6 performance cores, so beyond that
+work lands on efficiency cores while a shared job queue means one slow thread holding a large
+library delays the tail (12 and 18 threads are 0.1-0.3 s *slower* than 8). "Default to full
+parallelism" therefore means `n_threads()` here, not the raw core count. `DAE_DEC_THREADS` overrides
+it so the curve can be re-measured without a rebuild.
+
+The body-buffer capacity estimate was also corrected. It used to be `n_fns * 768`, but measured on
+material_3_demo the expansion is **~16.6 bytes of Dart per byte of machine code** (3.8 MB of code →
+63.2 MB of output; `asm/` is 46.3/3.8 ≈ 12.2, which is exactly the factor `asm.rs` already used --
+a useful cross-check), so the old estimate was **5.4× low** and every buffer doubled several times.
+The pre-pass now sums `csize * 18` per library. Alternating A/B at 8 threads: wall 1.08-1.16 →
+1.04-1.12 s, RSS mean 221 → 210 MB -- small, but consistent in the same direction in all three
+pairs.
+
+**Net, alternating A/B (4 rounds, material_3_demo):** with `--decompile` 3.04-3.05 s / 181-200 MB →
+**1.42-1.43 s / 178-184 MB (2.13× faster, memory flat-to-lower)**; without it 0.56-0.58 s /
+139-142 MB → **0.55 s / 124-130 MB (-9%)**. Artifacts are **byte-identical**: `diff -rq` clean on
+material_3_demo (1011 files) and on six more corpora (arm64 Mach-O, x64 Mach-O, x64 ELF, two real
+Android `libapp.so`, the stress sample). All gates green: 59 tests, `full_scorecard` (26 samples /
+291 files / 24,253 functions / 0 `dart analyze` errors), `regress_all` 25/25, `check_profiles`
+47/47, clippy 0.
+
 ## Three defects found by reading source against output (2026-09-28, all fixed)
 
 Comparing decompiled output with the source of our own example programs, function by function,
@@ -308,6 +400,277 @@ found three defects that **every existing gate was blind to**.
    least one function, whereas `text/classes.txt` lists every Class record -- the two differ a lot
    (animations: 2177 vs 3358, the rest having had their methods inlined or tree-shaken).
 
+## Four more defects from a second stress sample (2026-09-28, three fixed, one reverted)
+
+The first round compared source against output on `if`/loops/classes/collections. This round built a
+**new** sample covering constructs none of the corpora exercise: `async`/`await`, `async*`/`yield`,
+generics (`Box<T>`), extension methods, operator overloads (`+`, `==`, `hashCode`), cascades, an
+`enum` with members, `mixin`, `abstract`, `late`, and nullable types. It compiles, runs, and its
+decompilation passes `dart analyze` with 0 errors -- and it still exposed four defects.
+
+1. **arm64 `cset`/`csetm` disappeared entirely** -- two bugs masking each other.
+   `lift_one` built the ternary from the *raw condition code*: `(ne) ? 1 : 0`. `ne` is not a Dart
+   identifier, so this should have been an `undefined_identifier` error; `csel`/`csinc` go through
+   `sel_cond()`/`fold_cond()`, but `cset`/`csetm` were missing from the `matches!` list in `lift()`.
+   That invalid text never surfaced because of the second bug: `nest_block` did not substitute
+   pending values for `Expr::Text` (only `Expr::Mem` did), and `pending` is keyed by destination --
+   so the following `x2 = (x2 << 1)` overwrote the `cset` entry and the statement vanished.
+   **The net effect was a silently wrong value, not a missing line.** In the sample,
+   `int get rank => this == Level.low ? 0 : 1` is inlined by AOT into
+   `cmp x1, <Level.low>; cset x2, ne; lsl x2, x2, #1`; before the fix the output was just
+   `x2 = x2 << 1`, where `x2` still held `4` -- the *interpolation array length* set eight
+   instructions earlier. After: `x2 = ((x1 != BARRIER) ? 1 : 0) << 1`.
+   A third piece was needed: when `NEST_MAX_DEPTH` blocks substitution, the pending value must be
+   **flushed to a statement** rather than left droppable. `_BigIntImpl.get_hashCode` hit exactly
+   that -- the depth limit stopped the fold at `asr r4, r5, #1`, then `ldur r5, [r2, #0xf]`
+   overwrote `pending[r5]` and the whole hash computation (ternary included) was lost. It now emits
+   `x5 = (((x4 == 0x10) ? -1 : 0) & ...) + ...` as its own line, which reads better than a
+   110-character nested expression anyway.
+   Gate: `cset_instructions_materialize_as_ternaries` -- per function, the number of `? 1 : 0` /
+   `? -1 : 0` ternaries in the body must be >= the number of `cset`/`csetm` in that function's raw
+   disassembly comment. Negative-tested: on v0.1.9 it reports **8 instructions / 0 ternaries /
+   8 failing functions**; after the fix, 7 / 9 / 0.
+2. **The raw disassembly comment block ran past the end of the function.** `lift` disassembles with
+   a deliberate 16-byte lookahead (the Code object's size often cuts the last instruction in half),
+   and `stmts` was correctly filtered by `stmts.retain(|s| s.addr < limit)` -- but `raw` was not.
+   Every function therefore printed up to four instructions belonging to the *next* function
+   (`_Record.get_hashCode`: entry `0x49e12c` + size `0x12c` => boundary `0x49e258`, yet the comment
+   block reached `0x49e264`, and the extra `csetm x0, eq` is not this function's -- `dae disasm`'s
+   IL stops at `0x49e254`). This is what made gate 1 mis-attribute one instruction. Now clipped.
+   It is also why `dart/` got **smaller**: -2.5% to -3.5% across seven corpora.
+3. **x86 `setcc` had no lift branch at all**, so it degraded to `// unmapped: setne dl`. That is
+   honest (unlike defect 1 it never vanished, and it counted toward the unmapped metric), but the
+   boolean condition was thrown away. `setcc` is the x86 counterpart of `cset` and now takes the
+   same path; the condition code maps to a jump mnemonic by prefix (`setne` <-> `jne`), and only
+   the 26 suffixes `fold_cond` actually handles are accepted -- anything else is left unmapped
+   rather than inventing a `condFlag("j...")` name.
+   Gate: `x86_setcc_materializes_as_ternary`. Negative-tested: v0.1.9 gives **9 instructions /
+   0 ternaries / 8 unmapped**; after, 8 / 8 / 0.
+4. **Reverted: substituting immediate literals into pending values.** Narrowing `subst_regs`'s
+   "pure register alias" guard so that single-token *literals* also fold is tempting -- it turns
+   `mov r17, #0x1cf2; movk r17, #0xd, lsl #16` from the self-referential
+   `x17 = (x17 & 0xffff) | 0xd0000` into `x17 = ((7410) & 0xffff) | 0xd0000`, where the constant is
+   readable. **It breaks `dart analyze`**: in the pseudocode every register and placeholder function
+   is `dynamic`, and `dynamic - dynamic` stays `dynamic` (any operator allowed), but as soon as one
+   side becomes an `int` literal the static type of `int - dynamic` is `num` -- and `num` has no
+   `<<`/`&`/`|`. `_Smi.get_bitLength` turned into `((64) - (clz(x0))) << 1` and failed with
+   `undefined_operator`; T4_blank failed the same way. It is not required for any of the three fixes
+   above (with the flush from defect 1 the ternary materialises regardless), so it is out. Getting
+   it back needs a self-consistent type system in the preamble (placeholder functions returning
+   `int` instead of `dynamic`), which is separate work.
+
+Across seven corpora (arm64 Mach-O, x64 Mach-O, x64 ELF, three real Android `libapp.so`, one
+purpose-built sample) the net effect is a win on every axis at once: **non-`dart/` artifacts are
+byte-identical**, **block and statement counts are unchanged**, `unmapped` lines drop
+(42 -> 34, 166 -> 161, 25 -> 22), `dart/` shrinks 2.5-3.5%, and condition ternaries go from
+**0 to 3-10 per corpus**. All standing gates stay green: 58 tests, `full_scorecard`
+(26 samples / 291 files / 24,253 functions / 0 `dart analyze` errors), `regress_all` 25/25,
+`check_profiles` 47/47, clippy 0.
+
+## A third stress sample: w-register writes did not alias x-reads (2026-09-28, fixed)
+
+The third sample covered what the first two had not: Dart 3 records, pattern `switch` expressions,
+`sealed` classes, `sync*` generators, function typedefs, spread / collection-`if` / collection-`for`,
+`rethrow`, `static`/`const`, and deliberately bit-twiddling code (an FNV-style hash with a rotate).
+It compiles, runs, and decompiles to 0 `dart analyze` errors -- and the hash function exposed a
+**silent wrong-value** defect.
+
+On arm64 `wN` (32-bit) and `xN` (64-bit) are two views of one physical register: writing `wN` zeroes
+bits 32-63 of `xN`. The output declares them as two independent `dynamic` variables, so "write `wN`,
+then read `xN` with no intervening `xN` write" read a **stale** value. In `hashBytes` the source
+rotate `((h << 5) | (h >> 27)) & 0xffffffff` compiles to `w4 = w1 << 5; w6 = w1 >> 27;` and the
+output was `x0 = ((x4 | x6) >> 0) & 0xffffffff` -- `x4`/`x6` holding values from instructions ago.
+After the fix it is
+`x0 = ((((w1 << 5) & 0xffffffff) | ((w1 >> 0x1b) & 0xffffffff)) >> 0) & 0xffffffff`.
+
+The fix emits an alias assignment `xN = wN & 0xffffffff` after every `wN` write; `nest_block` folds
+it into later expressions. **Renaming `wN` to `xN` was rejected**: `w4 = w1 + w2` really means
+`(w1 + w2) mod 2^32`, so a plain rename loses the truncation, and renaming only the write side would
+leave every later *read* of `wN` undefined.
+
+Measured on material_3_demo: stale reads **3 590 -> 16** (functions affected 1 135 -> 13, i.e.
+7.6% -> 0.1%); statements +1.5% (985 900 -> 1 000 974) from the alias lines. Gate
+`w_register_write_aliases_x_register` (floor 40 stale reads, and it asserts >= 20 `w` writes so it
+cannot pass vacuously), **negative-tested**: on the pre-fix binary it reports 290 and fails.
+
+Two measurement traps from this round, both worth keeping:
+
+* **`DART_AOT_PROF` percentages can now exceed 100%** (lift 271%, emit 357%). That is not broken
+  timing -- the per-phase numbers are *CPU time summed across threads* while the "main loop" line is
+  wall clock. Run with `DAE_DEC_THREADS=1` for a single-threaded reading. The printout now says so.
+* **A single wall-clock reading is unusable.** One run of material_3_demo came back at 3.42 s when
+  three clean runs gave 1.09-1.22 s -- it had been started right after an `unzip` in the same
+  command, on a machine that had been benchmarking for an hour. Always alternate A/B and take
+  several rounds; peak RSS is far more stable than wall clock.
+
+## Six more lift gaps closed by enumerating `// unmapped:` (2026-09-28)
+
+Instead of writing yet another sample, this round just **counted every unmapped mnemonic across the
+corpora** -- each distinct one is a concrete lift gap, so the enumeration is itself the bug list.
+Before: material_3_demo 3, hello_3.13.0 (x64) 161, T4_blank (x64) 34.
+
+| mnemonic | meaning | now rendered as |
+|---|---|---|
+| `addsd` `subsd` `mulsd` `divsd` (+`ss`) | x86 SSE scalar float, **two**-operand (`xmm0 = xmm0 op xmm1`) | `(a op b) /* float */`, sharing the arm64 `fadd`/`fmul` path |
+| `comisd` `comiss` `ucomisd` `ucomiss` | float compare, sets flags only | folded into the `cmp` family, so the following `ja`/`jb` gets a real condition |
+| `cmov<cc>` | conditional move (x86 sibling of `csel`) | `(cond) ? src : dst`, reusing the `sel_cond`/`fold_cond` path |
+| `cinc` `cinv` `cneg` | arm64 aliases of `csinc`/`csinv`/`csneg` | `cond ? xn+1 : xn` / `cond ? ~xn : xn` / `cond ? -xn : xn` |
+| `inc` `dec` | ±1 | `dst = dst + 1` / `- 1` |
+| `cdq` `cqo` | sign-extend eax/rax into edx/rdx before `idiv` | `edx = ((eax >> 31) & 1) == 0 ? 0 : -1 /* cdq: … */` |
+
+After: material_3_demo **3 → 2**, hello_3.13.0 **161 → 142**, T4_blank **34 → 9 (-74%)**.
+`dart analyze` still 0 errors over 26 samples / 24 253 functions; all 60 tests green.
+
+The x86 scalar-float case was the substantive one: `*sd`/`*ss` is how *every* `double`/`float`
+arithmetic is emitted on x64, so missing them meant all float math in x64 snapshots showed up as
+`// unmapped`. The two-operand form is why they were missed -- the arm64 path only accepted the
+three-operand `fadd d0, d1, d2`.
+
+**What is left, and a trap worth naming.** 121 of the remaining 142 are **instruction prefixes**
+(`rep` 61, `std` 30, `cld` 30, `lock` 3) that capstone reports as separate instructions; fixing them
+properly means combining a prefix with the instruction that follows (`rep movsb` is a memcpy loop),
+not mapping the prefix on its own. The rest are `mul rdx` (x86 one-operand multiply writing
+`rdx:rax` -- cannot be expressed as a single assignment without dropping the high half), `shld`/`shrd`,
+`or mem(...), reg` (read-modify-write to memory), `bsr`, `subps`/`subpd`.
+
+> ⚠️ Relabelling prefixes from `// unmapped:` to `// note:` would drop the headline number by 85%
+> while adding **zero** information. `unmapped` is the quality dial precisely because it counts
+> instructions whose semantics were not recovered; do not game it.
+
+## A register-name substring match invented `ppmem(...)` and swallowed 1411 stores (2026-09-28, fixed)
+
+Found by dispatching a subagent to audit Reqable (arm64, dart 3.3.4, obfuscated, `dedup_instructions`)
+class by class. The tell was a **pure prefix correlation**: all 16 distinct `ppmem` displacements in
+the whole artifact started with `0x27`, and `mem(..., 0x27*)` had **zero survivors**, while
+`mem(PP, 0x5270)` / `0x26x` / `0x28x` were all fine. That distribution is the fingerprint of a
+substring match, not of any semantic rule.
+
+The pool-load test read `ops.contains(&rl.pp)`. Dart's arm64 pool pointer `PP` is physically `x27`,
+and the displacement text `#0x27` **contains the substring `x27`**. So `stur x17, [x3, #0x27]` was
+classified as a pool load and returned `Expr::Pool(0x27)`, with three consequences:
+
+1. a **store became an assignment** -- direction reversed, so `memSet(x3, 0x27, x17)` vanished and
+   `x17` was left holding an undefined identifier;
+2. `Expr::Pool` renders as `pp[0x27]`, and the `sanitize_mem_refs` pass at the emitter's exit
+   rewrites `[..]` into `mem(..)`, minting the identifier **`ppmem(0x27)`** out of nothing;
+3. loads lost their base: `ldur x1, [x0, #0x27]` and the second-level `ldur x2, [x1, #0x27]` both
+   rendered as the same `ppmem(0x27)`, aliasing two distinct indirections into one value.
+
+Fix: word-boundary matching (`contains_word`, same boundary definition as the existing
+`replace_word`). Measured on Reqable: `ppmem(` **1411 -> 0**, `mem(..., 0x27*)` **744 restored**,
+and every swallowed `memSet(..., 0x27..., ...)` came back. The agent's original case `Agb.uzd` went
+from `x17 = ppmem(0x27);` to
+
+```dart
+x17 = "autoCapture" /* pp+0x2a608 */; // 0xecd0f0
+memSet(x3, 0x27, x17);                // 0xecd0f4
+```
+
+-- so the fix also **recovered a string literal** that the bogus pool index had been hiding.
+Gate `no_register_substring_false_positives_in_output` (asserts 0 `ppmem(` and, to stay non-vacuous,
+>= 50 `memSet` / >= 500 `mem`; this corpus measures 2475 / 9254).
+
+The general rule worth keeping: **any test of the form `text.contains(register_name)` is a bug
+waiting to happen.** `x27` is a substring of `0x27`, and `x1` is a substring of `x17`. Every
+register-name lookup has to go through a word-boundary matcher.
+
+## Clarity first -- attempted, and reverted (2026-09-28)
+
+The premise is right: a bit test in the output is usually **an `if` the compiler optimised**, and
+copying the machine form verbatim forces the reader to already know the object layout. The first
+attempt acted on it and was **wrong**, so it is recorded here rather than deleted.
+
+**What was tried.** `tbz xN, #0` / `tbnz xN, #0` → `isSmi(xN)` / `isHeapObject(xN)`, justified by
+`tagging.heap_object_tag` = 1 and `smi_mask` = 1 from the profile -- i.e. bit 0 *is* the
+Smi/HeapObject tag, read from the profile rather than hardcoded. On Reqable it produced 1 169
+`if (isSmi(...))` + 58 `if (isHeapObject(...))`, drove the `& (1 << 0)` form from 1 232 to 0, kept
+`dart analyze` at 0 errors, and fired on the w32-compressed Android corpus too. Every metric said
+it worked.
+
+**Why it is wrong.** The bit position does not establish the *meaning*. `tbz/tbnz xN, #0` is also how
+an **unboxed integer parity test** compiles: the source `return n.isEven ? 'even' : 'odd';`
+(`testing/stress/stress.dart:31`) becomes `tbnz w1, #0`, where `w1` holds an `int`, not a tagged
+pointer. The rewrite rendered it as
+
+```dart
+if (isHeapObject(w1)) { x0 = "odd"; } else { x0 = "even"; }   // ← fabricated semantics
+```
+
+which tells the reader "if this is a heap object" when the truth is "if this integer is odd". The
+previous form `if (w1 & (1 << 0) != 0)` is terse but **correct**. So the rewrite traded a correct
+expression for a pretty, wrong one -- which is exactly the fabrication this project forbids, and it
+was invisible to every gate: the output was still valid Dart, the counts still moved the right way.
+Only reading the output against the source caught it.
+
+Making the restoration sound needs proof that *this register currently holds a tagged value*, which
+requires type or dataflow information the decompiler does not have (everything is `dynamic`).
+Until then the bit test stays verbatim: it is what the machine actually does, and the reader can
+decide whether it is a tag test or a parity test.
+
+**Two things from this attempt are kept**, because both are independent of it:
+
+* `lift()`'s "is this condition already an expression, or a mnemonic to fold?" test used to be
+  `c.contains(' ')`. That proxy broke the rewrite (`isSmi(x0)` has no space, so it was treated as a
+  mnemonic, missed `fold_cond`'s table, and fell into the catch-all `condFlag("isSmi(x0)")` -- the
+  predicate ended up **inside a string literal**, worse than not restoring it, while the counts still
+  looked right). It is now shape-based: a mnemonic is entirely lowercase letters and dots
+  (`b.eq`, `jle`); anything with an uppercase letter, parenthesis or operator is already an
+  expression. That is strictly more robust regardless of this feature.
+* The gate `condflag_only_wraps_bare_condition_codes` **should have caught that and did not** -- its
+  criterion was "contains a space or a comparison/logical/bitwise operator", and `isSmi(w0)` contains
+  none. It now requires a `condFlag` argument to be a bare 1-3 lowercase-letter condition code.
+  **The lesson: write gate criteria by shape, not by enumerating the bad cases you have seen so
+  far** -- otherwise every new bug needs a new special case and the gate is always one step behind.
+
+Also worth keeping: new placeholder functions must be declared explicitly in `PSEUDO_FUNCS`, not left
+to the preamble's automatic `dynamic X;`. That automatic path is precisely why the invented
+identifier `ppmem` survived `dart analyze` -- an unknown name becomes a `dynamic` variable and
+calling a `dynamic` is legal.
+
+**And a note on the remaining constants.** Auditing every numeric literal added to the code (not the
+comments) this round leaves exactly one that came from measuring a single app: the decompiler's
+body-buffer estimate `est += csize * 18 + 96`. The 18 is the bytes-of-Dart-per-byte-of-machine-code
+ratio measured on material_3_demo (63.2 MB / 3.8 MB ≈ 16.6, rounded up); `asm.rs` independently uses
+12 for the same kind of estimate and its own ratio measures 46.3/3.8 ≈ 12.2, which is the
+cross-check. It is a **capacity hint only** -- over- or under-estimating changes how often the
+`String` reallocs, never a byte of output -- so it cannot produce wrong results, but it is not
+derived from anything universal and should be re-measured if the output format changes.
+Everything else is architectural (`0xffffffff` for the 32-bit register view, `31`/`63` for
+`cdq`/`cqo` sign extension), ISA-level (the 26-entry x86 condition-code whitelist, tied to
+`fold_cond`'s own table), or a plain I/O buffer size.
+
+## A field row that disappeared -- and why that is the fix working (2026-09-28)
+
+The pre-release diff against v0.1.9 found exactly one changed byte outside `dart/`: `text/fields.txt`
+went **634 -> 633 rows**, losing `_SyncStarIterator  _current  accessor  0x8`. Both binaries are
+deterministic (three runs, identical md5), and it only happens on arm64 corpora, so it was traced
+rather than waved off.
+
+The accessor-inference route **runs the full `lift` pipeline** (`accessor_fields` calls `lift` on each
+implicit getter/setter and reads the offsets out of the resulting `Stmt`s), so any lift change moves
+`text/fields.txt`. Its soundness guard is: infer a field only when the accessor shows **exactly one**
+distinct field offset and **zero** unclassifiable accesses.
+
+`_SyncStarIterator._current_assign` contains two field accesses:
+
+```
+0x38163c: ldur r2, [r3, #7]      -> offset 0x7 (0x8 once the tag is removed)
+0x381658: ldur r4, [r2, #0x27]   -> a second offset -- and 0x27 contains the substring "x27"
+```
+
+Under v0.1.9 the second one was swallowed by the pool-load substring bug (`ops.contains("x27")`
+matched the displacement), classified as `Expr::Pool`, counted as *not* a field access -- leaving
+exactly one offset, so the guard passed and the row was emitted. With word-boundary matching the
+second access is correctly seen, `offs.len() == 2`, and the guard **declines**, which is what it is
+for. Corroborating evidence that the old row was not sound anyway: this "setter" opens with two
+*loads*, not a `stur`, so it is not the shape of a plain field setter at all.
+
+So the row was produced by a bug cancelling out another bug's blind spot. **634 -> 633 is an increase
+in soundness, not a loss of capability.** Worth recording because the coupling is invisible: nothing
+in `text/fields.txt` suggests it depends on the decompiler's instruction lifter, and
+`tests/field_names.rs` checks that the two routes agree and that every annotation exists in the
+table -- it does **not** check that the row set is stable, so a lift change can silently move it.
+
 ## Known gaps (measured, not fixed)
 
 * **Statement order does not follow address order**: 21,826 sites = **2.74% of statements**,
@@ -328,6 +691,18 @@ found three defects that **every existing gate was blind to**.
   liveness, so writing arguments would pass off a register written before an *earlier* call as this
   call's argument (the truth corpus caught exactly that: x0 written 8 instructions and one call
   earlier).
+* **Closures lose their enclosing function** (`_anon_closure` instead of
+  `_BigIntImpl._cachedDivRemResultValue.<anonymous closure>`). This is blutter-compatible naming, and
+  unlike the pool-name gap below **the data is already parsed**: the `ClosureData` cluster carries
+  **2 refs in every profile from 2.14.4 through 3.13.0**, and the 2.14.4 profile labels them
+  `parent_function` and `closure` -- newer profiles read the same two refs but leave them unnamed, so
+  ref[0] is sitting there unused. Two things must be established before projecting it: (a) the ref
+  *order* is the same in every version (only 2.14.4 documents it -- prove it by checking that ref[0]
+  resolves to a Function and ref[1] to the closure's own Function, on the `.symtab` corpora where the
+  qualified name is independently known); (b) it is a deliberate artefact-wide rename, because
+  `_anon_closure` appears in `text/functions.txt`, the IDA/r2 scripts and `frida.js`, so every
+  `regress` archive has to be re-cut. Measured frequency on `.symtab` corpora: 40 sites in
+  hello_2.15.0, 26 in hello_3.13.0, all of them "class/prefix differs only".
 * **Object-pool names are still not projected into the IDA/r2 scripts** (blutter emits ~52,700
   `pp.*` flags). The data exists and `dae pp` / `dae findrefs` query it.
 

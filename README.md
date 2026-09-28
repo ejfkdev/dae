@@ -38,17 +38,26 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
   Irreducible control flow keeps an explicit `gotoLabel` and a `NOTE` header rather than being
   silently flattened. See [Decompiler](#decompiler-experimental).
 - **Fast** — all measured with this release's binary: a 9 MB macOS Flutter sample exports in
-  0.26 s; `--decompile` takes 1.6 s on Lark (25.6 MB Android, 25 183 functions), 2.4 s on
-  `material_3_demo` (14 MB macOS, 15 796 functions) and 3.5 s on Weibo (9 MB Android,
-  19 053 decompiled functions / 1.53 M statements), at 179–211 MB peak RSS. That is **~50× faster
-  than v0.1.7** on the same artifact (106.8 s → 1.91 s) — from not rebuilding run-invariant data
-  per function, not from a faster algorithm.
+  0.26 s; `--decompile` takes 1.5 s on Lark (25.6 MB Android, 25 183 functions), 1.2 s on
+  `material_3_demo` (14 MB macOS, 15 796 functions) and 1.7 s on Weibo (9 MB Android,
+  19 053 decompiled functions / 1.63 M statements), at 172–263 MB peak RSS. That is **~89× faster
+  than v0.1.7** on the same artifact (106.8 s → 1.20 s) — from not rebuilding run-invariant data
+  per function, from streaming artifacts to disk instead of buffering them, and from rendering the
+  505 libraries in parallel; not from a faster algorithm. The parallel path is **byte-identical** to
+  the serial one (`diff -rq` over 1011 files), because file names and "which library emits each
+  entry point" are both settled by a sequential pre-pass before any rendering starts.
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
+- **Parallel decompiler** — the 505-ish libraries are rendered concurrently (default `n_threads()`,
+  i.e. core count capped at 8); override with `DAE_DEC_THREADS=N`. Output is **byte-identical** at any
+  setting, because file names and "which library emits each entry point" are settled by a sequential
+  pre-pass first. Past 8 threads it gets *slower* and uses more memory on a 6P+12E-core Mac, so the
+  cap is the sweet spot, not a limitation. `DART_AOT_PROF=1` prints a per-phase breakdown — note its
+  percentages can exceed 100% because the phases are CPU time summed across threads.
 - **Progressive mode** — 20 subcommands to query the snapshot like a database (`libs`, `classes`,
   `functions`, `members`, `strings`, `findrefs`, `callers`, `callees`, `pp`, `objs`, `stubs`, ...)
   and then decompile exactly one thing (`getclass` / `getmethod` / `getlib` / `decompile --app`).
   Queries answer in 15–30 ms on a small corpus and 43–311 ms on a 15,796-function app; a full
-  export of that app is 0.54 s, or ~2.1 s with `--decompile` (~1000 files). Every command's output
+  export of that app is 0.55 s, or ~1.4 s with `--decompile` (~1000 files). Every command's output
   is pasteable into the next one.
   See [Progressive mode](#progressive-mode-list-first-decompile-one-thing).
 - **No toolchain required** — one self-contained binary: no Dart SDK, no Flutter install, and the
@@ -246,7 +255,7 @@ loses its underscore and could clash with a public `SliderState`. If you want a 
 `dae getclass App HomePage -o HomePage.dart` already gives you one; `-o DIR` deliberately keeps
 the full-export layout so "the selection is a subset of the full export" is literally checkable.
 
-Cost, measured: a full `--decompile` export of a 15,796-function Flutter app takes ~2.1s and
+Cost, measured: a full `--decompile` export of a 15,796-function Flutter app takes ~1.4s and
 writes ~1000 files. Queries are 15–30ms on a small corpus; on that same large app `findrefs` is
 0.21s, `callees` 0.30s, and `decompile --app` 0.20s. Snapshot parsing itself is ~50ms — what
 progressive mode saves is the writing.
@@ -313,7 +322,13 @@ a branch was silently dropped — every in-function statement must terminate, a 
 floor, and **address self-consistency**: at least 80% of function entries must look like prologues
 and direct calls must land on function entries) and `tests/field_names.rs` (the two field-name
 routes must agree, zero conflicts, and every annotation in the output must exist in the recovered
-table — that is the no-fabrication check). The address gate exists because an address-location bug
+table — that is the no-fabrication check), and `tests/cli_query.rs` (the query commands, plus three
+decompiler invariants that validity checks cannot see because they are **omissions**: every real
+instruction address from `asm/` must show up as a statement address in `dart/`, floor 0.75;
+`condFlag(...)` may only ever wrap a bare condition code, never an expression that is already valid
+Dart; and every `cset`/`csetm` on arm64 and every whitelisted `setcc` on x86 must materialise as a
+ternary inside its own function's body — not vanish, and not degrade to `// unmapped:`).
+The address gate exists because an address-location bug
 on appended Mach-O snapshots once made the decompiler read the wrong bytes while every name-based
 metric stayed green. Its criterion is the *prologue rate*, not "the last instruction is a
 terminator": that older check was itself fake — it was counting x64 `int3` padding and still scored

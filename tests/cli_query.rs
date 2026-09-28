@@ -744,15 +744,14 @@ fn condflag_only_wraps_bare_condition_codes() {
                 None => break,
             };
             total += 1;
-            // 含比较/逻辑/位运算符，或含空格 ⇒ 它是一个表达式，不该被包起来
-            if arg.contains(' ')
-                || arg.contains("==")
-                || arg.contains("!=")
-                || arg.contains('<')
-                || arg.contains('>')
-                || arg.contains('&')
-                || arg.contains('|')
-            {
+            // 合法的条件码只有 1–3 个小写字母（arm64: eq/ne/lt/gt/le/ge/lo/hs/hi/ls/
+            // mi/pl/vs/vc/al/nv/cs/cc；x86: e/ne/l/le/g/ge/b/be/a/ae/s/ns/o/no/p/np/c/nc）。
+            //
+            // ⚠️ 原来的判据只查「含不含空格或比较/逻辑/位运算符」，**太弱**：
+            // `condFlag("isSmi(w0)")` 一个都不含，于是大摇大摆过了门禁——而它是把
+            // 已经还原好的语义判断又塞回字符串字面量里，比不还原更糟。
+            // 改成「必须是纯小写字母短串」，任何表达式形态都会被挡下。
+            if !arg.chars().all(|c| c.is_ascii_lowercase()) || arg.is_empty() || arg.len() > 3 {
                 if wrapped_expr.len() < 6 {
                     wrapped_expr.push(arg.to_string());
                 }
@@ -773,5 +772,545 @@ fn condflag_only_wraps_bare_condition_codes() {
         wrapped_expr
     );
     println!("condFlag: 共 {total} 处，全是裸条件码 {:?}", codes);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// `cset`/`csetm` 必须落地成三元式：每条指令在**它所属函数**的函数体里都要留下产物。
+///
+/// 这个门禁守的是两个互相掩盖的缺陷（都只在「读了源码才知道该有什么」时才看得见，
+/// `dart analyze` 与指令覆盖率门禁全都测不到）：
+///
+/// 1. `lift_one` 的 cset 分支曾直接用裸条件码拼 `(ne) ? 1 : 0`。`ne` 不是 Dart 标识符，
+///    本该报 undefined_identifier——`csel`/`csinc` 走 `sel_cond()`/`fold_cond()` 那条路，
+///    cset 漏在了 `lift()` 折叠臂的 `matches!` 列表外面。
+/// 2. `nest_block` 的 `Expr::Text` 分支曾不做待定值替换（`Expr::Mem` 做），而 pending
+///    按 dst 建键 ⇒ 紧随的 `x2 = (x2 << 1)` 直接覆盖掉 cset 那条，语句整条消失。
+///
+/// (2) 把 (1) 的非法 Dart 吞掉了，所以 analyze 一直 0 错误；cset 的地址又被折进后一条
+/// 语句、本来就不该单独出现，所以覆盖率门禁也看不见。**净效果是静默的错误值**：
+/// 实测 stress2 样例 `Level.get_tag`（源码 `int get rank => this == Level.low ? 0 : 1`
+/// 被 AOT 内联成 `cmp x1, <Level.low>; cset x2, ne; lsl x2, x2, #1`），修复前产物只剩
+/// `x2 = x2 << 1`，而 x2 还是上面 `x2 = 4`（插值数组长度）的残值；修复后是
+/// `x2 = ((x1 != BARRIER) ? 1 : 0) << 1`。
+///
+/// 不变量按函数统计：函数体里 `? 1 : 0` / `? -1 : 0` 的个数 ≥ 该函数 raw 反汇编注释里
+/// `cset`/`csetm` 的条数。基线 v0.1.9 在 sample_arm64 上是 **8 条指令 ↔ 0 个三元式**
+/// （本门禁必红），修复后 8 ↔ 8。顺带钉住 (1)：函数体里不许出现裸条件码三元式。
+#[test]
+fn cset_instructions_materialize_as_ternaries() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 cset 落地门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_cset");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    /// raw 反汇编注释行是否为 cset/csetm：`//  0x4bd4dc: cset x2, ne`
+    fn is_cset_comment(line: &str) -> bool {
+        let t = line.trim_start();
+        let Some(t) = t.strip_prefix("//") else { return false };
+        let t = t.trim_start();
+        let Some(t) = t.strip_prefix("0x") else { return false };
+        let Some(i) = t.find(':') else { return false };
+        if t[..i].is_empty() || !t[..i].chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        let m = t[i + 1..].trim_start();
+        m.starts_with("cset ") || m.starts_with("csetm ")
+    }
+    /// 函数头：`dynamic Level_get_tag() {`。前导声明区里的
+    /// `dynamic mem(dynamic a, ...) => null;` 不以 `{` 结尾，不会误判。
+    fn is_fn_header(line: &str) -> bool {
+        let t = line.trim_end();
+        t.starts_with("dynamic ") && t.ends_with(") {") && t.contains('(')
+    }
+    fn count_ternaries(line: &str) -> usize {
+        line.matches("? 1 : 0").count() + line.matches("? -1 : 0").count()
+    }
+    /// 裸条件码三元式 `(ne) ? ...`：条件码没被包进 condFlag、也没折成真条件
+    const CODES: [&str; 18] = [
+        "eq", "ne", "lt", "gt", "le", "ge", "lo", "hs", "hi", "ls", "mi", "pl", "vs", "vc", "al",
+        "nv", "cs", "cc",
+    ];
+
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut total_csets = 0usize;
+    let mut total_tern = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    let mut bare: Vec<String> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        // raw 注释在函数头**之前**，所以先攒着，遇到函数头再归属给随后的函数体
+        let mut pending_csets = 0usize;
+        // Some((函数名, 该函数 raw 注释里的 cset 条数, 函数体里已数到的三元式个数))
+        let mut cur: Option<(String, usize, usize)> = None;
+        let fname_of = |e: &std::path::Path| e.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let file = fname_of(&e.path());
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                if cur.is_none() && is_cset_comment(line) {
+                    pending_csets += 1;
+                    total_csets += 1;
+                }
+                continue;
+            }
+            if is_fn_header(line) {
+                if let Some((n, c, tr)) = cur.take() {
+                    total_tern += tr;
+                    if tr < c && bad.len() < 8 {
+                        bad.push(format!("{file}::{n}: {c} 条 cset/csetm 只落地了 {tr} 个三元式"));
+                    }
+                }
+                let n = line
+                    .trim_start_matches("dynamic ")
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                cur = Some((n, pending_csets, 0));
+                pending_csets = 0;
+                continue;
+            }
+            let Some((ref n, _c, ref mut tr)) = cur else { continue };
+            // ⚠️ 只认**第 0 列**的 `}` 作为函数结束。函数体里的 `if`/`while` 块闭合是
+            // 缩进的 `  }`，用 `trim_start()` 比会把函数体提前截断（这个门禁自己先错过一次）。
+            if line == "}" {
+                let (n, c, tr) = cur.take().unwrap();
+                total_tern += tr;
+                if tr < c && bad.len() < 8 {
+                    bad.push(format!("{file}::{n}: {c} 条 cset/csetm 只落地了 {tr} 个三元式"));
+                }
+                continue;
+            }
+            *tr += count_ternaries(line);
+            for code in CODES {
+                let pat = format!("({code}) ?");
+                if line.contains(&pat) && bare.len() < 6 {
+                    bare.push(format!("{n}: {}", line.trim()));
+                }
+            }
+        }
+        if let Some((n, c, tr)) = cur.take() {
+            total_tern += tr;
+            if tr < c && bad.len() < 8 {
+                bad.push(format!("{file}::{n}: {c} 条 cset/csetm 只落地了 {tr} 个三元式"));
+            }
+        }
+    }
+
+    assert!(
+        total_csets > 0,
+        "语料里一条 cset/csetm 都没有——门禁会空过（sample_arm64 实测有 8 条）"
+    );
+    assert!(
+        bare.is_empty(),
+        "函数体里出现**裸条件码**三元式（样例 {bare:?}）。条件码必须包成 \
+         condFlag(\"cc\") 或用上一条 cmp 折成真条件，否则 `ne` 这类不是 Dart 标识符"
+    );
+    assert!(
+        bad.is_empty(),
+        "有 cset/csetm 指令没有落地成三元式（{bad:?}）——定义被静默丢弃，\
+         产物里会剩下引用残值的语句。见本测试的文档注释"
+    );
+    println!(
+        "cset/csetm 落地: {} 条指令 ↔ {} 个三元式（基线 v0.1.9 是 {} ↔ 0）",
+        total_csets, total_tern, total_csets
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// x86 `setcc` 必须落地成三元式，而不是退化成 `// unmapped: setne dl`。
+///
+/// `setcc` 是 arm64 `cset` 的对应物（条件成立取 1），语义同样依赖前一条 `cmp`/`test`。
+/// v0.1.9 完全没有 setcc 的 lift 分支，所以它落到 `Op::Other` —— 好处是**诚实**
+/// （产物里印 `// unmapped: setne dl`、计入 unmapped 指标，不像 cset 那样整条消失），
+/// 坏处是那个布尔条件白丢了：读的人只看到「这里有个没认出的指令」。
+///
+/// 现在 `set<cc>` 走与 `cset` 同一条折叠路径（`sel_cond` + `fold_cond`，条件码→等价
+/// 跳转助记符按 ISA 取前缀：arm64 `b.`、x86 `j`），条件码只认 `fold_cond` 里真有
+/// 对应跳转的白名单，**不在白名单里的一律不接管**（继续 unmapped，绝不编造
+/// `condFlag("j…")` 这种名字）。
+///
+/// 实测 T4_blank（elf x64）：raw 注释里 8 条 setcc ↔ 函数体 8 个 `? 1 : 0`、unmapped
+/// 残留 0；基线 v0.1.9 是 8 条**全部** unmapped、0 个三元式（本门禁必红）。
+/// hello_3.12.2（macho x64）同样 5 ↔ 5。
+#[test]
+fn x86_setcc_materializes_as_ternary() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sample = root.join("testing/variants/T4_blank/libapp.so");
+    if !sample.exists() {
+        skip_or_fail("缺语料 testing/variants/T4_blank/libapp.so，跳过 setcc 门禁");
+        return;
+    }
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_setcc");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    /// 与 `src/decompiler.rs::is_x86_setcc` 的白名单一致（改动要同步两边）
+    const CC: [&str; 26] = [
+        "e", "z", "ne", "nz", "l", "b", "nae", "le", "be", "na", "g", "a", "nbe", "ge", "ae",
+        "nb", "s", "ns", "o", "no", "c", "nc", "p", "np", "pe", "po",
+    ];
+    /// raw 注释行 `//  0x17a50: setne dl` → Some("ne")
+    fn setcc_of(line: &str) -> Option<&str> {
+        let t = line.trim_start().strip_prefix("//")?.trim_start();
+        let t = t.strip_prefix("0x")?;
+        let i = t.find(':')?;
+        let hex = &t[..i];
+        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let cc = t[i + 1..].trim_start().strip_prefix("set")?;
+        // 后面必须还有操作数（`setne dl`），否则不是 setcc
+        if !cc.contains(' ') {
+            return None;
+        }
+        let code = cc.split(' ').next()?;
+        CC.into_iter().find(|c| *c == code)
+    }
+
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut instr = 0usize;
+    let mut tern = 0usize;
+    let mut unmapped: Vec<String> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let mut in_body = false;
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                if !in_body && setcc_of(line).is_some() {
+                    instr += 1;
+                }
+                // 白名单内的 setcc 出现在 unmapped 注释里 = lift 分支没接住
+                if let Some(u) = t.strip_prefix("// unmapped: set") {
+                    let code = u.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("");
+                    if CC.contains(&code) && unmapped.len() < 6 {
+                        unmapped.push(t.to_string());
+                    }
+                }
+                continue;
+            }
+            let tr = line.trim_end();
+            if tr.starts_with("dynamic ") && tr.ends_with(") {") && tr.contains('(') {
+                in_body = true;
+                continue;
+            }
+            if in_body {
+                if line == "}" {
+                    in_body = false;
+                    continue;
+                }
+                tern += line.matches("? 1 : 0").count();
+            }
+        }
+    }
+
+    assert!(
+        instr > 0,
+        "语料里一条白名单内的 setcc 都没有——门禁会空过（T4_blank 实测 8 条）"
+    );
+    assert!(
+        unmapped.is_empty(),
+        "白名单内的 setcc 仍被当成 unmapped（样例 {unmapped:?}）——lift 分支没接住，\
+         前一条 cmp/test 的布尔条件就白丢了"
+    );
+    assert!(
+        tern >= instr,
+        "setcc 落地不全：raw 注释里 {instr} 条，函数体里只有 {tern} 个 `? 1 : 0` 三元式"
+    );
+    println!("x86 setcc 落地: {instr} 条指令 ↔ {tern} 个三元式，unmapped 残留 0（基线 v0.1.9 是 {instr} ↔ 0）");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// arm64 的 `wN`（32 位）与 `xN`（64 位）是**同一个物理寄存器的两个视图**：写 `wN` 会把
+/// `xN` 的高 32 位清零。产物里它们是 `dynamic w4; dynamic x4;` 两个独立变量，所以
+/// 「先写 `wN`、之后读 `xN`、中间没有对 `xN` 的写」会读到 `xN` 的**旧值**（或从未赋值的值）
+/// —— 这不是少一行注释，是**静默的错误值**。
+///
+/// 实测 stress3 样例的 `hashBytes`：源码 `h = ((h << 5) | (h >> 27)) & 0xffffffff`
+/// 编译成 `w4 = w1 << 5; w6 = w1 >> 27; ... (x4 | x6)`，修复前产物就是
+/// `x0 = ((x4 | x6) >> 0) & 0xffffffff`，而 x4/x6 是几个指令之前的陈旧值；
+/// 修复后是 `x0 = ((((w1 << 5) & 0xffffffff) | ((w1 >> 0x1b) & 0xffffffff)) >> 0) & 0xffffffff`。
+///
+/// 修法是每写一次 `wN` 就补一条别名赋值 `xN = wN & 0xffffffff`（`nest_block` 会把它折进
+/// 后续表达式）。**不能**简单把 `wN` 改名成 `xN`：`w4 = w1 + w2` 的真值是
+/// `(w1 + w2) mod 2^32`，改名就丢了截断；只改写入端又会让后续**读** `wN` 的地方变成未定义变量。
+///
+/// 门禁判据与实测口径一致：material_3_demo 上修复前 **3 590 个读点 / 1 135 个函数（7.6%）**，
+/// 修复后 **16 / 13（0.1%）**。门槛定 40 处——远高于修复后、远低于修复前。
+#[test]
+fn w_register_write_aliases_x_register() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 w/x 别名门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_wx");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut w_writes = 0usize; // 非空断言用：语料里必须真的有 w 寄存器写入
+    let mut stale: Vec<String> = Vec::new();
+    let mut stale_total = 0usize;
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let mut cur: Option<String> = None;
+        // 写过 wN、且其后未写 xN 的编号集合
+        let mut pending_w: BTreeSet<String> = BTreeSet::new();
+        for line in text.lines() {
+            let t = line.trim_end();
+            if t.starts_with("dynamic ") && t.ends_with(") {") && t.contains('(') {
+                cur = Some(
+                    t.trim_start_matches("dynamic ")
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                );
+                pending_w.clear();
+                continue;
+            }
+            if line == "}" {
+                cur = None;
+                pending_w.clear();
+                continue;
+            }
+            if t.starts_with("//") || cur.is_none() {
+                continue;
+            }
+            // 只看语句行（行尾带地址注释），跳过局部声明 `dynamic w4;`
+            let Some(ai) = t.rfind("// 0x") else { continue };
+            let code = &t[..ai];
+            let Some(eq) = code.find('=') else { continue };
+            let lhs = code[..eq].trim();
+            let rhs = &code[eq + 1..];
+            if let Some(n) = lhs.strip_prefix('w') {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    pending_w.insert(n.to_string());
+                    w_writes += 1;
+                }
+            } else if let Some(n) = lhs.strip_prefix('x') {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    pending_w.remove(n); // 写了 xN，之前的 wN 就不再是它的最新值
+                }
+            }
+            // RHS 里读到的 xN，若其编号正处在「只写过 wN」状态 ⇒ 陈旧读
+            let bytes = rhs.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'x'
+                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                {
+                    let j = i + 1;
+                    let mut k = j;
+                    while k < bytes.len() && bytes[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k > j
+                        && (k >= bytes.len()
+                            || !(bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_'))
+                    {
+                        let n = &rhs[j..k];
+                        if pending_w.contains(n) {
+                            stale_total += 1;
+                            if stale.len() < 6 {
+                                stale.push(format!("{}: x{n} 读自陈旧的 w{n} | {}", cur.clone().unwrap_or_default(), t.trim()));
+                            }
+                        }
+                        i = k;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    assert!(
+        w_writes >= 20,
+        "语料里只解析出 {w_writes} 处 w 寄存器写入——门禁会空过"
+    );
+    assert!(
+        stale_total <= 40,
+        "有 {stale_total} 处「写 wN 之后读 xN、中间未写 xN」的陈旧读（样例 {stale:?}）。\
+         修复前 material_3_demo 是 3590 处 / 1135 个函数，修复后 16 处；\
+         写 wN 时必须补一条 `xN = wN & 0xffffffff` 别名赋值"
+    );
+    println!(
+        "w/x 寄存器别名: {w_writes} 处 w 写入，陈旧 x 读 {stale_total} 处（门槛 40；修复前 material_3_demo 实测 3590）"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 产物里不许出现 `ppmem(`——它是**寄存器名子串误匹配**捏造出来的标识符。
+///
+/// 池加载判定原先写的是 `ops.contains(&rl.pp)`。Dart arm64 的池指针 PP 物理寄存器名是
+/// `x27`，而位移文本 `#0x27` 里**正好含有子串 `x27`**，于是 `stur x17, [x3, #0x27]`
+/// 被误判成池加载、返回 `Expr::Pool(0x27)`：
+///
+/// 1. **store 被当成赋值**，方向反转，`memSet(x3, 0x27, x17)` 这个写**彻底消失**；
+/// 2. `Expr::Pool` 渲染成 `pp[0x27]`，再经出口的 `sanitize_mem_refs` 把 `[..]` 改写成
+///    `mem(..)`，于是产物里出现凭空的 `ppmem(0x27)`；
+/// 3. load 侧丢基址：`ldur x1,[x0,#0x27]` 与二级解引用 `ldur x2,[x1,#0x27]` 渲染成
+///    同一个 `ppmem(0x27)`，双重间接被别名成同一个值。
+///
+/// 修法是改用**词边界匹配**（`contains_word`，与 `replace_word` 同一套边界定义）。
+/// 实测 Reqable（arm64、dart 3.3.4）：`ppmem(` **1411 → 0**，`mem(..., 0x27*)` 恢复
+/// **744 处**，被吞掉的 `memSet(..., 0x27..., ...)` 全部回来；agent 报的原始案例
+/// `Agb.uzd` 从 `x17 = ppmem(0x27);` 变成
+/// `x17 = "autoCapture" /* pp+0x2a608 */; memSet(x3, 0x27, x17);`——顺带把一个此前丢失的
+/// 字符串字面量也恢复了。诊断指纹是「**纯前缀相关**」：16 种 ppmem 偏移全部以 `0x27`
+/// 开头、而 `mem(..., 0x27*)` 零幸存，`mem(PP,0x5270)`/0x26x/0x28x 全正常。
+#[test]
+fn no_register_substring_false_positives_in_output() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 ppmem 门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_ppmem");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut ppmem: Vec<String> = Vec::new();
+    let mut stores = 0usize;
+    let mut loads = 0usize;
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        for line in text.lines() {
+            if line.trim_start().starts_with("//") {
+                continue; // 只看正文语句，不看 raw 反汇编注释
+            }
+            if line.contains("ppmem(") && ppmem.len() < 6 {
+                ppmem.push(line.trim().to_string());
+            }
+            if line.contains("memSet(") {
+                stores += 1;
+            }
+            if line.contains("mem(") {
+                loads += 1;
+            }
+        }
+    }
+    // 非空断言：门禁要真的量到内存访问，否则「0 处 ppmem」是空过
+    assert!(
+        stores >= 50 && loads >= 500,
+        "语料里只解析出 {stores} 个 memSet / {loads} 个 mem —— 分母太小，门禁会空过"
+    );
+    assert!(
+        ppmem.is_empty(),
+        "产物里出现 {n} 处捏造标识符 `ppmem(`（样例 {ppmem:?}）——寄存器名匹配退化成子串匹配了：\
+         PP 的物理名 `x27` 是位移文本 `0x27` 的子串。必须用 contains_word 按词边界匹配",
+        n = ppmem.len()
+    );
+    println!("无寄存器子串误匹配: {stores} 个 memSet / {loads} 个 mem，ppmem 0 处（修复前 Reqable 实测 1411）");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 位测试（`tbz`/`tbnz`）的条件里不许出现 32 位视图 `wN`，必须是同一物理寄存器的 `xN`。
+///
+/// 产物里 `wN` 与 `xN` 是两个独立的 Dart 变量，而编译器**极少**显式写 w 形式：
+/// `blr LR; tbz w0, #4` 里的 w0 是调用返回的 x0 的低半部，全函数只写过 `x0`，
+/// 于是 `w0` 从未被赋值 ⇒ 条件在对 `null` 求值。这是「写 wN 后读 xN」
+/// （见 `w_register_write_aliases_x_register`）的**镜像方向**。
+///
+/// 换成 `xN` 是**可证明精确**的、不需要补掩码：`tbz`/`tbnz` 对 w 形式的位号必然 ≤ 31，
+/// 而对 k < 32，`wN` 的第 k 位与 `xN` 的第 k 位恒等（`wN` 就是 `xN` 的低 32 位），
+/// 与高位内容、与之前谁写过它都无关。实测 Reqable：这类陈旧读 **1690 → 0**，
+/// 1671 处位测试改为读真正被写入的 `xN`。
+#[test]
+fn bit_test_conditions_use_the_64bit_view() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过位测试门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_tbz");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut w_form: Vec<String> = Vec::new();
+    let mut x_form = 0usize;
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        for line in text.lines() {
+            if line.trim_start().starts_with("//") {
+                continue; // 只看正文语句，不看 raw 反汇编注释
+            }
+            // 位测试的形态固定是 `<reg> & (1 << <k>) == 0` / `!= 0`
+            let Some(i) = line.find("& (1 << ") else { continue };
+            let before = &line[..i];
+            // 取 `& (1 <<` 之前最后一个**非空**字母数字 token 就是被测寄存器。
+            // ⚠️ 不能直接 `.last()`：`if (x0 ` 尾部有空格，split 出来的最后一段是空串
+            // （第一版就是这么写的，结果一处都没匹配上，被自己的防空过断言拦住了）。
+            let reg = before
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .rev()
+                .find(|t| !t.is_empty())
+                .unwrap_or("");
+            if reg.len() < 2 {
+                continue;
+            }
+            let (tag, num) = reg.split_at(1);
+            if !num.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            match tag {
+                "w" => {
+                    if w_form.len() < 6 {
+                        w_form.push(line.trim().to_string());
+                    }
+                }
+                "x" => x_form += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        x_form >= 20,
+        "语料里只找到 {x_form} 处 x 形式位测试——分母太小，门禁会空过"
+    );
+    assert!(
+        w_form.is_empty(),
+        "有 {} 处位测试仍读 32 位视图 `wN`（样例 {w_form:?}）。w 形式在产物里是独立变量、\
+         而机器码几乎从不显式写它 ⇒ 条件在对未赋值的 null 求值。\
+         tbz/tbnz 的位号 ≤ 31，用同一物理寄存器的 xN 是精确等价的",
+        w_form.len()
+    );
+    println!("位测试用 64 位视图: {x_form} 处 xN、0 处 wN（修复前 Reqable 实测 1690 处读 wN）");
     let _ = std::fs::remove_dir_all(&out);
 }

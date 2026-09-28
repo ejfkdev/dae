@@ -136,12 +136,54 @@ fn lift(
         // `SP - #8`、`1 << #0` 这类残留会让 Dart 解析器报 expected_token。
         // 反汇编注释块（raw）保留原样，便于与 asm/ 产物逐字对照。
         let ops = ops_masked.replace('#', "");
-        if matches!(mnem.as_str(), "cmp" | "cmn" | "tst" | "test" | "fcmp" | "fcmpe") {
+        // x86 的浮点比较是 `comisd`/`ucomisd`（SSE），arm64 是 `fcmp`——都不产出目标寄存器，
+        // 只设标志位，所以与 `cmp` 同一处理：不出语句、只记下 (a, b) 供紧随的分支折叠。
+        if matches!(
+            mnem.as_str(),
+            "cmp" | "cmn"
+                | "tst"
+                | "test"
+                | "fcmp"
+                | "fcmpe"
+                | "comisd"
+                | "comiss"
+                | "ucomisd"
+                | "ucomiss"
+        ) {
             let mut it = ops.split(',');
             let a = it.next().unwrap_or("").trim().to_string();
-            let b = it.next().unwrap_or("").trim().to_string();
-            // test/tst 的两个操作数相同 ⇒ 与 0 比较（x86 `test al,al`、arm64 `tst x,x`）
-            let b = if matches!(mnem.as_str(), "test" | "tst") && b == a { "0".to_string() } else { b };
+            let b_raw = it.next().unwrap_or("").trim().to_string();
+            // 第三段是移位修饰（`lsr #32` 去掉 `#` 后是 `lsr 32`）。**丢掉它会让操作数
+            // 错一个数量级**：Dart 写屏障的快路径判定就是 `tst BARRIER, HEAP, lsr #32`。
+            let shift = it.next().unwrap_or("").trim().to_string();
+            // `test`/`tst` 是**位测试**：算的是 `a & b` 并据此设标志位，所以
+            // `tst a, b; b.eq` 的真值是 `(a & b) == 0`，**不是 `a == b`**。
+            // 原来这里只在 `b == a` 时特殊处理（`tst x,x` → `x == 0`），其余情况把
+            // `(a, b)` 原样交给 fold_cond，于是 `b.eq` 渲染成 `a == b` —— 运行期两个
+            // 寄存器几乎不可能全等，写屏障的快/慢路径就此**语义反转**（伪码恒走 else
+            // 去调用屏障 stub）。这不是 condFlag 那种诚实占位，是给出了错的具体表达式。
+            // 实测 Reqable：`if (X == HEAP)` 形态 **436 行**，对应 458 条
+            // `tst …, HEAP, lsr #32`；x86 的 `test eax, 0x20` + `je` 同样中招。
+            let (a, b) = if matches!(mnem.as_str(), "test" | "tst") {
+                if b_raw == a {
+                    // tst x, x ⇔ x == 0（保持原有行为）
+                    (a.clone(), "0".to_string())
+                } else {
+                    let mut bb = b_raw.clone();
+                    // 应用移位修饰；只认得这四种，认不出来就**不猜**、原样保留
+                    let mut sp = shift.split_whitespace();
+                    match (sp.next(), sp.next()) {
+                        (Some("lsr"), Some(n)) => bb = format!("({bb} >> {n})"),
+                        (Some("lsl"), Some(n)) => bb = format!("({bb} << {n})"),
+                        (Some("asr"), Some(n)) => bb = format!("({bb} >> {n}) /* arithmetic */"),
+                        (Some("ror"), Some(n)) => bb = format!("ror({bb}, {n})"),
+                        _ => {}
+                    }
+                    (format!("({a} & {bb})"), "0".to_string())
+                }
+            } else {
+                (a, b_raw)
+            };
             last_cmp = Some((a, b));
             // 比较不单独出**语句行**（紧随的条件分支已经把它表达成 `if (a op b)`），
             // 但必须保留下**地址**：`tbz ...; cmp; b.eq` 这类代码的分支目标常常正落在
@@ -151,13 +193,30 @@ fn lift(
             continue;
         }
         let s = match lift_one(rl, is_arm64, &mnem, &ops, addr) {
-            // csel：条件码先换成 condFlag("cc")，再尝试用上一条 cmp 折成真条件
-            Op::Assign { dst, src: Expr::Text(t) } if mnem == "csel" || mnem == "csinc" => {
+            // csel/cset：条件码先换成 condFlag("cc")，再尝试用上一条 cmp 折成真条件。
+            // `cset`/`csetm` 必须一起列进来：它们是 `csinc`/`csinv` 的别名形式，
+            // 同样依赖上一条 `cmp` 才有语义。漏掉它们的后果不是「少个名字」而是
+            // **语句整条消失**——见 `nest_block` 里 `Expr::Text` 的注释。
+            // 实测 stress2 样例 `Level.get_tag`：`int get rank => this == Level.low ? 0 : 1`
+            // 被 AOT 内联成 `cmp x1, <Level.low>; cset x2, ne`，两条都不出语句，
+            // 产物里只剩 `x2 = x2 << 1`，而 x2 还是上面 `x2 = 4`（插值数组长度）的残值。
+            Op::Assign { dst, src: Expr::Text(t) }
+                if matches!(
+                    mnem.as_str(),
+                    "csel" | "csinc" | "cset" | "csetm" | "cinc" | "cinv" | "cneg"
+                ) || (!is_arm64 && (is_x86_setcc(&mnem).is_some() || is_x86_cmov(&mnem).is_some()))
+                =>
+            {
                 if let (Some((a, b)), Some(cc)) = (&last_cmp, sel_cc(&t)) {
                     // fold_cond 的表是按跳转助记符（`b.eq`/`je`）写的，条件码要先补前缀；
+                    // 前缀按 ISA 取：arm64 是 `b.`，x86 是 `j`（`setne` ↔ `jne`）。
                     // **折不出来时它原样返回**，那就必须保留 condFlag(...)，不能把裸
                     // `eq` 塞回去（`(eq) ? a : b` 过不了分析）。
-                    let as_branch = format!("b.{cc}");
+                    let as_branch = if is_arm64 {
+                        format!("b.{cc}")
+                    } else {
+                        format!("j{cc}")
+                    };
                     let folded = fold_cond(&as_branch, &Some((a.clone(), b.clone())));
                     if folded == as_branch {
                         Op::Assign { dst, src: Expr::Text(t) }
@@ -188,10 +247,25 @@ fn lift(
                 // 自带条件的生成式（`"{a} {op} 0"` 与 `"{} & (1 << {}) {op} 0"`）一定含空格。
                 // 不认得的裸标识符仍走 fold_cond → condFlag，避免把 `if (eq)` 这种
                 // 过不了分析的写法放进产物。
-                let cond = Some(if c.contains(' ') {
-                    c.clone()
-                } else {
+                // 判据是「**长得像不像助记符**」，不是「含不含空格」。
+                //
+                // 原来写的是 `c.contains(' ')`：助记符（`b.eq`/`jne`）从不含空格，而
+                // lift 生成的自带条件表达式（`x2 != 0`、`w1 & (1 << 4) != 0`）一定含空格。
+                // 但还原成语义判断后这个代理判据就失效了——`isSmi(x0)` **不含空格**，
+                // 于是被当成助记符送进 fold_cond，匹配不到就落到兜底
+                // `condFlag("isSmi(x0)")`：信息躲进字符串字面量，**比还原前更糟**
+                // （实测 Reqable 上 1232 处 `& (1 << 0)` 形态确实归零了，但全都变成了
+                // `condFlag("isSmi(...)")`）。
+                //
+                // 直接判形状：助记符只由小写字母和 `.` 组成（`b.eq`/`b.ls`/`jne`/`jle`），
+                // 任何含大写、括号、运算符或空格的都已经不是助记符。
+                let is_mnem = !c.is_empty()
+                    && c.chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch == '.');
+                let cond = Some(if is_mnem {
                     fold_cond(&c, &last_cmp)
+                } else {
+                    c.clone()
                 });
                 last_cmp = None;
                 Op::Branch { cond, target }
@@ -215,9 +289,63 @@ fn lift(
             }
             other => other,
         };
+        // arm64：写 32 位的 `wN` 会把 `xN` 的高 32 位**清零**，两者是同一个物理寄存器的
+        // 两个视图。但产物里 `wN` 与 `xN` 是两个独立的 Dart 变量，于是「先写 wN、后读 xN」
+        // 读到的是 xN 的**旧值**（或从未赋值的值）。实测 material_3_demo：这样的读点
+        // **3 590 处、波及 1 135 个函数（7.6%）**。stress3 样例的 `hashBytes` 里
+        // `w4 = w1 << 5; w6 = w1 >> 27;` 之后 `(x4 | x6)` 读的就是两个陈旧变量——
+        // 而那正是源码的 rotate `((h << 5) | (h >> 27))`。
+        //
+        // 补一条别名赋值把两个视图接上：`xN = wN & 0xffffffff`。
+        // ⚠️ 不能简单把 `wN` 改名成 `xN`——`w4 = w1 + w2` 的真值是
+        // `(w1 + w2) mod 2^32`，改名就丢了截断；也不能只改写入端，那样后续**读** `wN`
+        // 的地方会变成未定义变量。加一条别名语句两头都保住，且 `nest_block` 会把它
+        // 折进后面的表达式，不额外增加可读性负担。
+        let walias: Option<(String, String)> = if is_arm64 {
+            match &s {
+                Op::Assign { dst, .. } => dst.strip_prefix('w').and_then(|n| {
+                    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                        .then(|| (format!("x{n}"), dst.clone()))
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         out.push(Stmt { addr, op: s });
+        if let Some((xd, wn)) = walias {
+            out.push(Stmt {
+                addr,
+                op: Op::Assign {
+                    dst: xd,
+                    src: Expr::Text(format!("{wn} & 0xffffffff")),
+                },
+            });
+        }
     }
     (out, raw)
+}
+
+/// x86 `cmov<cc>` 的条件后缀 → 条件码本身。与 [`is_x86_setcc`] 共用同一张白名单：
+/// 两者的条件编码完全一致，且都只收 `fold_cond` 真能处理的，认不出来就不接管
+/// （继续 `// unmapped`，绝不编 `condFlag("j…")` 这种名字）。
+fn is_x86_cmov(mnem: &str) -> Option<&'static str> {
+    let cc = mnem.strip_prefix("cmov")?;
+    is_x86_setcc(&format!("set{cc}"))
+}
+
+/// x86 `setcc` 的条件后缀白名单 → 条件码本身。
+///
+/// 只收 `fold_cond` 里**确实有对应跳转助记符**的那些（`setne` ↔ `jne`、`setae` ↔ `jae`…），
+/// 这样折出来的条件一定是真比较或明确的 `condFlag("…")`，不会出现 `condFlag("jxyz")`
+/// 这种编造名。不在表里的 `set…` 一律不接管，保持 unmapped 注释。
+fn is_x86_setcc(mnem: &str) -> Option<&'static str> {
+    const CC: [&str; 26] = [
+        "e", "z", "ne", "nz", "l", "b", "nae", "le", "be", "na", "g", "a", "nbe", "ge", "ae",
+        "nb", "s", "ns", "o", "no", "c", "nc", "p", "np", "pe", "po",
+    ];
+    let cc = mnem.strip_prefix("set")?;
+    CC.into_iter().find(|c| *c == cc)
 }
 
 /// 条件选择（csel）的条件码 → Dart 可达的布尔表达式。
@@ -402,6 +530,42 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
     }
     out.push_str(&s[last..]);
     out
+}
+
+/// 反汇编注释块里一行的指令地址（`  0x49e260: csetm x0, eq` → Some(0x49e260)）。
+/// 解析不出来返回 None——调用方据此**保留**该行（不猜）。
+fn line_addr(line: &str) -> Option<u64> {
+    let t = line.trim_start().strip_prefix("0x")?;
+    let i = t.find(':')?;
+    let hex = &t[..i];
+    if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// 把反汇编注释块裁到 `limit` 之前。`lift` 是线性反汇编、地址单调递增，
+/// 所以越界行一定连续出现在**末尾**：找到第一条就截断，不必逐行重建整串。
+fn clip_raw(raw: &mut String, limit: u64) {
+    let mut start = 0usize;
+    while start < raw.len() {
+        let end = match raw[start..].find('\n') {
+            Some(i) => start + i + 1,
+            None => raw.len(),
+        };
+        let over = match line_addr(&raw[start..end]) {
+            Some(a) => a >= limit,
+            None => false,
+        };
+        if over {
+            raw.truncate(start);
+            return;
+        }
+        if end >= raw.len() {
+            return;
+        }
+        start = end;
+    }
 }
 
 /// 寄存器角色（与 asm 导出同源；按平台 profile 取名）
@@ -787,8 +951,20 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         };
     }
     // 池加载：ldr rN, [PP, #off] / mov rN, [PP+off]（x86）
+    //
+    // ⚠️ 必须**按词边界**匹配，不能 `ops.contains(rl.pp)`。Dart arm64 的池指针 PP
+    // 物理寄存器名是 `x27`，而位移文本 `#0x27` 里**正好含有子串 `x27`** ⇒
+    // `stur x17, [x3, #0x27]` 会被误判成池加载，返回 `Expr::Pool(0x27)`：
+    // ① **store 被当成赋值**，方向反转，`memSet(x3, 0x27, x17)` 这个写**彻底消失**；
+    // ② `Expr::Pool` 渲染成 `pp[0x27]`，再经出口的 `sanitize_mem_refs` 把 `[..]`
+    //    改写成 `mem(..)`，于是产物里出现凭空捏造的 **`ppmem(0x27)`**；
+    // ③ load 侧同样丢基址：`ldur x1,[x0,#0x27]` 与二级解引用 `ldur x2,[x1,#0x27]`
+    //    渲染成同一个 `ppmem(0x27)`，双重间接被别名成同一个值。
+    // 实测 Reqable：`ppmem(` **1411 处**，全部 16 种偏移都以 `0x27` 开头、
+    // 而 `mem(..., 0x27*)` **零幸存**（`mem(PP,0x5270)`/0x26x/0x28x 全正常）——
+    // 这个「纯前缀相关」的分布就是子串误匹配的指纹。
     let ppx = rl.pp.to_uppercase();
-    if (ops.contains(&ppx) || ops.contains(&rl.pp))
+    if (contains_word(ops, &ppx) || contains_word(ops, &rl.pp))
         && is_reg(&first) {
             let idx = ops
                 .rfind("#0x")
@@ -854,8 +1030,42 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
         if parts.len() >= 3 {
             let op = if mnem == "tbz" { "==" } else { "!=" };
+            // 被测寄存器是 32 位视图 `wN` 时，改用同一个物理寄存器的 64 位名 `xN`。
+            //
+            // 这是**可证明精确**的，不是近似：`tbz/tbnz` 的位号对 w 形式必然 ≤ 31，
+            // 而对 k < 32，`wN` 的第 k 位与 `xN` 的第 k 位恒等（`wN` 就是 `xN` 的低 32 位），
+            // 与高位是什么、之前谁写过它都无关 ⇒ 不需要补 `& 0xffffffff` 掩码。
+            //
+            // 为什么必须改：产物里 `wN` 与 `xN` 是两个独立的 Dart 变量，而编译器**极少**
+            // 显式写 w 形式——`blr LR; tbz w0, #4` 里的 w0 是调用返回的 x0 的低半部，
+            // 全函数只写过 `x0`，于是 `w0` 从未被赋值，条件在对 `null` 求值。
+            // 实测 Reqable：这类「写 xN 后读 wN」的陈旧读 **1690 处**（w0 占 1291）。
+            // 这是上一轮修的「写 wN 后读 xN」的**镜像方向**；那个方向靠补别名赋值解决，
+            // 这个方向不需要——换成同一个名字就对了。
+            let reg = {
+                let r = parts[0];
+                match r.strip_prefix('w') {
+                    Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                        format!("x{n}")
+                    }
+                    _ => r.to_string(),
+                }
+            };
+            // ⚠️ 这里**刻意不做**「测第 0 位 ⇒ isSmi/isHeapObject」的语义还原。
+            //
+            // 试过，并且是错的：位号相同不代表语义相同。`tagging.heap_object_tag` 确实
+            // 说明「tagged 指针的第 0 位区分 Smi 与 HeapObject」，但 `tbz/tbnz xN, #0`
+            // 也用于**未装箱整数的奇偶测试**——源码 `n.isEven ? 'even' : 'odd'`
+            // 编译出来就是 `tbnz w1, #0`，w1 里是个 int，根本不是指针。
+            // 把它渲染成 `isHeapObject(w1)` 是**编造语义**（testing/stress 样例实测命中：
+            // 产物变成 `if (isHeapObject(w1)) { "odd" } else { "even" }`），
+            // 比原来的 `w1 & (1 << 0) != 0` 更糟——后者朴素但**正确**。
+            //
+            // 要安全地做这个还原，必须先证明「该寄存器此刻持有 tagged 值」，那需要类型或
+            // 数据流信息（产物里全是 `dynamic`，没有）。所以保持位运算原样：
+            // 它是机器真正做的事，读者可以自己判断这是标记测试还是奇偶测试。
             return Op::Branch {
-                cond: Some(format!("{} & (1 << {}) {op} 0", parts[0], parts[1])),
+                cond: Some(format!("{reg} & (1 << {}) {op} 0", parts[1])),
                 target: parse_addr(parts[2]).unwrap_or(0),
             };
         }
@@ -912,6 +1122,91 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
             }
         }
     }
+    // ---- adcs/sbcs：带进位/借位的加减（多精度算术的中间步）----
+    // 进位标志是**跨指令的隐式状态**，产物里没有建模，所以不能写成 `a + b`（那是错的，
+    // 会丢掉进位）。前导里已经声明了 `addCarry`/`subBorrow` 两个占位函数，接上去即可：
+    // 如实说明「这里是一次带进位的加法」，而不猜进位的值。
+    // 这是 material_3_demo 上最后 2 条 unmapped（`adcs`），补完全量产物 unmapped 归零。
+    if is_arm64 && matches!(mnem, "adc" | "adcs" | "sbc" | "sbcs") {
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
+        if parts.len() >= 3 && is_reg(parts[0]) {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!(
+                    "{}({}, {}) /* carry flag not modelled */",
+                    if mnem == "adc" || mnem == "adcs" {
+                        "addCarry"
+                    } else {
+                        "subBorrow"
+                    },
+                    parts[1],
+                    parts[2]
+                )),
+            };
+        }
+    }
+    // ---- x86 inc/dec dst → dst ± 1（不影响 CF，这里只表达算术效果）----
+    if !is_arm64 && (mnem == "inc" || mnem == "dec") {
+        let d = ops.trim();
+        if is_reg(d) {
+            return Op::Assign {
+                dst: reg_name(d),
+                src: Expr::Text(format!(
+                    "{} {} 1",
+                    reg_name(d),
+                    if mnem == "inc" { "+" } else { "-" }
+                )),
+            };
+        }
+    }
+    // ---- x86 cdq/cqo：把 eax/rax 的符号位铺满 edx/rdx（idiv 之前的高半部）----
+    if !is_arm64 && (mnem == "cdq" || mnem == "cqo") {
+        let (hi, lo, bits) = if mnem == "cdq" {
+            ("edx", "eax", 31)
+        } else {
+            ("rdx", "rax", 63)
+        };
+        return Op::Assign {
+            dst: hi.to_string(),
+            src: Expr::Text(format!(
+                "(({lo} >> {bits}) & 1) == 0 ? 0 : -1 /* {mnem}: sign-extend for idiv */"
+            )),
+        };
+    }
+    // ---- x86 cmov<cc> dst, src → dst = cond ? src : dst（与 arm64 csel 同族）----
+    if let Some(cc) = is_x86_cmov(mnem) {
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
+        if parts.len() == 2 && is_reg(parts[0]) {
+            // 条件码包成 condFlag(...)，交给 lift() 的折叠臂用上一条 cmp 折成真条件
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!(
+                    "({}) ? {} : {}",
+                    sel_cond(cc),
+                    parts[1],
+                    reg_name(parts[0])
+                )),
+            };
+        }
+    }
+    // ---- arm64 cinc/cinv/cneg：csinc/csinv/csneg 的别名形式 ----
+    // cinc xd, xn, cond  → xd = cond ? xn+1 : xn
+    // cinv xd, xn, cond  → xd = cond ? ~xn   : xn
+    // cneg xd, xn, cond  → xd = cond ? -xn   : xn
+    if is_arm64 && (mnem == "cinc" || mnem == "cinv" || mnem == "cneg") {
+        let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
+        if parts.len() == 3 && is_reg(parts[0]) {
+            let on = match mnem {
+                "cinc" => format!("{} + 1", parts[1]),
+                "cinv" => format!("~{}", parts[1]),
+                _ => format!("-{}", parts[1]),
+            };
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!("({}) ? {on} : {}", sel_cond(parts[2]), parts[1])),
+            };
+        }
+    }
     // ---- 条件选择 csel dst, a, b, cond → cond ? a : b ----
     if mnem == "csel" || mnem == "csinc" {
         let parts: Vec<&str> = ops.split(',').map(|s| s.trim()).collect();
@@ -939,15 +1234,31 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
         }
     }
     // ---- 浮点：与整数同一套二元渲染 ----
+    // arm64 是三操作数 `fadd d0, d1, d2`；x86 SSE 是**两操作数** `addsd xmm0, xmm1`
+    // （= `xmm0 = xmm0 + xmm1`）。两种形态都要认——x86 的标量浮点算术全走 `*sd`/`*ss`，
+    // 漏掉它们等于把所有 double/float 运算丢成 `// unmapped`。
+    // 实测 hello_3.13.0（x64）未映射 161 行里 mulsd 4 + addsd 2 + subps 1；
+    // T4_blank 34 行里 comisd 5 + mulsd 4 + addsd 2。
     let fbin = match mnem {
-        "fadd" => Some("+"),
-        "fsub" => Some("-"),
-        "fmul" => Some("*"),
-        "fdiv" => Some("/"),
+        "fadd" | "addsd" | "addss" => Some("+"),
+        "fsub" | "subsd" | "subss" => Some("-"),
+        "fmul" | "mulsd" | "mulss" => Some("*"),
+        "fdiv" | "divsd" | "divss" => Some("/"),
         _ => None,
     };
     if let Some(op) = fbin {
         let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
+        // x86 两操作数形态
+        if parts.len() == 2 && is_reg(parts[0]) && is_reg(parts[1]) && !is_arm64 {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!(
+                    "({} {op} {}) /* float */",
+                    reg_name(parts[0]),
+                    reg_name(parts[1])
+                )),
+            };
+        }
         if parts.len() >= 3 && is_reg(parts[0]) {
             return Op::Assign {
                 dst: reg_name(parts[0]),
@@ -1034,12 +1345,35 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
                 }),
             };
         }
-        // cset dst, cond：条件成立取 1
+        // cset dst, cond：条件成立取 1（csetm 成立取全 1）
+        //
+        // ⚠️ 条件码必须走 `sel_cond` 包成 `condFlag("ne")`，不能直接用 `parts[1]`：
+        // 裸条件码不是 Dart 标识符，`(ne) ? 1 : 0` 会报 undefined_identifier。
+        // 包起来之后 `lift()` 的折叠臂才能用 `sel_cc` 把它取回、再用上一条 `cmp`
+        // 折成真条件（`csel`/`csinc` 一直是这么做的，cset 之前漏了）。
         if (mnem == "cset" || mnem == "csetm") && parts.len() >= 2 && is_reg(d) {
             return Op::Assign {
                 dst: reg_name(d),
-                src: Expr::Text(format!("({}) ? {} : 0", parts[1], if mnem == "csetm" { "-1" } else { "1" })),
+                src: Expr::Text(format!(
+                    "({}) ? {} : 0",
+                    sel_cond(parts[1]),
+                    if mnem == "csetm" { "-1" } else { "1" }
+                )),
             };
+        }
+        // x86 setcc dst8：条件成立取 1（arm64 `cset` 的对应物）。
+        // 条件码只认 `fold_cond` 真能处理的白名单，认不出来就**不接管**——
+        // 让它落到 `Op::Other` 的 `// unmapped: setne dl` 注释里（诚实、且计入
+        // unmapped 指标），绝不编一个 `condFlag("j…")` 出来。
+        if !is_arm64 {
+            if let Some(cc) = is_x86_setcc(mnem) {
+                if !parts.is_empty() && is_reg(d) {
+                    return Op::Assign {
+                        dst: reg_name(d),
+                        src: Expr::Text(format!("({}) ? 1 : 0", sel_cond(cc))),
+                    };
+                }
+            }
         }
         // adr：把它当「取本地址」——x64/arm64 都用于取常量标签
         if (mnem == "adr" || mnem == "adrp" || mnem == "lea") && is_reg(d) {
@@ -1118,17 +1452,41 @@ fn lift_one(rl: &Roles, is_arm64: bool, mnem: &str, ops: &str, addr: u64) -> Op 
     if mnem.starts_with("imul") && !ops.contains(',') {
         return Op::Helper(format!("mul({first})"));
     }
-    // ---- 带进位/借位的加减（隐含标志位）：占位调用，别假装是普通加减 ----
-    if mnem == "adc" || mnem == "adcx" {
+    // ---- x86 带进位/借位的加减（隐含标志位）：占位调用，别假装是普通加减 ----
+    //
+    // 必须渲染成**赋值**，不是裸调用。x86 的 `adc rax, rbx` 语义是
+    // `rax = rax + rbx + CF`，原来写成 `Op::Helper("addCarry(rax, rbx)")` 渲染成
+    // `addCarry(rax, rbx);`——**对 rax 的写彻底消失**，后续读 rax 拿到旧值。
+    // 这与本文件里修过的几处是同一类缺陷（结果没有落点）。
+    //
+    // ⚠️ 只有 x86 走这里：arm64 的 `adcs`/`sbcs` 是**三操作数**（`adcs xd, xn, xm`），
+    // 由上面专门的分支处理。原来 `sbcs` 也列在这条 x86 两操作数路径里，于是 arm64 的
+    // `sbcs x0, x1, x2` 被渲染成 `subBorrow(x0, x1)`——**第三个操作数被丢掉**，
+    // 而且 x0 既当目标又当操作数，语义全错。
+    if !is_arm64 && (mnem == "adc" || mnem == "adcx") {
         let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
-        if parts.len() >= 2 {
-            return Op::Helper(format!("addCarry({}, {})", parts[0], parts[1]));
+        if parts.len() >= 2 && is_reg(parts[0]) {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!(
+                    "addCarry({}, {}) /* carry flag not modelled */",
+                    reg_name(parts[0]),
+                    parts[1]
+                )),
+            };
         }
     }
-    if mnem == "sbb" || mnem == "sbcs" || mnem == "sbc" {
+    if !is_arm64 && (mnem == "sbb" || mnem == "sbc") {
         let parts: Vec<&str> = split_operands(ops).iter().map(|s| s.trim()).collect();
-        if parts.len() >= 2 {
-            return Op::Helper(format!("subBorrow({}, {})", parts[0], parts[1]));
+        if parts.len() >= 2 && is_reg(parts[0]) {
+            return Op::Assign {
+                dst: reg_name(parts[0]),
+                src: Expr::Text(format!(
+                    "subBorrow({}, {}) /* borrow flag not modelled */",
+                    reg_name(parts[0]),
+                    parts[1]
+                )),
+            };
         }
     }
     // ---- 浮点取整到整数（arm64 fcvtm* = floor, fcvtp* = ceil）----
@@ -2092,6 +2450,50 @@ const WIDTH_NAMES: &[&str] = &[
 /// 文件前导：伪运行时 + 用到但本文件没定义的标识符声明。
 /// 这一步是「产物能过 `dart analyze`」的关键：寄存器（x0/PP/THR）、跨库调用目标、
 /// 机器层占位函数都不是 Dart 内建名字，不声明就是几万条 undefined_identifier。
+/// 正文起始标记：`render_one_library` 在每个库正文的最前面写这一行，前导声明在它之前。
+/// 合并多个库的输出时用它把「前导」与「正文」切开（见 [`split_rendered`]）。
+pub const BODY_MARKER: &str = "// dae decompiler output -- pseudocode that parses as Dart";
+
+/// 把 `render` 产出的一份文本切成 `(前导声明, 正文)`。找不到标记时返回 `None`——
+/// 调用方应原样保留，不猜、不丢内容。
+pub fn split_rendered(text: &str) -> Option<(&str, &str)> {
+    let k = text.find(BODY_MARKER)?;
+    Some((&text[..k], &text[k..]))
+}
+
+/// 按**合并后的正文**重算一份前导声明。
+///
+/// 为什么需要它：`getclass` / `getmethod` / `decompile` 的一个目标可能命中**多个库**
+/// （混淆过的短类名尤其常见——Reqable 上随机抽 100 个类，**45 个命中 ≥2 个库**），
+/// 而 `render` 是逐库出「前导 + 正文」的，直接拼接就得到多份前导，
+/// `mem`/`memSet`/`gotoLabel` 这些占位函数于是重复定义，产物过不了 `dart analyze`
+/// （`duplicate_definition`）。
+///
+/// 也**不能**「只留第一份前导、丢掉其余」：A 库的前导是按 A 的正文算的，它会把
+/// **B 库定义的函数**声明成 `dynamic X;`（收窄产物里跨库调用就是这么处理的），
+/// 与 B 的 `dynamic X() {}` 撞成 `duplicate_definition`。所以必须重算。
+///
+/// 「已定义的函数名」从正文里扫出来：发射形态固定是 `dynamic NAME() {`（行尾是 `{`），
+/// 而前导里的占位声明是 `… => null;`、变量声明是 `dynamic a, b;`（无括号），都不会误判。
+pub fn dart_preamble_for(bodies: &str) -> String {
+    let mut defined: BTreeSet<String> = BTreeSet::new();
+    for line in bodies.lines() {
+        let Some(rest) = line.strip_prefix("dynamic ") else { continue };
+        if !line.trim_end().ends_with('{') {
+            continue;
+        }
+        let Some(i) = rest.find('(') else { continue };
+        let n = rest[..i].trim();
+        if !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            defined.insert(n.to_string());
+        }
+    }
+    dart_preamble(bodies, &defined)
+}
+
 fn dart_preamble(body: &str, defined: &BTreeSet<String>) -> String {
     let used = identifiers(body);
     let mut vars: Vec<&String> = used
@@ -2261,21 +2663,62 @@ pub fn write(
     libs: &LibGroups,
     out_dir: &Path,
 ) -> Result<DecompileStats, String> {
-    let (files, stats) = render(analyzer, libs)?;
     let dir = out_dir.join("dart");
+    // **流式落盘**：每渲染完一个库就立刻写出去，不再把 505 份文件全攒在 `Vec` 里。
+    // 原来 `render` 返回 `Vec<(文件名, 正文)>`，material_3_demo 上那是 **63.2 MB 常驻**，
+    // 而且 `full = preamble + of` 还会把最大的一份（4.2 MB）再拷一遍。
+    // 反编译器跑在 8 个导出器**之后**，它们 freed 的页没还给 OS，所以这 63 MB 是叠在
+    // 导出高水位上的——实测 `--decompile` 比不带它高 46 MB。
+    //
+    // 目录要**无条件预建**，即使一份 `.dart` 都不产：`hello_2.10.4.exe` /
+    // `hello_2.7.2.exe` 这类只有对象层、没有指令表的快照按设计不产伪代码，
+    // 而 `dart_valid.rs::full_scorecard` 仍然会对每个样本的 `dart/` 目录跑
+    // `dart analyze`（0 文件 0 错误是合法结果，目录不存在才是错误）。
+    // 曾把这行改成「写第一份时由 stream_writer 顺手建」，scorecard 立刻红：
+    // `启动 dart analyze 失败（目录 …/dart）: No such file or directory`。
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 dart 目录失败: {e}"))?;
-    for (name, text) in files {
-        std::fs::write(dir.join(name), text).map_err(|e| format!("写 dart 文件失败: {e}"))?;
-    }
+    let stats = render_into(analyzer, libs, &|name, preamble, body| {
+        use std::io::Write;
+        let mut w = crate::export::stream_writer(&dir, name)?;
+        w.write_all(preamble.as_bytes())
+            .map_err(|e| format!("写 dart 文件失败: {e}"))?;
+        w.write_all(body.as_bytes())
+            .map_err(|e| format!("写 dart 文件失败: {e}"))?;
+        crate::export::finish_writer(w, name)
+    })?;
     Ok(stats)
 }
 
 /// 渲染但不落盘：返回 (文件名, 正文) 列表 + 统计。
-/// 子命令要往 stdout 出伪代码，落盘版本只是它的一层包装。
+/// 子命令要往 stdout 出伪代码，所以这一层仍然收集成 `Vec`；
+/// **落盘走 [`render_into`]，不要走这里**（那会把全部产物常驻内存）。
 pub fn render(
     analyzer: &Analyzer,
     libs: &LibGroups,
 ) -> Result<(Vec<(String, String)>, DecompileStats), String> {
+    // sink 现在要能被多个线程调用（`Sync`），所以收集容器套一层 Mutex。
+    // 这条路径服务的是 stdout 子命令，通常只渲染被选中的少数几个库，锁竞争可以忽略。
+    let files: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let stats = render_into(analyzer, libs, &|name, preamble, body| {
+        let mut full = String::with_capacity(preamble.len() + body.len());
+        full.push_str(preamble);
+        full.push_str(body);
+        files.lock().unwrap().push((name.to_string(), full));
+        Ok(())
+    })?;
+    Ok((files.into_inner().unwrap(), stats))
+}
+
+/// 渲染并把每个库文件交给 `sink(文件名, 前导声明, 正文)`。
+///
+/// 前导声明必须在正文**全部**渲染完之后才能算（要知道用到了哪些标识符、定义了哪些函数），
+/// 但输出顺序是「前导在前、正文在后」——所以 sink 拿到两段、由它决定怎么拼：
+/// 落盘版按序 `write_all` 两次（零拷贝），收集版才需要合成一个 `String`。
+pub fn render_into(
+    analyzer: &Analyzer,
+    libs: &LibGroups,
+    sink: &(dyn Fn(&str, &str, &str) -> Result<(), String> + Sync),
+) -> Result<DecompileStats, String> {
     // `DART_AOT_PROF=1`：分阶段计时。加它是因为 release 构建开了 LTO，
     // `sample` 拿不到 inclusive 归因（除 start 外最高符号只占 0.6%），
     // 靠剖析器猜已经错过两次，所以改成自己量。
@@ -2290,7 +2733,6 @@ pub fn render(
     };
     let is_arm64 = analyzer.platform.arch == "arm64";
     let rl = roles(analyzer);
-    let cs = crate::disasm::build_cs(is_arm64)?;
 
     // 字段名：Field 簇（直接写着）+ 访问器名推断（隐式 getter/setter 的名字）。
     let fctx = {
@@ -2299,19 +2741,6 @@ pub fn render(
     };
     lap("recover_fields", &mut mark);
 
-    let mut files: Vec<(String, String)> = Vec::new();
-    let mut stats = DecompileStats {
-        funcs: 0,
-        blocks: 0,
-        stmts: 0,
-        structured: 0,
-        fallback: 0,
-        unmapped: 0,
-        calls: 0,
-        calls_named: 0,
-    };
-    let mut seen: BTreeSet<u64> = BTreeSet::new();
-    let mut used: BTreeMap<String, u32> = BTreeMap::new();
     // 入口地址 → 显示名（与产物里的函数标题一致，首见生效），供 `bl` 目标命名。
     //
     // ⚠️ 这张表必须按**未筛选的完整函数表**建，不能按传进来的 `libs` 建。
@@ -2373,155 +2802,382 @@ pub fn render(
     let (mut p_lift, mut p_chunks, mut p_cfg, mut p_emit, mut p_pre) =
         (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let mut n_prof_fn = 0usize;
-    for (lib_name, cls_map) in libs {
-        let mut file = if lib_name.is_empty() {
-            "app".to_string()
-        } else {
-            lib_name.clone()
-        }
-        .replace(['/', '$', ':'], "_");
-        if !file.ends_with(".dart") {
-            file.push_str(".dart");
-        }
-        let k = file.to_lowercase();
-        let fname = match used.get(&k) {
-            Some(&n) => {
-                used.insert(k, n + 1);
-                format!("{}_{}.dart", &file[..file.len() - 5], n + 1)
+
+    // ---- 阶段 A（顺序、廉价）：定文件名 + 定「每个入口地址归哪个库渲染」 ----
+    //
+    // 这两件事都是**首见生效**，必须按 `libs` 的原始顺序做，否则产物会变：
+    // - 文件名去重是大小写不敏感的，第二个撞名的库要加 `_2` 后缀；
+    // - 代码共享（Dart 会把相同的 getter 体去重，一个机器码入口被多个 Function 对象引用）时，
+    //   同一个 ep 只由**第一个遇到它的库**发射一次——原先靠跨库的 `seen: BTreeSet` 保证。
+    // 预扫描把归属固定成 `owner: ep → 库序号`，阶段 B 就能按库并行而**输出逐字节不变**。
+    // 成本是 O(函数数) 次哈希插入（material_3_demo 15 082 个）。
+    let mut fnames: Vec<String> = Vec::with_capacity(libs.len());
+    let mut ests: Vec<usize> = Vec::with_capacity(libs.len());
+    let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    {
+        let mut used: BTreeMap<String, u32> = BTreeMap::new();
+        for (ji, (lib_name, cls_map)) in libs.iter().enumerate() {
+            let mut file = if lib_name.is_empty() {
+                "app".to_string()
+            } else {
+                lib_name.clone()
             }
-            None => {
-                used.insert(k, 1);
-                file.clone()
+            .replace(['/', '$', ':'], "_");
+            if !file.ends_with(".dart") {
+                file.push_str(".dart");
             }
-        };
-        // 按本库函数数预估：大的库（如 dart:core）产物可达数百 KB，从 0 长起要 realloc 十几次
-        let n_fns: usize = cls_map.iter().map(|(_, fs)| fs.len()).sum();
-        let mut of = String::with_capacity(n_fns * 768 + 4096);
-        let _ = writeln!(of, "// dae decompiler output -- pseudocode that parses as Dart");
-        let _ = writeln!(of, "// library: {lib_name}");
-        let _ = writeln!(
-            of,
-            "// control flow is structured (if/else + loops) where possible; functions whose"
-        );
-        let _ = writeln!(
-            of,
-            "// control flow could not be structured keep a NOTE header and emit gotoLabel()."
-        );
-        let mut cnt = 0usize;
-        // 同一文件内函数名去重：两个不同入口可能算出同一个名字（同一类的多个匿名闭包），
-        // 而 Dart 里同名定义是编译错误（duplicate_definition）。
-        let mut defined: BTreeSet<String> = BTreeSet::new();
-        for (_cls, funcs) in cls_map {
-            for f in funcs {
-                if f.ep == 0 || !seen.insert(f.ep) {
-                    continue;
+            let k = file.to_lowercase();
+            let fname = match used.get(&k) {
+                Some(&n) => {
+                    used.insert(k, n + 1);
+                    format!("{}_{}.dart", &file[..file.len() - 5], n + 1)
                 }
-                let Some((entry, csize)) = analyzer.code_range(f.idx) else {
-                    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
-                        eprintln!(
-                            "[dbg-dec] skip ep={:#x} cls={:?} m={} idx={}",
-                            f.ep, _cls, f.mangled, f.idx
-                        );
+                None => {
+                    used.insert(k, 1);
+                    file.clone()
+                }
+            };
+            fnames.push(fname);
+            // 正文容量按**代码字节**预估，不按函数个数。
+            //
+            // 原来写的是 `n_fns * 768 + 4096`，而实测 material_3_demo：代码字节共 3.8 MB、
+            // dart/ 产出 63.2 MB ⇒ 膨胀 **≈16.6 字节产物 / 字节机器码**（asm/ 是
+            // 46.3 / 3.8 ≈ 12.2，正好对上 `asm.rs` 里已有的系数 12，互为交叉验证）。
+            // 按个数估只给到 15 082 × 768 = 11.6 MB，**低估 5.4 倍** ⇒ 每个库的 String
+            // 都要翻倍扩容好几次，峰值容量最多是成品的 2 倍。并发渲染时这是按线程数放大的，
+            // 所以估准了在**任何并发度下都省内存**（取 18 略高于 16.6，宁可一次到位）。
+            let mut est: usize = 4096;
+            for (_cls, funcs) in cls_map {
+                for f in funcs {
+                    // 与原来的 `if f.ep == 0 || !seen.insert(f.ep)` 逐字等价：
+                    // `||` 短路 ⇒ ep==0 时**不**占用归属
+                    if f.ep == 0 {
+                        continue;
                     }
-                    continue;
+                    match owner.entry(f.ep) {
+                        std::collections::hash_map::Entry::Occupied(_) => continue,
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(ji as u32);
+                        }
+                    }
+                    // 只估真正会被本库发射的那些（共享入口归第一个认领它的库）
+                    if let Some((_, csize)) = analyzer.code_range(f.idx) {
+                        est += csize as usize * 18 + 96;
+                    }
+                }
+            }
+            ests.push(est);
+        }
+    }
+
+    // ---- 阶段 B（并行）：每线程一个 capstone（它不是 Sync），按库取任务 ----
+    //
+    // 反编译器原先是**单线程**跑完 505 个库的：material_3_demo 上 render 合计 2.49s，
+    // 占整次 `--decompile`（墙钟 3.0s）的绝大部分，而机器有 18 核。各库之间除了阶段 A
+    // 那两项「首见生效」的归属外没有依赖，所以按库并行是安全的。
+    // 并发度 = `n_threads()`（与 asm/callgraph 等导出器同一个口径：核数，上限 8）。
+    //
+    // 反编译的每线程工作集比其它导出器大：前导声明必须在正文渲染完之后才能算
+    // （要知道用到了哪些标识符、定义了哪些函数），所以**一个库的正文必须整份驻留内存**，
+    // 没法流式掉，而库的大小极不均匀（material_3_demo 最大的一份 4.2 MB，505 份共 63.2 MB）。
+    // 实测 material_3_demo（15 082 函数，18 逻辑核 = 6 性能核 + 12 能效核）：
+    //
+    //   并发   墙钟(s)          峰值 RSS(MB)
+    //   串行   2.98–3.05        181–200
+    //   1      3.09             159.7   ← 流式落盘单独的收益
+    //   2      1.83–1.90        175
+    //   3      1.43–1.51        178.7
+    //   4      1.23–1.25        205
+    //   8      **0.96**         206–235  ← 取这档
+    //   12     1.12–1.24        235–241
+    //   18     1.08–1.15        267
+    //
+    // **8 是甜点，再往上两项都变差**：线程数超过性能核之后任务会落到能效核上，
+    // 而共享队列里一个慢线程拿着大库就拖住收尾（12/18 线程反而比 8 慢 0.1–0.3 s），
+    // 内存还按线程数线性涨。所以「默认拉满」在本项目里就是 `n_threads()`，不是核数原值。
+    // 想换档位用 `DAE_DEC_THREADS`（不必改代码重编）。
+    //
+    // ⚠️ 并行**不改变产物一个字节**：文件名与「每个入口地址归哪个库」都在阶段 A
+    // 按原始顺序预先定死，线程只是领取任务。已验：material_3_demo 1011 个文件在
+    // 1/8 线程下 `diff -rq` 完全相同，另 6 个语料与串行版也逐字节一致。
+    let n_threads = std::env::var("DAE_DEC_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(crate::analyzer::n_threads)
+        .min(libs.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let merged: std::sync::Mutex<(DecompileStats, [Duration; 5], usize)> =
+        std::sync::Mutex::new((
+            DecompileStats {
+                funcs: 0,
+                blocks: 0,
+                stmts: 0,
+                structured: 0,
+                fallback: 0,
+                unmapped: 0,
+                calls: 0,
+                calls_named: 0,
+            },
+            [Duration::ZERO; 5],
+            0,
+        ));
+    std::thread::scope(|scope| {
+        for _ in 0..n_threads {
+            scope.spawn(|| {
+                let cs = match crate::disasm::build_cs(is_arm64) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        *err.lock().unwrap() = Some(e);
+                        return;
+                    }
                 };
-                let foff = entry + analyzer.slice_off;
-                if foff as usize + csize as usize > analyzer.data.len() {
-                    continue;
-                }
-                // **带前瞻地反汇编**：code size 常常把函数截在最后一条指令中间
-                // （x64 的多字节 NOP `66 2e 0f 1f 84 00 ..` 只进来前 4 字节时，
-                // capstone 只能吐 `.byte`）。多给 16 字节，再只保留起点在范围内的语句。
-                let look = 16usize;
-                let end = ((foff as usize + csize as usize) + look).min(analyzer.data.len());
-                let code = &analyzer.data[foff as usize..end];
-                let _pt = Instant::now();
-                let (mut stmts, raw) = lift(&cs, &rl, code, entry, is_arm64, &names);
-                if prof { p_lift += _pt.elapsed(); }
-                let limit = entry + csize;
-                stmts.retain(|s| s.addr < limit);
-                if stmts.is_empty() {
-                    if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
-                        eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} entry={entry:#x} csize={csize}", f.mangled, f.ep);
+                loop {
+                    if err.lock().unwrap().is_some() {
+                        break;
                     }
-                    continue;
-                }
-                // 共享尾块（跳进别的函数范围又跳回来）也算本函数的一部分
-                let _pt = Instant::now();
-                let (extra, chunks) = lift_chunks(&cs, analyzer, &rl, &stmts, is_arm64, &names);
-                if prof { p_chunks += _pt.elapsed(); }
-                if !extra.is_empty() {
-                    stmts.extend(extra);
-                    stmts.sort_by_key(|s| s.addr);
-                }
-                let _pt = Instant::now();
-                let blocks = build_blocks(stmts);
-                if prof { p_cfg += _pt.elapsed(); }
-                if prof { n_prof_fn += 1; }
-                stats.stmts += blocks.iter().map(|b| b.stmts.len()).sum::<usize>();
-                stats.blocks += blocks.len();
-                for b in &blocks {
-                    for st in &b.stmts {
-                        if let Op::Call { target: Some(_), resolved, .. } = &st.op {
-                            stats.calls += 1;
-                            if resolved.is_some() {
-                                stats.calls_named += 1;
+                    let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if j >= libs.len() {
+                        break;
+                    }
+                    let (lib_name, cls_map) = &libs[j];
+                    match render_one_library(
+                        analyzer,
+                        &rl,
+                        &fctx,
+                        &names,
+                        &cs,
+                        is_arm64,
+                        prof,
+                        lib_name,
+                        cls_map,
+                        &fnames[j],
+                        ests[j],
+                        &owner,
+                        j as u32,
+                        sink,
+                    ) {
+                        Ok((st, pd, nf)) => {
+                            let mut m = merged.lock().unwrap();
+                            m.0.funcs += st.funcs;
+                            m.0.blocks += st.blocks;
+                            m.0.stmts += st.stmts;
+                            m.0.structured += st.structured;
+                            m.0.fallback += st.fallback;
+                            m.0.unmapped += st.unmapped;
+                            m.0.calls += st.calls;
+                            m.0.calls_named += st.calls_named;
+                            for (a, b) in m.1.iter_mut().zip(pd) {
+                                *a += b;
                             }
+                            m.2 += nf;
+                        }
+                        Err(e) => {
+                            *err.lock().unwrap() = Some(e);
+                            return;
                         }
                     }
                 }
-                let base = dart_ident(
-                    format!(
-                        "{}_{}",
-                        _cls.replace(['.', ':', '&', '<', '>'], "_"),
-                        f.mangled
-                    )
-                    .trim_start_matches('_'),
-                );
-                let mut name = base.clone();
-                let mut k = 2usize;
-                while defined.contains(&name) {
-                    name = format!("{base}_{k}");
-                    k += 1;
-                }
-                defined.insert(name.clone());
-                if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
-                    eprintln!("[dbg-dec] emit ep={:#x} entry={entry:#x} csize={csize} name={name}", f.ep);
-                }
-                let before = of.len();
-                if std::env::var("DART_AOT_DEBUG_DEC").is_ok() && name.contains("get_result") {
-                    eprintln!("[dbg-dec] annotate name={name} cls={_cls:?} map_has={}", fctx.by_class_off.contains_key(&(_cls.to_string(), 0x18)));
-                }
-                let fa = FieldAnnot { class: _cls, ctx: &fctx, rl: &rl };
-                let _pt = Instant::now();
-                emit_function(
-                    &name,
-                    &blocks,
-                    &rl,
-                    &mut of,
-                    &raw,
-                    &chunks,
-                    &mut stats.structured,
-                    &mut stats.fallback,
-                    &fa,
-                );
-                if prof { p_emit += _pt.elapsed(); }
-                // 未映射行只数**发射出去的**：原来的口径统计所有基本块，
-                // 把永远走不到的块也算进去，产物一变就虚高（chunk 之后尤其明显）
-                stats.unmapped += of[before..].matches("// unmapped:").count();
-                cnt += 1;
-            }
+            });
         }
-        stats.funcs += cnt;
-        // 前导声明要在正文全部渲染完之后算（要知道用到哪些标识符、定义了哪些函数）
-        let _pt = Instant::now();
-        let preamble = dart_preamble(&of, &defined);
-        if prof { p_pre += _pt.elapsed(); }
-        let mut full = String::with_capacity(of.len() + preamble.len());
-        full.push_str(&preamble);
-        full.push_str(&of);
-        files.push((fname, full));
+    });
+    if let Some(e) = err.into_inner().unwrap() {
+        return Err(e);
     }
+    let (stats, mpd, mnf) = merged.into_inner().unwrap();
+    p_lift += mpd[0];
+    p_chunks += mpd[1];
+    p_cfg += mpd[2];
+    p_emit += mpd[3];
+    p_pre += mpd[4];
+    n_prof_fn += mnf;
+/// 渲染**一个库**：返回它的前导声明与正文，由调用方决定落盘还是收集。
+///
+/// 从 `render_into` 的主循环里抽出来，是为了让各库能**并行**渲染——见 `render_into`
+/// 阶段 A 的说明：文件名与「每个入口地址归哪个库」都已预先按原始顺序定死，
+/// 所以这里没有任何跨库共享的可变状态（`defined` 是库内函数名去重，天然局部）。
+///
+/// `stats` / `p_*` / `n_prof_fn` 都是本函数内的局部量，由调用方合并；
+/// `cs`（capstone）不是 `Sync`，必须**每线程一个**，所以由调用方传进来。
+#[allow(clippy::too_many_arguments)]
+fn render_one_library(
+    analyzer: &Analyzer,
+    rl: &Roles,
+    fctx: &FieldCtx,
+    names: &BTreeMap<u64, String>,
+    cs: &capstone::Capstone,
+    is_arm64: bool,
+    prof: bool,
+    lib_name: &str,
+    cls_map: &[(String, Vec<crate::analyzer::FuncEntry>)],
+    fname: &str,
+    est: usize,
+    owner: &std::collections::HashMap<u64, u32>,
+    ji: u32,
+    sink: &(dyn Fn(&str, &str, &str) -> Result<(), String> + Sync),
+) -> Result<(DecompileStats, [std::time::Duration; 5], usize), String> {
+    let mut stats = DecompileStats {
+        funcs: 0,
+        blocks: 0,
+        stmts: 0,
+        structured: 0,
+        fallback: 0,
+        unmapped: 0,
+        calls: 0,
+        calls_named: 0,
+    };
+    let (mut p_lift, mut p_chunks, mut p_cfg, mut p_emit, mut p_pre) =
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut n_prof_fn = 0usize;
+    // 容量由 render_into 的预扫描按「代码字节 × 18」算好——见那里的说明
+    let mut of = String::with_capacity(est);
+    let _ = writeln!(of, "// dae decompiler output -- pseudocode that parses as Dart");
+    let _ = writeln!(of, "// library: {lib_name}");
+    let _ = writeln!(
+        of,
+        "// control flow is structured (if/else + loops) where possible; functions whose"
+    );
+    let _ = writeln!(
+        of,
+        "// control flow could not be structured keep a NOTE header and emit gotoLabel()."
+    );
+    let mut cnt = 0usize;
+    // 同一文件内函数名去重：两个不同入口可能算出同一个名字（同一类的多个匿名闭包），
+    // 而 Dart 里同名定义是编译错误（duplicate_definition）。
+    let mut defined: BTreeSet<String> = BTreeSet::new();
+    // 库内 ep 去重（与跨库的 `owner` 一起复刻原来那一个全局 `seen` 的语义）
+    let mut seen_local: BTreeSet<u64> = BTreeSet::new();
+    for (_cls, funcs) in cls_map {
+        for f in funcs {
+            // 与原来的 `if f.ep == 0 || !seen.insert(f.ep)` 等价，拆成两半：
+            // - `owner` 是阶段 A 预扫描定死的**跨库**归属（首见生效，见 render_into）；
+            // - `seen_local` 是**库内**去重。原来那一个 `seen` 同时干这两件事，
+            //   只靠 owner 会漏掉库内重复：同一个库里有两条 FuncEntry 指向同一 ep
+            //   （代码共享在库内也发生，如一批同体 getter）时，两条都会通过归属检查
+            //   而各发射一次。实测 material_3_demo 因此多出 **285 个函数**
+            //   （15 082 → 15 367）。它每个任务独有，并行下无竞争。
+            if f.ep == 0 || owner.get(&f.ep).copied() != Some(ji) || !seen_local.insert(f.ep) {
+                continue;
+            }
+            let Some((entry, csize)) = analyzer.code_range(f.idx) else {
+                if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+                    eprintln!(
+                        "[dbg-dec] skip ep={:#x} cls={:?} m={} idx={}",
+                        f.ep, _cls, f.mangled, f.idx
+                    );
+                }
+                continue;
+            };
+            let foff = entry + analyzer.slice_off;
+            if foff as usize + csize as usize > analyzer.data.len() {
+                continue;
+            }
+            // **带前瞻地反汇编**：code size 常常把函数截在最后一条指令中间
+            // （x64 的多字节 NOP `66 2e 0f 1f 84 00 ..` 只进来前 4 字节时，
+            // capstone 只能吐 `.byte`）。多给 16 字节，再只保留起点在范围内的语句。
+            let look = 16usize;
+            let end = ((foff as usize + csize as usize) + look).min(analyzer.data.len());
+            let code = &analyzer.data[foff as usize..end];
+            let _pt = Instant::now();
+            let (mut stmts, mut raw) = lift(cs, rl, code, entry, is_arm64, names);
+            if prof { p_lift += _pt.elapsed(); }
+            let limit = entry + csize;
+            stmts.retain(|s| s.addr < limit);
+            // raw 注释块要按**同一边界**裁剪。上面那 16 字节前瞻是必要的
+            // （code size 常把函数截在指令中间），但它取到的字节属于紧随其后的
+            // 函数；`stmts` 一直有 retain，raw 漏了 ⇒ 每个函数的注释块尾部都多印
+            // 几条**别人的指令**，读的人会把它算到本函数头上，产物也白白变大。
+            // 实测 sample_arm64 `_Record.get_hashCode`：entry 0x49e12c + size 0x12c
+            // ⇒ 边界 0x49e258，而注释块印到 0x49e264，多出的 `csetm x0, eq`
+            // 属于下一个函数（`dae disasm` 的 IL 到 0x49e254 就结束，可对照）。
+            clip_raw(&mut raw, limit);
+            if stmts.is_empty() {
+                if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+                    eprintln!("[dbg-dec] 空 lift: {_cls}.{} ep={:#x} entry={entry:#x} csize={csize}", f.mangled, f.ep);
+                }
+                continue;
+            }
+            // 共享尾块（跳进别的函数范围又跳回来）也算本函数的一部分
+            let _pt = Instant::now();
+            let (extra, chunks) = lift_chunks(cs, analyzer, rl, &stmts, is_arm64, names);
+            if prof { p_chunks += _pt.elapsed(); }
+            if !extra.is_empty() {
+                stmts.extend(extra);
+                stmts.sort_by_key(|s| s.addr);
+            }
+            let _pt = Instant::now();
+            let blocks = build_blocks(stmts);
+            if prof { p_cfg += _pt.elapsed(); }
+            if prof { n_prof_fn += 1; }
+            stats.stmts += blocks.iter().map(|b| b.stmts.len()).sum::<usize>();
+            stats.blocks += blocks.len();
+            for b in &blocks {
+                for st in &b.stmts {
+                    if let Op::Call { target: Some(_), resolved, .. } = &st.op {
+                        stats.calls += 1;
+                        if resolved.is_some() {
+                            stats.calls_named += 1;
+                        }
+                    }
+                }
+            }
+            let base = dart_ident(
+                format!(
+                    "{}_{}",
+                    _cls.replace(['.', ':', '&', '<', '>'], "_"),
+                    f.mangled
+                )
+                .trim_start_matches('_'),
+            );
+            let mut name = base.clone();
+            let mut k = 2usize;
+            while defined.contains(&name) {
+                name = format!("{base}_{k}");
+                k += 1;
+            }
+            defined.insert(name.clone());
+            if std::env::var("DART_AOT_DEBUG_DEC").is_ok() {
+                eprintln!("[dbg-dec] emit ep={:#x} entry={entry:#x} csize={csize} name={name}", f.ep);
+            }
+            let before = of.len();
+            if std::env::var("DART_AOT_DEBUG_DEC").is_ok() && name.contains("get_result") {
+                eprintln!("[dbg-dec] annotate name={name} cls={_cls:?} map_has={}", fctx.by_class_off.contains_key(&(_cls.to_string(), 0x18)));
+            }
+            let fa = FieldAnnot { class: _cls, ctx: fctx, rl };
+            let _pt = Instant::now();
+            emit_function(
+                &name,
+                &blocks,
+                rl,
+                &mut of,
+                &raw,
+                &chunks,
+                &mut stats.structured,
+                &mut stats.fallback,
+                &fa,
+            );
+            if prof { p_emit += _pt.elapsed(); }
+            // 未映射行只数**发射出去的**：原来的口径统计所有基本块，
+            // 把永远走不到的块也算进去，产物一变就虚高（chunk 之后尤其明显）
+            stats.unmapped += of[before..].matches("// unmapped:").count();
+            cnt += 1;
+        }
+    }
+    stats.funcs += cnt;
+    // 前导声明要在正文全部渲染完之后算（要知道用到哪些标识符、定义了哪些函数）
+    let _pt = Instant::now();
+    let preamble = dart_preamble(&of, &defined);
+    if prof { p_pre += _pt.elapsed(); }
+    sink(fname, &preamble, &of)?;
+
+    Ok((
+        stats,
+        [p_lift, p_chunks, p_cfg, p_emit, p_pre],
+        n_prof_fn,
+    ))
+}
+
     if prof {
         let tot = prof_t_main.elapsed().as_secs_f64();
         eprintln!(
@@ -2529,6 +3185,9 @@ pub fn render(
             "主循环(lift+结构+渲染)",
             tot
         );
+        // ⚠️ 各阶段是**跨线程累加的 CPU 时间**，而「主循环」是墙钟，所以并行渲染下
+        // 下面的百分比会超过 100%（实测 lift 271% / emit 357%）——那是并发度的体现，
+        // 不是计时错乱。想看单线程口径就 `DAE_DEC_THREADS=1`。
         for (l, d) in [
             ("  ├ lift (反汇编+IR)", p_lift),
             ("  ├ lift_chunks (共享尾块)", p_chunks),
@@ -2545,7 +3204,7 @@ pub fn render(
         eprintln!("[prof]   函数数={n_prof_fn}");
         eprintln!("[prof] {:<28} {:>8.2}s", "render 合计", t0.elapsed().as_secs_f64());
     }
-    Ok((files, stats))
+    Ok(stats)
 }
 // ---------------------------------------------------------------- 字段名恢复
 //
@@ -3763,6 +4422,30 @@ fn sanitize_mem_refs(text: &str) -> String {
     t
 }
 
+/// `needle` 是否作为**完整的词**出现在 `haystack` 里（两侧都不是标识符字节）。
+///
+/// 寄存器名判定一律要用它，不能用 `contains`：`x27` 是 `0x27` 的子串、`x1` 是 `x17`
+/// 的子串，裸子串匹配会把位移文本和更长的寄存器名误判成短名（`ppmem` 那个 bug
+/// 就是这么来的，见池加载分支的注释）。与 `replace_word` 同一套边界定义。
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let b = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    let mut i = 0usize;
+    while i + nb.len() <= b.len() {
+        if b[i..].starts_with(nb)
+            && (i == 0 || !is_word_byte(b[i - 1]))
+            && (i + nb.len() >= b.len() || !is_word_byte(b[i + nb.len()]))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// 寄存器名里的 `.` 会让 Dart 把它读成成员访问：`v2.2d = min(v9.2d, v5.2d);`
 /// 会解析成 `v2 . 2d = ...`。arm64 的 SIMD 车道写法统一收敛成 `v2_2d`。
 fn sanitize_regs(text: &str) -> String {
@@ -3912,10 +4595,40 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                         if d < NEST_MAX_DEPTH {
                             mem_read(rl, &subst_regs(m, &pending, rl))
                         } else {
+                            // 折不动 ⇒ **先落地**。见下面 `Expr::Text` 分支的说明：
+                            // 留在 pending 里的值会被后续同 dst 赋值覆盖而彻底消失。
+                            flush(&mut pending, &mut out, st.addr);
                             mem_read(rl, m)
                         }
                     }
-                    Expr::Text(x) => x.clone(),
+                    // `Expr::Text` 也必须替换待定值，否则**定义会被静默吞掉**：
+                    // pending 按 dst 建键，`x2 = (condFlag("ne")) ? 1 : 0` 之后紧跟
+                    // `x2 = (x2 << 1)` 时，`insert` 直接覆盖旧条目，而新文本里的 `x2`
+                    // 又没被替换 ⇒ 前一条既不落地、也不参与折叠，产物里凭空少一行，
+                    // 剩下的 `x2 = x2 << 1` 引用的是一个从未在本函数赋过值的 x2。
+                    // 与 `Expr::Mem` 分支同构（同样受 NEST_MAX_DEPTH 限制）。
+                    Expr::Text(x) => {
+                        let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
+                        if d < NEST_MAX_DEPTH {
+                            subst_regs(x, &pending, rl)
+                        } else {
+                            // 折不动 ⇒ **先落地**，不能就这么把旧值留在 pending 里。
+                            //
+                            // `NEST_MAX_DEPTH` 只是可读性约束（别产出一行读不完的长表达式），
+                            // 但「跳过替换」的副作用是致命的：pending 按 dst 建键，后面任何
+                            // 一条同 dst 的赋值都会 `insert` 覆盖掉它，于是那个值**既没折进
+                            // 读者、也没单独落地**，凭空消失。
+                            //
+                            // 实测 sample_arm64 `BigIntImpl.get_hashCode`：
+                            // `csetm r5,eq; and r5,r5,BARRIER; add r5,r5,r17; asr r4,r5,#1`
+                            // 到 `asr` 那步深度已达 3、替换被跳过，紧接着
+                            // `ldur r5,[r2,#0xf]` 覆盖 pending[r5]，于是产物只剩
+                            // `x4 = x5 >> 1`——整条哈希计算（含那个三元式）全丢。
+                            // 落地之后是两三条短语句，比一行 110 字符的嵌套更好读。
+                            flush(&mut pending, &mut out, st.addr);
+                            x.clone()
+                        }
+                    }
                 };
                 let depth = pending.get(dst).map(|(_, d, _)| *d).unwrap_or(0) + 1;
                 pending.insert(dst.clone(), (text, depth, st.addr));
@@ -3966,7 +4679,18 @@ fn subst_regs(text: &str, pending: &BTreeMap<String, (String, usize, u64)>, rl: 
         if e == n {
             continue;
         }
-        // 纯寄存器别名（如 FP = SP）不做替换：语义等价但可读性更差
+        // 纯寄存器别名（如 FP = SP）不做替换：语义等价但可读性更差。
+        //
+        // ⚠️ 这里**刻意不放过单 token 的立即数**（`0x1cf2` / `-0xa0001`），尽管把它们
+        // 折进去看着更清楚（`mov r17,#0x1cf2; movk r17,#0xd,lsl#16` 现在产出
+        // `x17 = (x17 & 0xffff) | 0xd0000`，读的人得自己算常量）。原因是它会**打破
+        // dart analyze**：伪码里寄存器与占位函数都是 `dynamic`，`dynamic - dynamic`
+        // 的静态类型还是 `dynamic`（什么运算符都能用），而一旦一边换成 `int` 字面量，
+        // `int - dynamic` 的静态类型变成 `num`——`num` 没有 `<<`/`&`/`|`，于是
+        // `((64) - (clz(x0))) << 1` 报 undefined_operator。
+        // 实测 sample_arm64 `Smi.get_bitLength` 与 T4_blank 各命中一处，
+        // `emitted_dart_is_valid` 门禁直接红。要拿到这个可读性收益，得先给伪码
+        // 前导声明一套自洽的类型（让占位函数返回 int 而不是 dynamic），是独立工程。
         if e.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).count() == 1
             && !e.contains('[')
             && !e.contains('+')

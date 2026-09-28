@@ -35,7 +35,6 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
         path: std::path::PathBuf,
         header: String,
         plan: Vec<Plan>,
-        est: usize,
     }
     let mut jobs: Vec<Job> = Vec::new();
     let mut total = 0usize;
@@ -64,7 +63,6 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
         };
         let header = format!("// lib: , url: {lib_name}\n\n");
         let mut plan: Vec<Plan> = Vec::new();
-        let mut est: usize = header.len();
         for (_cls_name, funcs) in cls_map {
             for f in funcs {
                 if f.ep == 0 || !seen.insert(f.ep) {
@@ -85,7 +83,6 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                 {
                     continue;
                 }
-                est += 96 + f.mangled.len() + csize as usize * 12;
                 plan.push(Plan {
                     mangled: f.mangled.clone(),
                     ep: f.ep,
@@ -95,7 +92,7 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
             }
         }
         total += plan.len();
-        jobs.push(Job { path: asm_dir.join(fn_name), header, plan, est });
+        jobs.push(Job { path: asm_dir.join(fn_name), header, plan });
     }
     let acc_plan = t0.elapsed() - acc_build;
 
@@ -125,21 +122,68 @@ pub fn write(analyzer: &Analyzer, libs: &LibGroups, out_dir: &Path) -> Result<us
                         break;
                     }
                     let job = &jobs[i];
-                    let mut of = String::with_capacity(job.est);
-                    of.push_str(&job.header);
-                    for p in &job.plan {
-                        match render_one(analyzer, &cs, &p.mangled, p.ep, p.csize, p.payload)
-                        {
-                            Ok(text) => of.push_str(&text),
-                            Err(e) => {
-                                *err.lock().unwrap() = Some(e);
-                                return;
+                    // **流式写，不在内存里攒整份文件**。
+                    //
+                    // 原来是 `String::with_capacity(job.est)` 攒完再 `fs::write`，两个问题：
+                    // ① `est = 96 + mangled.len() + csize*12` 对 arm64 是**低估约 2 倍**
+                    //    （每 4 字节指令实际渲染成一条机器码注释 + 一条 IL 注释 ≈ 90–100 字符），
+                    //    所以每个 job 都要经历若干次翻倍扩容，峰值容量最多是成品的 2 倍；
+                    // ② 8 个线程循环处理 489 个 job，freed 的页不立刻还给 OS，
+                    //    峰值 RSS 记的是分配高水位。实测 asm 这一个导出器就占 **37.6 MB**
+                    //    （关它 137.6→100.0 MB），而 capstone 每实例只有 ~0.9 MB
+                    //    （`dae disasm` 单函数 42.8 MB vs `dae info` 41.9 MB），
+                    //    最大的 10 个产物文件加起来也才 8.6 MB——都对不上，
+                    //    说明大头是这块缓冲的分配/扩容，不是数据本身。
+                    // 换成固定 256 KB 的 BufWriter 之后，每线程占用与文件大小**无关**。
+                    //
+                    // 字节完全一致：写入顺序与原先逐字相同（header 然后各函数文本）。
+                    // 出错时删掉半成品，保持原先「失败就不留产物」的行为。
+                    use std::io::Write;
+                    let fail = |e: String| {
+                        let _ = std::fs::remove_file(&job.path);
+                        *err.lock().unwrap() = Some(e);
+                    };
+                    let f = match std::fs::File::create(&job.path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            fail(format!("failed to create {}: {e}", job.path.display()));
+                            return;
+                        }
+                    };
+                    let mut w = std::io::BufWriter::with_capacity(256 * 1024, f);
+                    let mut broken = false;
+                    if let Err(e) = w.write_all(job.header.as_bytes()) {
+                        fail(format!("failed to write {}: {e}", job.path.display()));
+                        broken = true;
+                    }
+                    if !broken {
+                        for p in &job.plan {
+                            match render_one(analyzer, &cs, &p.mangled, p.ep, p.csize, p.payload) {
+                                Ok(text) => {
+                                    if let Err(e) = w.write_all(text.as_bytes()) {
+                                        fail(format!(
+                                            "failed to write {}: {e}",
+                                            job.path.display()
+                                        ));
+                                        broken = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    fail(e);
+                                    broken = true;
+                                    break;
+                                }
                             }
                         }
                     }
-                    if let Err(e) = std::fs::write(&job.path, of) {
-                        *err.lock().unwrap() =
-                            Some(format!("failed to write {}: {e}", job.path.display()));
+                    if !broken {
+                        if let Err(e) = w.flush() {
+                            fail(format!("failed to flush {}: {e}", job.path.display()));
+                            return;
+                        }
+                    }
+                    if broken {
                         return;
                     }
                 }
