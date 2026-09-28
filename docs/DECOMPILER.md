@@ -700,7 +700,7 @@ alone does not determine whether it copies up or down. Rendering it as a forward
 guess; and relabelling the prefixes from `// unmapped:` to `// note:` would cut the headline number
 by 85% while adding no information, so that is off the table too.
 
-## Root cause of the lost loop-header stack guard (2026-09-28, diagnosed, not yet fixed)
+## The lost loop-header stack guard (2026-09-28, fixed)
 
 Instrumenting the structurer settled it. A temporary `DAE_DBG_ARM` print at the conditional-branch
 arm fired for blocks 0x4bbdb8 and 0x4bbdc0 of `main` but **never for 0x4bbdac** -- the block that
@@ -733,6 +733,25 @@ after the load (which is why the two statements in the output are 0x64 apart). C
 function (`total`: header 0x4bbe4c, guard `b.ls 0x4bbe84`, back edge `b 0x4bbe4c`), and the handler
 blocks are tail-duplicated (`main` has three copies at 0x4bbe28 / 0x4bbe30 / 0x4bbe38, all
 `bl 0x4c3c40`).
+
+**Fixed.** The discriminator that works is the **shape of the side block**, not loop membership:
+the overflow handler is `bl <stub>; b <fallthrough>`, i.e. its unconditional branch target is exactly
+the header's fallthrough successor (`is_rejoin_side_block`). When that holds, the header's branch is
+a guard, so `loop_shape`'s fallback now enters the body via the fallthrough edge and `seq` emits the
+guard as an `if` at the top of the body.
+
+> ⚠️ The first attempt used "the branch target is outside the loop" and **failed**: the handler jumps
+> *back into* the loop, so loop detection marks it `in_loop`, the predicate was always false, and the
+> change moved 15 other `if`s without touching the target defect. It was reverted. The lesson that
+> made the second attempt succeed: **verify the target instance itself first** -- unchanged structured
+> rates across 7 corpora plus every gate green did *not* show that the first attempt had fixed
+> nothing.
+>
+> Measured: unguarded **113 -> 0**, guarded 758 -> **875**, `if (` 5445 -> 5562 on sample_arm64;
+> structured/unstructured **identical on all 7 corpora** (1060/115, 1047/127, 1051/116, 1063/156,
+> 13947/1135, 1716/92, 1073/115); `dart analyze` 0 errors on full material_3_demo and Reqable
+> exports; non-`dart/` artifacts byte-identical. The empty-`if` ratchet stayed at 109, so those 139
+> lost branch edges are a **different** root cause, not this one. The ratchet ceiling is now 0.
 
 **The fix has to distinguish "header's branch is the loop condition" from "header's branch is an
 ordinary guard"**, and the natural discriminator is already available: `self.loops.get(&b)` yields the

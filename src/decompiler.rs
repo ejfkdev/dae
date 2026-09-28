@@ -4119,6 +4119,25 @@ impl<'a> Structurer<'a> {
             if let Some(&(_, exit)) = self.loops.get(&b) {
                 let (cond, body_entry) = self.loop_shape(b);
                 let mut body = self.body_lines(b);
+                // 头块那条指向「立即汇合侧块」的条件分支要在 body 顶部补发成守卫 `if`：
+                // 下面的 `continue` 会跳过整个 Branch match，否则它凭空消失
+                // （栈溢出 stub 于是从「仅 SP<=BARRIER 时调用」变成每圈无条件调用）。
+                // stop 取 body_entry：侧块的形态是 `bl <stub>; b <落空块>`，遇到它就收尾。
+                // 放在 `loop_stack.push(b)` **之前**——侧块在循环上下文之外。
+                if let Some(Op::Branch { cond: Some(gc), target }) = self.term(b) {
+                    if let (Some(ti), Some(fi)) =
+                        (self.idx.get(&target).copied(), self.succ(b, 1))
+                    {
+                        if ti != body_entry && self.is_rejoin_side_block(ti, fi) {
+                            let then = self.seq(ti, Some(body_entry), depth + 1);
+                            body.push(Node::If {
+                                cond: gc.clone(),
+                                then,
+                                els: vec![],
+                            });
+                        }
+                    }
+                }
                 self.loop_stack.push(b);
                 body.extend(self.seq(body_entry, Some(b), depth + 1));
                 self.loop_stack.pop();
@@ -4301,6 +4320,21 @@ impl<'a> Structurer<'a> {
     }
 
     /// 循环形状：条件来自头块的终结分支（true 支在体内 ⇒ while(cond)；否则 while(true)）
+    /// `t` 是否是一个**立即重新汇合**到 `rejoin` 的侧块：它的终止符是一条无条件跳转、
+    /// 且目标正好是 `rejoin`。
+    ///
+    /// 这是识别「循环头的守卫」的局部判据，**不依赖循环归属**——上一版用
+    /// `in_loop[target] != Some(h)` 判别失败了，因为 Dart 的 out-of-line 栈溢出处理块
+    /// 形态是 `bl <stub>; b <落空块>`，它**跳回循环内**，于是被循环检测标成 in_loop，
+    /// 判据恒假。改成看形状之后就不受归属影响了。
+    fn is_rejoin_side_block(&self, t: usize, rejoin: usize) -> bool {
+        matches!(
+            self.term(t),
+            Some(Op::Branch { cond: None, target })
+                if self.idx.get(&target).copied() == Some(rejoin)
+        )
+    }
+
     fn loop_shape(&self, h: usize) -> (Option<String>, usize) {
         match self.term(h) {
             Some(Op::Branch { cond: Some(c), target }) => {
@@ -4310,7 +4344,19 @@ impl<'a> Structurer<'a> {
                 let outside = fi.filter(|t| self.in_loop.get(t) != Some(&h));
                 match (inside, outside) {
                     (Some(inn), Some(_)) => (Some(c), inn),
-                    _ => (None, self.succ(h, 0).unwrap_or(h)),
+                    _ => {
+                        // 头块的条件分支若指向一个**立即汇合回落空块**的侧块，那它不是循环条件
+                        // 而是守卫（Dart 的循环头就是栈溢出检查：`ldr BARRIER,[THR,#lim];
+                        // cmp SP,BARRIER; b.ls <handler>`，而 handler 是 `bl <stub>; b <落空块>`）。
+                        // 此时循环体必须从**落空边**进入；原来一律用 `succ(h,0)`＝分支目标，
+                        // 于是 handler 被当成循环体入口，产物里 `ldr` 后面直接接上 `bl <stub>`
+                        // （两条语句地址相差 0x64），守卫的 `if` 随循环头路径的 `continue` 消失。
+                        let entry = match (ti, fi) {
+                            (Some(t), Some(f)) if self.is_rejoin_side_block(t, f) => f,
+                            _ => self.succ(h, 0).unwrap_or(h),
+                        };
+                        (None, entry)
+                    }
                 }
             }
             _ => (None, self.succ(h, 0).unwrap_or(h)),

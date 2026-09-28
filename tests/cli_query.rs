@@ -1417,8 +1417,15 @@ fn empty_if_without_else_does_not_grow() {
 /// 1007 次加载 / 差值 249，收紧后是 **113 处 / 99 个函数**，且三例的偏移都是 0x48、
 /// 紧跟同一个 stub 地址——宽松判据会把真值淹没在 2 倍多的噪声里。
 ///
-/// 这条门禁**不断言已经修好**，只钉住当前数量。修好之后应当把上限往下调，
-/// 并且调之前先确认下降来自真的补回了守卫。
+/// **已修**（2026-09-28）：根因是 `loop_shape` 的兜底臂返回 `succ(h, 0)`＝**分支目标**，
+/// 于是 out-of-line 的溢出处理块被当成循环体入口，而守卫的 `if` 随循环头路径的 `continue`
+/// 消失。判别「这是守卫而不是循环条件」用的是**侧块形状**——处理块的形态是
+/// `bl <stub>; b <落空块>`，即它的无条件跳转目标正好是头块的落空后继
+/// （`is_rejoin_side_block`）。⚠️ 不能用「目标在不在循环内」判别：处理块跳回循环内，
+/// 会被循环检测标成 in_loop，那个判据恒假（第一版就是这么失败的）。
+/// 实测 sample_arm64：无守卫 **113 → 0**、有守卫 758 → **875**、`if (` 5445 → 5562；
+/// **7 个语料的结构化率逐一完全不变**，material_3_demo 与 Reqable 全量 `dart analyze` 0 错误，
+/// 非 `dart/` 产物逐字节一致。上限因此收到 0。
 #[test]
 fn stack_check_guards_do_not_regress() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1434,8 +1441,9 @@ fn stack_check_guards_do_not_regress() {
     let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
     assert_eq!(rc, 0, "全量导出失败: {se}");
 
-    // 2026-09-28 sample_arm64 实测：113 处 / 99 个函数；守卫形态 758 处
-    const CEIL_UNGUARDED: usize = 113;
+    // 2026-09-28 修复前 sample_arm64 实测 113 处 / 99 个函数；**修复后为 0**（守卫 758 → 875）。
+    // 上限收到 0：缺陷已修，这条门禁从此强制「不许再出现」。
+    const CEIL_UNGUARDED: usize = 0;
     /// 未命名 stub 调用：`sub_0x4c3c40();`
     fn is_stub_call(t: &str) -> bool {
         let Some(h) = t.strip_prefix("sub_0x") else { return false };
@@ -1501,8 +1509,9 @@ fn stack_check_guards_do_not_regress() {
         guarded >= 300,
         "只解析出 {guarded} 个 `if (SP <= BARRIER)` 守卫——判据大概没匹配上         （sample_arm64 实测 758），无守卫计数不可信"
     );
+    // 上限已是 0，对 usize 而言 `<=` 与 `==` 等价（clippy: absurd_extreme_comparisons）
     assert!(
-        unguarded <= CEIL_UNGUARDED,
+        unguarded == CEIL_UNGUARDED,
         "无守卫的栈检查从 {CEIL_UNGUARDED} 涨到 {unguarded}（{fns_hit} 个函数，样例 {examples:?}）——         结构化器丢了更多 `cmp SP, BARRIER; b.ls`，溢出 stub 变成无条件调用"
     );
     println!(
