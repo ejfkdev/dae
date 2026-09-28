@@ -671,6 +671,35 @@ in `text/fields.txt` suggests it depends on the decompiler's instruction lifter,
 `tests/field_names.rs` checks that the two routes agree and that every annotation exists in the
 table -- it does **not** check that the row set is stable, so a lift change can silently move it.
 
+## Two backlog items re-examined and deliberately left alone (2026-09-28)
+
+Both were listed as "found, not fixed". Looking closely, neither is a naming or rendering tweak, and
+guessing at either would trade a self-consistent reading for an unprovable one -- the same mistake as
+the reverted `isSmi` restoration.
+
+**Post-index stack slots are not mis-named; they need SP tracking.** The pair
+
+```
+str q0, [SP, #-0x10]!   ->  local_m10 = q0      (pre-index: SP -= 0x10, then store)
+ldr q0, [SP], #0x10     ->  q0 = local_0        (post-index: load at SP, then SP += 0x10)
+```
+
+looks inconsistent, and at the machine level both touch the same slot. But dae names a slot by the
+displacement **inside the brackets**, and `[SP]` has none, so `local_0` is self-consistent with that
+model. Making the two names agree requires tracking SP across instructions (pre-index decrements,
+post-index increments) -- real state, not a rename. Until that exists, forcing the names to match
+would be a guess presented as a fact. 51 functions on material_3_demo show the pattern.
+
+**The remaining x64 `unmapped` lines are prefixes and string ops, and my earlier count was wrong.**
+The enumeration split on whitespace, so the 61 rows reported as `rep` were already capstone's
+*combined* form `rep movsb mem(rdi), mem(rsi)` -- one unrecognised operation, not a bare prefix. The
+142 remaining on hello_3.13.0 are therefore 61 string ops + 30 `std` + 30 `cld` + 3 `lock` + a few
+`mul rdx` / `shld` / `shrd` / `or mem(...), reg` / `bsr`. Restoring a string op needs the
+**direction flag**: `std; rep movsb; cld` is the fixed idiom for a backwards copy, so `rep movsb`
+alone does not determine whether it copies up or down. Rendering it as a forward `memcpy` would be a
+guess; and relabelling the prefixes from `// unmapped:` to `// note:` would cut the headline number
+by 85% while adding no information, so that is off the table too.
+
 ## Known gaps (measured, not fixed)
 
 * **Statement order does not follow address order**: 21,826 sites = **2.74% of statements**,
