@@ -1591,3 +1591,65 @@ fn post_index_stack_slots_do_not_regress() {
     println!("post-index 槽位棘轮: local_0 {n} / 上限 {CEIL_LOCAL0}（local_* 引用共 {slots}）");
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// `dae disasm <binary> 0xADDR` 必须能反汇编**未命名的 stub**，并且对两个表都不认识的地址
+/// **报错而不是猜一个窗口长度**。
+///
+/// 为什么这条能力是必需的：占直接调用 **54%** 的目标是未命名 stub（material_3_demo 实测
+/// 42 759 个 `sub_0x…()` 调用点、只有 **346 个不同地址**，其中 89.8% 在 stub 表里）。
+/// stub 没有 Code 对象、从不出现在 `build_functions` 里，所以按名字的路径**结构上够不到它们**
+/// ——在加这条之前，产物里最该看的那部分代码根本无法查看。
+///
+/// 「不猜长度」是硬要求：猜一个窗口会反汇编到**别的字节**上，而输出看起来完全正常
+/// （本项目在快照定位上踩过三次这类「指标全绿但读的是别的代码」的坑）。
+#[test]
+fn disasm_accepts_address_and_refuses_unknown() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(sample) = corpus(root) else {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 disasm 地址门禁");
+        return;
+    };
+    let s = sample.to_string_lossy().to_string();
+
+    // 取一个真实存在的函数入口地址
+    let (so, se, rc) = run(bin, &["functions", &s]);
+    assert_eq!(rc, 0, "functions 失败: {se}");
+    let entry = so
+        .lines()
+        .find_map(|l| l.split('\t').next())
+        .expect("函数表应至少有一行");
+    assert!(entry.starts_with("0x"), "入口地址形态不对: {entry}");
+
+    // 1) 已知入口：必须出反汇编，且真的有指令行（防空过）
+    let (o1, e1, r1) = run(bin, &["disasm", &s, entry]);
+    assert_eq!(r1, 0, "按地址反汇编已知入口失败: {e1}");
+    assert!(
+        o1.contains("// entry:"),
+        "输出里没有 entry 头：{}",
+        &o1[..o1.len().min(200)]
+    );
+    let insn_lines = o1
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("//") && !t.contains(": 0x") && t[2..].trim_start().starts_with("0x")
+        })
+        .count();
+    assert!(
+        insn_lines >= 1,
+        "按地址反汇编只出了 {insn_lines} 行指令注释——大概没真的反汇编"
+    );
+
+    // 2) 两个表都不认识的地址：必须**非零退出**并说明不猜长度
+    let (o2, e2, r2) = run(bin, &["disasm", &s, "0xdeadbeef00"]);
+    assert_ne!(r2, 0, "未知地址竟然成功了（rc={r2}），说明它在猜窗口长度");
+    let msg = format!("{o2}{e2}");
+    assert!(
+        msg.contains("stub-table") || msg.contains("stub 表"),
+        "错误消息没说明「不在函数表也不在 stub 表」: {msg}"
+    );
+    println!(
+        "disasm 按地址: 已知入口 {entry} 出 {insn_lines} 行指令；未知地址 rc={r2} 且拒绝猜长度"
+    );
+}

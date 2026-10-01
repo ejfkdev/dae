@@ -1689,6 +1689,78 @@ fn cmd_findrefs(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
 #[cfg(feature = "asm")]
 fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     let bin = o.bin("disasm", lang)?;
+    // 位置参数若是 `0x…` 形式的地址，走「按地址反汇编」。
+    //
+    // 这是必需的：占调用目标 **54%** 的是未命名 stub（material_3_demo 实测 42759 个
+    // `sub_0x…()` 调用点、只有 **346 个不同地址**，其中 89.8% 在 stub 表里、没有 Code 对象），
+    // 而 stub 从不出现在 `build_functions` 里 ⇒ 按名字的路径**结构上就够不到它们**，
+    // 于是产物里最该看的那部分代码根本没法查看。
+    //
+    // 长度只从**函数表或 stub 表**取；两个表都没有就报错，**绝不猜一个窗口长度**
+    // （猜长度会反汇编到别的代码上去，而输出看起来完全正常——这类错位本项目踩过三次）。
+    if let Some(addr) = o.rest.first().and_then(|t| {
+        let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))?;
+        if h.is_empty() || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(h, 16).ok()
+    }) {
+        return with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
+            // 1) 函数入口
+            let mut found: Option<(u64, u64, String)> = None;
+            for &(_, idx) in a.func_eps.values() {
+                if let Some((ep, csize)) = a.code_range(idx) {
+                    if ep == addr {
+                        found = Some((ep, csize, format!("function@{ep:#x}")));
+                        break;
+                    }
+                }
+            }
+            // 2) stub 表条目（无 Code 对象；名字可能是空的）
+            if found.is_none() {
+                for (ep, size, name) in crate::export::stubs::stub_rows(a) {
+                    if ep == addr {
+                        let label = if name.is_empty() {
+                            format!("stub@{ep:#x}")
+                        } else {
+                            name
+                        };
+                        found = Some((ep, size, label));
+                        break;
+                    }
+                }
+            }
+            let Some((entry, csize, label)) = found else {
+                return Err(tr(
+                    lang,
+                    &format!(
+                        "disasm: {addr:#x} 既不是函数入口、也不在 stub 表里；不猜窗口长度（猜长度会反汇编到别的字节上，而输出看起来完全正常）"
+                    ),
+                    &format!(
+                        "disasm: {addr:#x} is neither a function entry nor a stub-table entry; not guessing a window (a guessed length disassembles unrelated bytes and still looks plausible)"
+                    ),
+                ));
+            };
+            let (foff, _) = crate::disasm::function_code(a.data, a.slice_off, entry, csize)
+                .ok_or_else(|| "字节超出文件范围".to_string())?;
+            let mut out = String::new();
+            let _ = writeln!(out, "// {label}");
+            let _ = writeln!(
+                out,
+                "// {}: {entry:#x}, {}: {csize}",
+                tr(lang, "入口", "entry"),
+                tr(lang, "字节", "bytes")
+            );
+            let text = if a.platform.arch == "arm64" {
+                let cs = crate::disasm::build_cs(true)?;
+                crate::export::asm::render_one(a, &cs, &label, entry, csize, entry)?
+            } else {
+                crate::decompiler::disasm_text(a, entry, csize, foff)?
+            };
+            out.push_str(&text);
+            emit(&o, &out, lang, "disasm")
+        });
+    }
     let sel = target_sel(&o, "disasm", lang, TargetKind::Any)?;
     with_analyzer(bin, o.sdk.as_deref(), o.platform.as_deref(), s, true, |a, _, _| {
         let sel = apply_scope(a, &o, sel);
@@ -2017,8 +2089,12 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             t("间接调用（blr/call reg）目标运行时才定，按设计不解析，只在末尾报数量。", "Indirect calls (blr / call reg) resolve only at runtime and are not guessed; the count is reported.")
         ),
         "disasm" => format!(
-            "{}\n\n  dae disasm <binary> <CLASS[.method]> [-o FILE]\n\n{}\n{}",
-            t("disasm —— 单个函数（或一个类）的原始反汇编", "disasm -- raw disassembly of one function (or a whole class)"),
+            "{}\n\n  dae disasm <binary> <CLASS[.method] | 0xADDR> [-o FILE]\n\n{}\n{}\n{}",
+            t("disasm —— 单个函数、一个类，或**一个地址**的原始反汇编", "disasm -- raw disassembly of one function, a whole class, or **an address**"),
+            t(
+                "`0x…` 形式按地址反汇编，函数入口与 **stub 表条目**都认——这是看未命名 stub 的唯一途径：stub 没有 Code 对象、不在函数表里，按名字的路径结构上够不到它们。实测 material_3_demo：42 759 个 `sub_0x…()` 调用点只有 **346 个不同地址**、89.8% 是 stub，合计占直接调用的 **54%**。长度只从函数表或 stub 表取，两个表都没有就**报错而不猜窗口长度**。",
+                "A positional `0x...` disassembles by address; function entries and **stub-table entries** are both accepted. This is the only way to look at an unnamed stub: stubs have no Code object and never appear in the function table, so the name-based path structurally cannot reach them. Measured on material_3_demo: 42,759 `sub_0x...()` call sites resolve to only **346 distinct addresses**, 89.8% stubs -- 54% of all direct calls. The length comes only from the function or stub table; an address in neither **errors instead of guessing a window**."
+            ),
             t("arm64 带 blutter 同形的 IL 分组注释（与 asm/ 产物一致）；x64 为纯反汇编。", "arm64 includes the blutter-shaped IL group comments (same as the asm/ artifact); x64 is plain disassembly."),
             t("寄存器已按框架名替换（PP/THR/SP/FP…）。", "Registers are already renamed to framework roles (PP/THR/SP/FP...).")
         ),
