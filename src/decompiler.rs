@@ -2324,31 +2324,41 @@ pub fn disasm_text(
 /// 用途：给「用到但本文件没定义」的名字补声明，让产物能过 `dart analyze`。
 fn identifiers(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let bytes: Vec<char> = text.chars().collect();
+    // **按字节扫，不要 `text.chars().collect::<Vec<char>>()`**。
+    //
+    // 原来先把整份正文收集成 `Vec<char>`：每字符 4 字节，而产物是 ASCII 为主的 UTF-8，
+    // 于是每个库都要做一次 **4 倍体积的分配 + 逐字符拷贝**（material_3_demo 的 dart/
+    // 共 63.2 MB、最大的库 4.2 MB），而且 8 个线程并发渲染时按线程数放大。
+    //
+    // 按字节扫是**语义等价**的：UTF-8 自同步，`"` `'` `//` `/*` `*/` `\` 这些 ASCII 字节
+    // 不可能出现在多字节序列内部，所以跳过注释与字符串字面量的逻辑不受影响；
+    // 而标识符字符本来就全是 ASCII（`dart_ident` 保证），非 ASCII 字节只会走到
+    // 最后的 `i += 1`，与原先逐 char 处理的结果一致。
+    let bytes = text.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
         // 注释
-        if c == '/' && bytes.get(i + 1) == Some(&'/') {
-            while i < bytes.len() && bytes[i] != '\n' {
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if c == '/' && bytes.get(i + 1) == Some(&'*') {
+        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
             i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == '*' && bytes[i + 1] == '/') {
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
             }
             i = (i + 2).min(bytes.len());
             continue;
         }
         // 字符串字面量
-        if c == '\'' || c == '"' {
+        if c == b'\'' || c == b'"' {
             let q = c;
             i += 1;
             while i < bytes.len() && bytes[i] != q {
-                if bytes[i] == '\\' {
+                if bytes[i] == b'\\' {
                     i += 1;
                 }
                 i += 1;
@@ -2360,21 +2370,22 @@ fn identifiers(text: &str) -> BTreeSet<String> {
         // （曾收出 `x5b30`/`x838` 这类幽灵名字塞进声明表）
         if c.is_ascii_digit() {
             while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '.' || bytes[i] == '_')
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'_')
             {
                 i += 1;
             }
             continue;
         }
-        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
-            let mut id = String::new();
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+            let start = i;
             while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '_' || bytes[i] == '$')
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
             {
-                id.push(bytes[i]);
                 i += 1;
             }
-            out.insert(id);
+            // 直接切原文而不是逐字符 push 进一个新 String：一次分配代替增量扩容。
+            // start..i 全是 ASCII 标识符字节，切片必然落在字符边界上。
+            out.insert(text[start..i].to_string());
             continue;
         }
         i += 1;
