@@ -3116,8 +3116,19 @@ fn render_one_library(
                 for st in &b.stmts {
                     if let Op::Call { target: Some(_), resolved, .. } = &st.op {
                         stats.calls += 1;
-                        if resolved.is_some() {
-                            stats.calls_named += 1;
+                        // ⚠️ `resolved.is_some()` **不等于**「解析出了真名字」：名字表给
+                        // 每个指令表入口都兜了一个 `sub_{ep:#x}` 占位（见本文件
+                        // `names.entry(ep).or_insert_with(...)`），所以占位也会让 resolved
+                        // 是 Some。按 `render_op` 的同一判据排除占位——那边也是靠
+                        // 「解析结果是否等于 `sub_{t:#x}`」决定要不要加 `/* 0x… */` 注释。
+                        // 不排除的后果是摘要把具名率报虚高一倍：material_3_demo 上
+                        // 报 82256/86825 = 94.7%，而产物实测只有 36739/79498 = **46.2%**
+                        // （`sub_0x…()` 形式的调用 42759 处）。用前缀判断而不是拼一次
+                        // format! 比对，因为这里是每个调用点都要走的热点。
+                        if let Some(nm) = resolved {
+                            if !nm.starts_with("sub_0x") {
+                                stats.calls_named += 1;
+                            }
                         }
                     }
                 }
