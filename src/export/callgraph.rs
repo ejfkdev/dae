@@ -476,6 +476,110 @@ fn name_alloc_stubs(
 
 /// 对给定地址批量尝试分配 stub 识别——供真值门禁复用（不经过导出管线）。
 /// 返回与输入等长的 (地址, 名字) 列表；识别不出时为 None（不猜）。
+/// 形状解码：**调用约定转换包装**（save-all / restore-all）→ `RuntimeCallStub_0x…`。
+///
+/// 判据完全来自代码、可机械校验，不依赖任何版本相关的常量：
+/// 1. 第 0 条把 `lr` 压栈（`str lr, [SP, #-8]!`）；
+/// 2. 紧随 **≥6 组 `stp`** 把成对寄存器全部压栈（arm64 上是 r0..r5 / r6..r9 / r10..r13 /
+///    r14,r19 / r20,CODE_REG / r24,r25 —— 即**全部**参数寄存器与固定寄存器）；
+/// 3. 结尾 `ret` 之前有 **≥6 组 `ldp`**，且**第一组 stp 的寄存器对 == 最后一组 ldp 的寄存器对**
+///    （严格逆序恢复）。
+///
+/// 没有任何普通 Dart 函数会保存并恢复全部参数寄存器与固定寄存器，所以这个形状唯一对应
+/// 「转出到非 Dart 代码（VM runtime / native）」的包装。**它只声称到这一层**：
+/// 具体是哪一个 runtime entry **不可证**——profile 的 `runtime_offsets` 只有 7 个键，
+/// 不含这个形状里出现的 `THR+0x188` 与 `THR+0x488`，所以名字里保留地址而不猜 entry 名
+/// （判据同撤回 `isSmi` 那次：一个形状对应多个语义时，命名就是编造）。
+///
+/// 实测 material_3_demo：这个形状有 **11 个地址 / 22 847 次调用 = 全部未命名调用的 53%**
+/// （`0x3dc328`×12676、`0x3dc7b0`×5521 等）。42 759 个 `sub_0x…()` 调用点只有 346 个不同地址，
+/// 89.8% 在 stub 表里。
+fn runtime_stub_name(analyzer: &Analyzer, cs: &Capstone, addr: u64, is_arm64: bool) -> Option<String> {
+    if !is_arm64 {
+        return None; // x64 的对应形状（一串 push / pop）尚未取证，不猜
+    }
+    let foff = addr + analyzer.slice_off;
+    let data = analyzer.data;
+    if foff >= data.len() as u64 {
+        return None;
+    }
+    // 窗口取 384 字节：实测这类 stub 是 128 字节，留足余量；越界部分自然截断
+    let end = (foff + 384).min(data.len() as u64);
+    let code = &data[foff as usize..end as usize];
+    let insns = cs.disasm_all(code, addr).ok()?;
+    let v: Vec<_> = insns.iter().collect();
+    let mnem = |i: usize| -> String {
+        v.get(i)
+            .and_then(|x| x.mnemonic())
+            .map(|m| m.to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let ops = |i: usize| -> String {
+        v.get(i).and_then(|x| x.op_str()).unwrap_or("").to_string()
+    };
+    // 1) lr 压栈
+    if mnem(0) != "str" {
+        return None;
+    }
+    let o0 = ops(0);
+    if !(o0.contains("lr") || o0.contains("x30")) || !o0.contains('[') {
+        return None;
+    }
+    // 2) 紧随的连续 stp 组
+    let mut stp: Vec<String> = Vec::new();
+    let mut i = 1usize;
+    while i < v.len() && mnem(i) == "stp" {
+        stp.push(ops(i));
+        i += 1;
+    }
+    if stp.len() < 6 {
+        return None;
+    }
+    // 3) 找到 ret，再往回数连续的 ldp 组
+    let ret_at = (1..v.len()).find(|&k| mnem(k) == "ret")?;
+    let mut ldp: Vec<String> = Vec::new();
+    let mut k = ret_at;
+    // ret 之前允许最多 2 条非 ldp 指令（实测是 `add x15, x15, #8`，弹掉最初压的 lr）。
+    // ⚠️ **不能按操作数里有没有 "sp" 来认这条 add**：Dart 的 arm64 栈指针在 Dart 代码里是
+    // **x15**（SDK constants_arm64.h 的 `R15 = 15; // SP in Dart code.`），capstone 给出的
+    // 操作数是 `x15, x15, #8`，里面根本没有 "sp" 字样——第一版就是这么写的，于是这条 add
+    // 没被跳过、往回的 ldp 收集到 0 组，346 个地址一个都没匹配上。
+    let mut skip = 0u8;
+    while k > 0 && mnem(k - 1) != "ldp" && skip < 2 {
+        k -= 1;
+        skip += 1;
+    }
+    while k > 0 && mnem(k - 1) == "ldp" {
+        k -= 1;
+        ldp.push(ops(k));
+    }
+    if ldp.len() < 6 {
+        return None;
+    }
+    // 镜像校验：第一组 stp 的寄存器对必须等于最后一组 ldp 的寄存器对
+    // 只取 `[` 之前的寄存器部分：`x24, x25, [sp, #-0x10]!` → ["x24","x25"]。
+    // ⚠️ 不能按 `]` 切——那样会把 `[sp, #-0x10` 也当成一个「寄存器」，镜像校验永远不成立
+    // （第一版就是这么写的，346 个地址一个都没匹配上）。
+    let regs = |o: &str| -> Vec<String> {
+        o.split('[')
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    // `ldp` 是从 ret 往回数的，所以 ldp[0] 是**程序序最后**那一条，恰好与 stp[0] 配对
+    // （入口第一组压栈 = 出口最后一组弹回）。第一版取了 ldp[len-1]（那是 `ldp fp, lr`），
+    // 方向反了。
+    let first_stp = regs(&stp[0]);
+    let last_ldp = regs(&ldp[0]);
+    if first_stp.len() < 2 || first_stp != last_ldp {
+        return None;
+    }
+    Some(format!("RuntimeCallStub_{addr:#x}"))
+}
+
 pub fn alloc_stubs_at(analyzer: &Analyzer, addrs: &[u64]) -> Vec<(u64, Option<String>)> {
     let is_arm64 = analyzer.platform.arch == "arm64";
     if !class_layer_usable(analyzer) {
@@ -486,6 +590,13 @@ pub fn alloc_stubs_at(analyzer: &Analyzer, addrs: &[u64]) -> Vec<(u64, Option<St
     };
     addrs
         .iter()
-        .map(|a| (*a, alloc_stub_name(analyzer, &cs, *a, is_arm64)))
+        .map(|a| {
+            (
+                *a,
+                // 先试分配 stub（序言里的 class-id tag 字），认不出再试调用约定转换包装的形状
+                alloc_stub_name(analyzer, &cs, *a, is_arm64)
+                    .or_else(|| runtime_stub_name(analyzer, &cs, *a, is_arm64)),
+            )
+        })
         .collect()
 }

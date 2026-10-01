@@ -1653,3 +1653,108 @@ fn disasm_accepts_address_and_refuses_unknown() {
         "disasm 按地址: 已知入口 {entry} 出 {insn_lines} 行指令；未知地址 rc={r2} 且拒绝猜长度"
     );
 }
+
+/// 零编造校验：`stubs.txt` 里每一个 `RuntimeCallStub_0x…` 名字，都必须能在**该地址的真实
+/// 反汇编**里复核出「保存全部寄存器 / 严格逆序恢复」的形状。
+///
+/// 这条门禁刻意走**独立路径**取证——用 `dae disasm <bin> 0xADDR` 的文本输出重新数一遍
+/// `stp`/`ldp`，不复用 `callgraph::runtime_stub_name` 的代码。否则分类器写错时，
+/// 门禁会用同一段错逻辑自证清白（`alloc_stub_naming` 也是这个套路）。
+///
+/// 判据（与实现同源但独立复核）：≥6 组 `stp` 压栈、≥6 组 `ldp` 弹回、有 `ret`，
+/// 且**第一组 stp 的寄存器对 == 最后一组 ldp 的寄存器对**（镜像）。
+/// 名字里保留地址而**不猜具体是哪个 runtime entry**：形状可证到「调用约定转换包装」这一层，
+/// 但 profile 的 `runtime_offsets` 只有 7 个键、不含该形状里出现的 `THR+0x188`/`THR+0x488`，
+/// 所以再往下命名就是编造（判据同撤回 `isSmi` 那次）。
+#[test]
+fn runtime_call_stub_names_are_provable() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sample = root.join("testing/decompiler_corpus/sample_arm64");
+    if !sample.exists() {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 RuntimeCallStub 门禁");
+        return;
+    }
+    let s = sample.to_string_lossy().to_string();
+    let out = root.join("target").join("cli_query_rtstub");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    let stubs = std::fs::read_to_string(out.join("text/stubs.txt")).expect("stubs.txt 应存在");
+    let mut named: Vec<String> = Vec::new();
+    for line in stubs.lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() >= 4 && c[3].starts_with("RuntimeCallStub_0x") {
+            named.push(c[0].to_string());
+        }
+    }
+    if named.is_empty() {
+        // 该语料可能没有这个形状的 stub；不是失败，但要说明，避免被误读成「验过了」
+        println!("runtime stub 命名: 本语料 0 条（无该形状），门禁未产生断言");
+        let _ = std::fs::remove_dir_all(&out);
+        return;
+    }
+    let regs = |o: &str| -> Vec<String> {
+        o.split('[')
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    let mut bad: Vec<String> = Vec::new();
+    for addr in &named {
+        let (od, _ed, rd) = run(bin, &["disasm", &s, addr]);
+        assert_eq!(rd, 0, "disasm {addr} 失败");
+        let mut stp: Vec<Vec<String>> = Vec::new();
+        let mut ldp: Vec<Vec<String>> = Vec::new();
+        let mut has_ret = false;
+        for line in od.lines() {
+            // 指令行形如 `//     0x8ec5c: stp          x24, x25, [x15, #-0x10]!`
+            // ⚠️ 冒号在**地址之后**，不是 `": 0x"`（第一版按 `": 0x"` 找，一条都没解析到，
+            // 于是把两条正确命名的 stub 全报成不合格）。IL 分组行 `// 0x…: EnterFrame`
+            // 也会走到这里，但它的助记符是大写开头的名字，匹配不上 stp/ldp/ret，无害。
+            let t = line.trim();
+            let Some(t) = t.strip_prefix("//") else { continue };
+            let t = t.trim_start();
+            let Some(t) = t.strip_prefix("0x") else { continue };
+            let Some(k) = t.find(':') else { continue };
+            if t[..k].is_empty() || !t[..k].chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let body = t[k + 1..].trim();
+            let mut it = body.split_whitespace();
+            let m = it.next().unwrap_or("").to_ascii_lowercase();
+            let ops = it.collect::<Vec<_>>().join(" ");
+            match m.as_str() {
+                "stp" => stp.push(regs(&ops)),
+                "ldp" => ldp.push(regs(&ops)),
+                "ret" => has_ret = true,
+                _ => {}
+            }
+        }
+        let mirror = match (stp.first(), ldp.last()) {
+            (Some(a), Some(b)) => a.len() >= 2 && a == b,
+            _ => false,
+        };
+        if stp.len() < 6 || ldp.len() < 6 || !has_ret || !mirror {
+            bad.push(format!(
+                "{addr}: stp={} ldp={} ret={has_ret} mirror={mirror}",
+                stp.len(),
+                ldp.len()
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "有 RuntimeCallStub 名字无法从反汇编复核出「保存全部寄存器/逆序恢复」形状：{bad:?}"
+    );
+    println!(
+        "runtime stub 命名可复核: {} 条全部满足 stp≥6 / ldp≥6 / ret / 首末镜像",
+        named.len()
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}

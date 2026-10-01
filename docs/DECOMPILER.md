@@ -764,6 +764,67 @@ just the gates. `stack_check_guards_do_not_regress` (113) and
 `empty_if_without_else_does_not_grow` (109) are in place to catch the attempt getting worse; if this
 and the empty-`if` defect share the root cause, one fix should lower **both**.
 
+## Naming 31% of the unnamed call targets by provable shape (2026-09-28)
+
+`sub_0x…` call sites were the single largest quality gap: **42 759 of 86 825 direct calls (54%)** on
+material_3_demo. Forensics first, because the answer decides whether this is fixable at all:
+
+* those 42 759 call sites resolve to only **346 distinct addresses**, and **89.8% of them are
+  stub-table entries** (no Code object);
+* the **top 5 addresses account for 59%** of the traffic (`0x3dc328` alone is called 12 676 times);
+* there is **no name source in the snapshot**: the profile has no Stub cluster, `grep` for
+  `stub_name`/`StubNameList` finds nothing, and `ppobjs.rs` writes the literal string `"Stub"` for
+  those pool entries. The only existing mechanism is `alloc_stub_name`, which decodes the class-id tag
+  materialised in an allocation stub's prologue.
+
+So naming can only come from **shape decoding**. Clustering all 346 addresses by their first
+instructions (via the new `dae disasm <bin> 0xADDR`) gives 40 clusters; by call volume the largest is
+**11 addresses / 22 847 calls (53%)** whose shape is:
+
+```
+str  x30, [x15, #-8]!
+stp  x24, x25 / x20, CODE_REG / x19, x14 / x13, x12 / x11, x10 / x9, x8 / x7, x6 / x5, x4 / x3, x2 / x1, x0   (all pushed)
+ldr  x24, [THR, #0x188] ; EnterFrame ; ldr x5, [THR, #0x488] ; ...
+ldp  fp, lr ; ldp x0,x1 ; ... ; ldp x24,x25     (restored in exact reverse order)
+add  x15, x15, #8 ; ret
+```
+
+Saving and restoring **every** argument and pinned register around a frame is not something any
+ordinary Dart function does, so the shape is mechanically checkable and uniquely identifies a
+calling-convention transition wrapper. `runtime_stub_name` requires: `str lr` first, >= 6 consecutive
+`stp`, a `ret`, >= 6 consecutive `ldp` immediately before it, and **the first `stp`'s register pair
+equal to the last `ldp`'s** (the mirror). It names them `RuntimeCallStub_0x<addr>`.
+
+**It stops there on purpose.** Which specific runtime entry it is, is *not* provable: the profile's
+`runtime_offsets` has 7 keys and contains neither `THR+0x188` nor `THR+0x488`, so naming a particular
+entry would be fabrication -- the same line the reverted `isSmi` restoration crossed. The address
+stays in the name so the 11 remain distinguishable.
+
+Only **2 of the 11** addresses pass the strict mirror check on material_3_demo (the other 9 differ in
+some detail); that is the intended behaviour -- naming 2 provably beats naming 11 guessingly. Those 2
+cover **13 316 call sites**, so `sub_0x…` sites drop **42 759 -> 29 443 (-31%)** and the summary's
+named-call count rises 40 485 -> **53 909**.
+
+Verification: `dart analyze` 0 errors on full material_3_demo and Reqable exports; structured /
+unstructured **identical on 5 corpora** (13947/1135, 1060/115, 1047/127, 1063/156, 1716/92); the
+object layer is **byte-identical** to the pre-change binary (`pp.txt`, `objs.txt`, `classes.txt`,
+`functions.txt`, `strings.txt`, `libs.txt`, `arrays.txt`, `maps.txt`, all of `asm/`) on 3.4.0, 3.5.0
+and 3.6.1 -- the **only** file that differs anywhere is `text/stubs.txt`, which is the point. The
+three `regress` archives were updated for that one file after verifying the object layer, and
+`regress_all` is back to 25/25.
+
+Gate `runtime_call_stub_names_are_provable` re-derives the shape **through a different path**: it runs
+`dae disasm <bin> 0xADDR` and re-counts `stp`/`ldp`/`ret`/mirror from the text, so a broken
+classifier cannot certify itself with its own logic (same pattern as `alloc_stub_naming`).
+
+> Two measurement traps hit while building this, both worth recording. (1) `dae stubs` defaults to
+> **200 rows**; the first classification run therefore saw a truncated stub table and concluded
+> "99.4% of targets are in neither table" -- completely wrong. Use `-n`. (2) The shape matcher's first
+> two versions matched **zero** addresses: `regs()` split on `]` so the memory operand was counted as
+> a register, and the `add` before the `ldp` run was recognised by looking for `"sp"` in its operands
+> -- but Dart's arm64 stack pointer inside Dart code is **x15** (`R15 = 15; // SP in Dart code.`), so
+> capstone prints `add x15, x15, #8` and there is no `"sp"` substring anywhere.
+
 ## Known gaps (measured, not fixed)
 
 * **Statement order does not follow address order**: 21,826 sites = **2.74% of statements**,
