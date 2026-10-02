@@ -611,11 +611,34 @@ fn cmd_export(o: Opts, out: &str, decompile: bool, s: &Messages) -> Result<(), S
             analyzer.iso.functions.len(),
         );
         println!(
-            "InstructionsTable: first_entry_with_code={} n_entries={} instr_base(file-offset)={:#x}",
+            "InstructionsTable: first_entry_with_code={} n_entries={} instr_base(file-offset)={:#x} payload_infos={}",
             analyzer.first_entry,
             analyzer.pc_offsets.len(),
-            analyzer.instr_base
+            analyzer.instr_base,
+            analyzer.payload_infos.len()
         );
+        // 覆盖率诊断：指令表里有多少条目能算出 (入口, 长度)，以及**已发布名字却没有函数体**的个数。
+        //
+        // 后者是本项目两次真实缺陷的共同指纹（`code_size` 的 `idx < first_entry` 旧守卫、
+        // 以及 2.12–2.15 的 Instructions 去重导致「下一条」增量为 0），
+        // 两次都表现为 functions.txt 名字齐全而 asm//dart/ 空空如也，
+        // 且**任何形态指标都看不出来**（名字是对的）。门禁 tests/code_coverage.rs 直接断言它为 0。
+        {
+            let n = analyzer.pc_offsets.len();
+            let withrange = (0..n).filter(|&i| analyzer.code_range(i).is_some()).count();
+            let (mut pubfn, mut orphan) = (0usize, 0usize);
+            for f in analyzer.iso.functions.values() {
+                if let Some((_ep, idx)) = analyzer.entry_for(f.code_index) {
+                    pubfn += 1;
+                    if analyzer.code_range(idx).is_none() {
+                        orphan += 1;
+                    }
+                }
+            }
+            println!(
+                "code_range coverage: {withrange}/{n} entries; published_fns={pubfn} name_without_body={orphan}"
+            );
+        }
     }
 
     // 输出目录的绝对路径（不解析软链、不要求已存在，仅把相对路径接到 cwd 上），
@@ -1403,7 +1426,13 @@ fn cmd_objs(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     })
 }
 
-/// `dae stubs <bin> [pattern]`：指令表里没有 Code 对象的条目。三列 `entry \t bytes \t name`。
+/// `dae stubs <bin> [pattern]`：指令表里没有被任何 Function 对象引用的条目。
+/// 三列 `entry \t bytes \t name`。
+///
+/// ⚠️ 口径是「没被 Function 引用」而**不是**「没有 Code 对象」——dae 不检查后者，
+/// 而且 SDK 源码（`app_snapshot.cc`）表明每条表项都对应一个 Code 对象，
+/// 只是 `first_entry_with_code` 之前那些的 Code 被**丢弃**了（入口点照样保留）。
+/// 它们也**不全是 stub**：见 `export/stubs.rs` 顶部与 docs/DECOMPILER.md。
 ///
 /// 名字解不出就是空——**绝不为凑覆盖率编名字**（口径见 `export/stubs.rs` 的模块文档，
 /// 门禁 `alloc_stub_naming` 盯着）。
@@ -1692,7 +1721,7 @@ fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
     // 位置参数若是 `0x…` 形式的地址，走「按地址反汇编」。
     //
     // 这是必需的：占调用目标 **54%** 的是未命名 stub（material_3_demo 实测 42759 个
-    // `sub_0x…()` 调用点、只有 **346 个不同地址**，其中 89.8% 在 stub 表里、没有 Code 对象），
+    // `sub_0x…()` 调用点、只有 **346 个不同地址**，其中 89.8% 在 stub 表里、没有 Function 引用），
     // 而 stub 从不出现在 `build_functions` 里 ⇒ 按名字的路径**结构上就够不到它们**，
     // 于是产物里最该看的那部分代码根本没法查看。
     //
@@ -1728,6 +1757,14 @@ fn cmd_disasm(o: Opts, lang: Lang, s: &Messages) -> Result<(), String> {
                         found = Some((ep, size, label));
                         break;
                     }
+                }
+            }
+            // 3) 子 stub：一个表项里装着多个 32 字节变体（写屏障族），调用方直接 bl 到
+            //    条目**内部**地址。窗口不是猜的——形状校验要求恰好 8 条指令 = 32 字节，
+            //    且该表项的**每一个** 32 字节块都通过同一校验才认（见 write_barrier_sub_stubs）。
+            if found.is_none() {
+                if let Some(name) = crate::export::callgraph::write_barrier_sub_stubs(a).get(&addr) {
+                    found = Some((addr, 32, name.clone()));
                 }
             }
             let Some((entry, csize, label)) = found else {
@@ -2092,8 +2129,8 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             "{}\n\n  dae disasm <binary> <CLASS[.method] | 0xADDR> [-o FILE]\n\n{}\n{}\n{}",
             t("disasm —— 单个函数、一个类，或**一个地址**的原始反汇编", "disasm -- raw disassembly of one function, a whole class, or **an address**"),
             t(
-                "`0x…` 形式按地址反汇编，函数入口与 **stub 表条目**都认——这是看未命名 stub 的唯一途径：stub 没有 Code 对象、不在函数表里，按名字的路径结构上够不到它们。实测 material_3_demo：42 759 个 `sub_0x…()` 调用点只有 **346 个不同地址**、89.8% 是 stub，合计占直接调用的 **54%**。长度只从函数表或 stub 表取，两个表都没有就**报错而不猜窗口长度**。",
-                "A positional `0x...` disassembles by address; function entries and **stub-table entries** are both accepted. This is the only way to look at an unnamed stub: stubs have no Code object and never appear in the function table, so the name-based path structurally cannot reach them. Measured on material_3_demo: 42,759 `sub_0x...()` call sites resolve to only **346 distinct addresses**, 89.8% stubs -- 54% of all direct calls. The length comes only from the function or stub table; an address in neither **errors instead of guessing a window**."
+                "`0x…` 形式按地址反汇编，认三种地址：函数入口、**stub 表条目**、以及**表条目内部的子 stub**（写屏障族：一个 640 字节表项其实是 20 个 32 字节变体，调用方直接 bl 到内部地址，所以两个表都查不到）。这是看未命名 stub 的唯一途径：这些表项没有被任何 Function 对象引用、不在函数表里，按名字的路径结构上够不到它们。窗口长度只从**可证的地方**取——函数表/stub 表给的长度，或形状校验要求的恰好 8 条指令 = 32 字节；三处都不认就**报错而不猜长度**（猜长度会反汇编到别的字节上，而输出看起来完全正常）。",
+                "A positional `0x...` disassembles by address and accepts three kinds: a function entry, a **stub-table entry**, or a **sub-stub inside one** (the write-barrier family: one 640-byte table entry is really 20 32-byte variants, and callers bl straight to the inner addresses, so neither table lists them). This is the only way to look at an unnamed stub: these entries are referenced by no Function object and never appear in the function table, so the name-based path structurally cannot reach them. The window length comes only from somewhere provable -- the function/stub table's own length, or the exactly-8-instructions = 32 bytes that the shape check requires; an address none of the three accepts **errors instead of guessing a window** (a guessed length disassembles unrelated bytes and still looks plausible)."
             ),
             t("arm64 带 blutter 同形的 IL 分组注释（与 asm/ 产物一致）；x64 为纯反汇编。", "arm64 includes the blutter-shaped IL group comments (same as the asm/ artifact); x64 is plain disassembly."),
             t("寄存器已按框架名替换（PP/THR/SP/FP…）。", "Registers are already renamed to framework roles (PP/THR/SP/FP...).")
@@ -2179,11 +2216,14 @@ fn help_for(cmd: &str, lang: Lang) -> String {
         ),
         "stubs" => format!(
             "{}\n\n  dae stubs <binary> [pattern] [-n N] [-o FILE]\n\n{}\n{}\n{}",
-            t("stubs —— 指令表里没有 Code 对象的条目", "stubs -- instruction-table entries with no Code object"),
+            t(
+                "stubs —— 指令表里没有被任何 Function 引用的条目",
+                "stubs -- instruction-table entries not referenced by any Function",
+            ),
             t("列：入口 \\t 字节数 \\t 名字（解不出就留空）", "columns: entry \\t bytes \\t name (empty when unresolved)"),
             t(
-                "AOT 指令表是「stub 前缀 + 有 Code 对象的函数尾巴」两段，functions.txt 只列后者，\n于是「表里有、列表里没有」的条目在外面看不见（实测 x64 语料 1608 条表项 vs 1258 个\n具名函数，缺的 176 条全是 stub）。",
-                "The AOT instructions table is \"stub prefix + functions that have a Code object\";\nfunctions.txt lists only the latter, so the prefix is invisible elsewhere (measured on\nthe x64 corpus: 1608 table entries vs 1258 named functions -- the missing 176 are all\nstubs).",
+                "functions.txt 只列「有 Function 对象引用」的表项，其余的在这里。\n⚠️ 它们**不全是 stub**，也不构成表的前缀：Reqable（first_entry_with_code=48455）里\n有 24932 条（53.4%、8.09 MB）以标准 Dart EnterFrame 序言开头、长度最长 27708 字节，\n是**没有名字的函数体**；同时 7798 条的下标 ≥ first_entry 而 9530 个已命名函数的下标 < 它。\nfirst_entry_with_code==0 的语料（material_3_demo/微博/ChatGLM）里这一比例只有 0.4–1.2%。",
+                "functions.txt lists only the entries a Function object references; this is the rest.\nThey are **not all stubs** and do not form a prefix of the table: on Reqable\n(first_entry_with_code=48455) 24932 of them (53.4%, 8.09 MB) start with a standard Dart\nEnterFrame prologue and run up to 27708 bytes -- they are **unnamed function bodies** --\nwhile 7798 sit at index >= first_entry and 9530 named functions sit below it. On corpora\nwith first_entry_with_code==0 (material_3_demo/Weibo/ChatGLM) that share is only 0.4-1.2%.",
             ),
             t(
                 "名字解不出就是空——**绝不为凑覆盖率编名字**（门禁 alloc_stub_naming 盯着）。",
@@ -2279,7 +2319,7 @@ pub fn help(lang: Lang) -> String {
     let _ = writeln!(h, "{}", t("对象层（与 text/ 里的同名产物同源）：", "Object layer (same source as the text/ artifacts):"));
     row(&mut h, "pp        <binary> [pattern]", t("对象池条目", "object pool entries"));
     row(&mut h, "objs      <binary> [pattern]", t("用户类实例（含字段值）", "user class instances with field values"));
-    row(&mut h, "stubs     <binary> [pattern]", t("指令表里没有 Code 对象的条目", "instruction-table entries with no Code object"));
+    row(&mut h, "stubs     <binary> [pattern]", t("指令表里没有被任何 Function 引用的条目（不全是 stub，见 dae help stubs）", "instruction-table entries no Function references (not all stubs -- see dae help stubs)"));
     let _ = writeln!(h);
 
     let _ = writeln!(h, "{}", t("定点反编译：", "Decompile surgically:"));

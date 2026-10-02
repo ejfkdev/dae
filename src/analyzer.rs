@@ -719,18 +719,50 @@ impl<'a> Analyzer<'a> {
             .collect()
     }
 
-    /// 函数精确大小 = pc_offsets[idx+1] - pc_offsets[idx]；末条退化为 0x200
+    /// 函数精确大小 = 「下一个**严格更大**的 pc_offset」− pc_offsets[idx]；末条退化为 0x200
     /// （对应参考实现 _code_size）。注意这是**从 payload 边界**量的长度；
     /// 多态入口（entry_for 的 eo）要从头部扣掉，故地址相关消费方应改用 code_range。
+    ///
+    /// ⚠️ **`idx < first_entry` 在这里不是排除理由**（与 `entry_for` 一致，见其文档）。
+    /// 曾经这里保留了那个旧守卫，于是「恢复函数名」的那次修复只做了一半：
+    /// `entry_for` 放行了 `idx < first_entry`（名字与入口地址回到 functions.txt），
+    /// 而本函数仍对这些下标返回 0 ⇒ `code_range` 因 `size <= eo` 返回 None ⇒
+    /// **函数体一条也没反汇编/反编译**。指令表里 `first_entry_with_code` 之前的条目
+    /// 只是那些条目的 Code 对象被**丢弃**了（SDK `app_snapshot.cc`：写入侧断言
+    /// `!IsDiscarded || not_discarded_count == 0`，故丢弃的全排在前面，
+    /// `first_entry_with_code` 就是第一个未丢弃者的下标；读取侧对
+    /// `code_index < first_entry_with_code` **照样返回入口点**、只把 Code 换成
+    /// `StubCode::UnknownDartCode()`）。代码字节当然还在、相邻 pc_offset 之差照样是它的长度。
+    /// 实测影响面（`idx<first_entry` / 函数总数）：Reqable 11207/13371＝**83.8%**、
+    /// 飞书 19921/25183＝**79.1%**；而 26 份桌面语料与全部 25 份 regress 存档的
+    /// `first_entry` **都是 0** ⇒ 守卫从不触发、**没有任何既有门禁能看见这个缺陷**
+    /// （与「语料全是 no-dwarf 所以地址错位测不出」同一类盲区）。
+    ///
+    /// ⚠️ **同样地，「下一条」不等于「下一个不同的 offset」**：2.12–2.15 的 AOT 写入器会
+    /// 合并字节相同的 `Instructions`，于是**连续多个表条目共享同一个 pc_offset**，
+    /// 只有 run 的最后一条能靠「下一条」算出长度，前面的全得 0 ⇒ 同一类「有名字没函数体」。
+    /// 实测 hello_2.12.4：174 个 0 增量、最长等值 run 16；73 个地址被 2..16 个函数共享，
+    /// 而共享者**语义上就是同一个函数体**（9 个不同 typed_data 类的 `get_elementSizeInBytes`、
+    /// 16 个 `_isWindows`/`_setupCompleted`/`_enableSocketProfiling` 这类布尔开关 getter、
+    /// 9 个错误类的 `ctor`/`get_stackTrace`）⇒ 去重是事实、不是解码错位。
+    /// 2.16.2 起 zero 增量为 0（Dart 侧不再去重），故本改动对那些版本**恒等**。
+    ///
+    /// 二分的前提是 pc_offsets 非递减：**8 份语料实测有符号增量的负值个数全为 0**
+    /// （2.12.4/2.13.4/2.14.4/2.15.0/2.16.2/3.13.0 + Reqable + 飞书）。
+    /// 越界与荒谬长度仍由 `code_range` 的长度上界拦住：坏数据的失败模式是
+    /// 「照旧返回 None」，不是「反汇编到别的字节上」。
     pub fn code_size(&self, idx: usize) -> u64 {
         let n = self.pc_offsets.len();
-        if (idx as u64) < self.first_entry || idx >= n {
+        if idx >= n {
             return 0;
         }
-        if idx + 1 < n {
-            return self.pc_offsets[idx + 1].saturating_sub(self.pc_offsets[idx]);
+        let po = self.pc_offsets[idx];
+        let j = self.pc_offsets.partition_point(|&x| x <= po);
+        if j < n {
+            self.pc_offsets[j] - po
+        } else {
+            0x200
         }
-        0x200
     }
 
     /// 多态入口偏移 eo（payload 内、真实入口之前的那几个字节的桩）。非多态为 0。
