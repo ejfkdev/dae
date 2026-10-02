@@ -57,7 +57,7 @@ pub enum Cmd {
     Pp(Query),
     /// user class instances with their field values
     Objs(Query),
-    /// instruction-table entries with no Code object
+    /// instruction-table entries no Function object references
     Stubs(Query),
 
     /// method/field name search, optionally scoped to one class

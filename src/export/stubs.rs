@@ -1,13 +1,23 @@
-//! `text/stubs.txt` —— **指令表里没有 Code 对象的条目索引**。
+//! `text/stubs.txt` —— **指令表里没有被任何 Function 对象引用的条目索引**。
 //!
-//! AOT 的指令表是「stub 前缀 + 有 Code 对象的函数尾巴」两段（SDK
-//! `Deserializer::GetCodeByIndex` 的注释：`code_index < first_entry_with_code`
-//! 的条目只有入口点，Code 对象是共享的占位符）。dae 的 `functions.txt` 只列后者，
-//! 于是「表里有、列表里没有」的条目在外面看不见——对拍同类工具时表现为「覆盖率少一截」
-//! （实测 x64 语料 1608 条表项 vs 1258 个具名函数，缺的 176 条全是 stub）。
+//! `functions.txt` 只列「有 Function 对象引用」的表项，于是剩下的在外面看不见——
+//! 对拍同类工具时表现为「覆盖率少一截」（实测 x64 语料 1608 条表项 vs 1258 个具名函数）。
+//! 这个产物把它们如实列出来：入口、字节数、能否解出名字（能解就写，解不出就留空——
+//! **绝不为凑覆盖率编名字**）。
 //!
-//! 这个产物把它们如实列出来：入口、字节数、能否解出分配 stub 的类名（能解就写名字，
-//! 解不出就留空——绝不为凑覆盖率编名字）。
+//! ⚠️ **判据是「没被 Function 引用」，不是「没有 Code 对象」**——后者 dae 并不检查。
+//! 早先的表头与文档都写成「without a Code object (stub prefix)」，两处都不成立，已实测更正：
+//! * **不是前缀**：Reqable（`first_entry_with_code` = 48 455）的 46 723 条里有 **7 798 条
+//!   的下标 ≥ first_entry**，同时有 **9 530 个已命名函数**的下标 < first_entry ⇒ 两类是交错的。
+//! * **不全是 stub**：Reqable 有 **24 932 条（53.4%、合计 8.09 MB）**、飞书有
+//!   **43 195 条（72.3%、14.67 MB）** 以教科书式的 Dart `EnterFrame` 序言开头
+//!   （`stp x29,x30,[x15,#-0x10]!` + `mov x29,x15`），条目长度中位数 180 字节、最长 27 708 字节
+//!   ——**它们是函数体，不是 stub**。而 `first_entry_with_code == 0` 的语料（material_3_demo /
+//!   微博 / ChatGLM）里这一比例只有 **0.4–1.2%**。所以这个现象**只与 `first_entry_with_code > 0`
+//!   相关**，与压缩指针无关（微博/ChatGLM 都是压缩指针、比例却极低）。
+//!   aotopsy 把这一段描述为「discarded Code objects」（`--split-debug-info`/`--obfuscate` 构建），
+//!   并对全部 57 960 条都出反汇编；dae 目前只反编译被 Function 引用的那 11 237 条。
+//!   **这是 dae 在移动端最大的未覆盖代码块，尚未定性、也没有照印成名字**，见 docs/DECOMPILER.md。
 
 use std::io::Write as _;
 use crate::analyzer::Analyzer;
@@ -23,9 +33,10 @@ pub struct StubCounts {
 /// `write`（产物 `text/stubs.txt`）与 `dae stubs`（查询命令）共用这一处，所以两边看到的
 /// 一定是同一批条目、同一套名字。
 pub fn stub_rows(analyzer: &Analyzer) -> Vec<(u64, u64, String)> {
-    // 「没有被任何 Code 对象认领」的表项：直接按 func_eps 的 idx 集合取补集，
-    // 不依赖 first_entry / code_base_ref 的语义（实测那两个字段在本语料上都不指向 stub 段：
-    // base_ref 之前的 167 个 Code 对象其实都是分配 stub，first_entry 却是 0）。
+    // 「没有被任何 Function 对象引用」的表项：直接按 func_eps 的 idx 集合取补集。
+    // ⚠️ 刻意**不**用 first_entry / code_base_ref 的语义去分段——实测那两个字段都不指向
+    // 「stub 段」：base_ref 之前的 167 个 Code 对象其实都是分配 stub；而 Reqable 的
+    // first_entry=48 455 两侧**都**同时含有已命名函数与未被引用的表项（9 530 / 7 798）。
     let claimed: std::collections::BTreeSet<usize> =
         analyzer.func_eps.values().map(|(_, idx)| *idx).collect();
     let mut rows: Vec<(u64, u64)> = Vec::new();
@@ -66,7 +77,7 @@ pub fn write(analyzer: &Analyzer, out_dir: &Path) -> Result<StubCounts, String> 
     let mut of = crate::export::stream_writer(&out_dir.join("text"), "stubs.txt")?;
     let _ = writeln!(
         of,
-        "// instruction-table entries without a Code object (stub prefix): {}",
+        "// instruction-table entries not referenced by any Function (stubs and, on some builds, unnamed function bodies): {}",
         rows.len()
     );
     let mut named = 0usize;
