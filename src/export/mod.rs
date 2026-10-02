@@ -2,7 +2,7 @@
 //! r2_script/addNames.r2、ida_script/addNames.py、frida.js、asm/、pp.txt、objs.txt
 //! （另附 r2/ida 共用的 Dart 结构头 r2_dart_struct.h / ida_dart_struct.h）。
 //!
-//! 与 Python 参考实现的四处有意修正（README 有说明）：
+//! 与 Python 参考实现的六处有意修正（README 有说明）：
 //! 1. addNames.r2 的 Library()/Class() 编号正确自增（参考实现漏了自增）；
 //! 2. addNames.r2 的 app.base 取容器 __TEXT 段 VM 地址（参考实现硬编码 0x106484000）；
 //! 3. frida 模板的 PointerCompressedEnabled/CompressedWordSize/HeapAddressReg 按 Profile 重写；
@@ -10,6 +10,23 @@
 //!    对 macOS/安卓、压缩/非压缩指针的产物都印同一个数）。blutter 是算出来的
 //!    （`raw_addr - app.heap_base()`），dae 既不重建 image 布局也没有 heap_base，
 //!    算不出来就如实写 unavailable——见 `tests/cli.rs::pp_header_is_not_fabricated`。
+//! 5. 平台 profile 的 `register_aliases` 把 `CODE_REG` 标在 **x23**，而同一份 profile 的
+//!    `registers.code_reg` 是 **x24**——参考实现（`dart_aot_export.py` 同一行）就是这么写的，
+//!    dae 原样继承了。SDK `runtime/vm/constants_arm64.h` 从 2.12.4 到 3.13.0 **每一版**都是
+//!    `const Register CODE_REG = R24;`，而 R23 只是 `kAbiPreservedCpuRegs` 里一个**没有名字角色**
+//!    的普通被保留寄存器。渲染用的是别名表，所以每一份 arm64 产物都在错标：
+//!    material_3_demo 实测 asm/ 里 1010 处、dart/ 里 3014 处把 x23 印成 `CODE_REG`，
+//!    同时真正的 CODE_REG（x24）被印成裸 `r24`/`x24`（asm/ 559 处、dart/ 2834 处）。
+//!    旁证两条：`non_field_base` 里列的是 x24（CODE_REG 永远不是对象指针）而没有 x23；
+//!    而 `ldr x24, [THR, #<某个 *_stub 字段>]` 正是「把本 stub 的 Code 对象装进 CODE_REG」，
+//!    修完之后这一行读起来才自洽。见 `tests/cli.rs::platform_register_aliases_are_self_consistent`。
+//! 6. 同一行还写着 `"x18": "ARG2"`，而 **`ARG2` 在任何版本的 constants_arm64.h 里都不存在**；
+//!    R18 的注释是「reserved on iOS, shadow call stack on Fuchsia, TEB on Windows」，
+//!    SDK 还明说「We rely on R18 not being touched by Dart generated assembly or stubs at all」。
+//!    实测 material_3_demo 与 Reqable 的产物里 `ARG2`/`x18`/`r18` 出现 **0 次**，
+//!    所以删掉它对输出是**可证明的无操作**，只是不再在发布数据里留一个编造的角色名。
+//!    ⚠️ 这两条能长期存活，是因为没有任何检查把 `registers` 与 `register_aliases` 放在一起看：
+//!    `scripts/check_profiles.sh` 只管 SDK profile 的新鲜度，不碰平台 profile 的寄存器表。
 
 /// 流式写产物文件：返回 BufWriter，写完调 [`finish_writer`]。
 ///

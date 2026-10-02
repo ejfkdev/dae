@@ -38,8 +38,7 @@
     "x26": "THR",
     "x22": "NULL",
     "x16": "BARRIER",
-    "x18": "ARG2",
-    "x23": "CODE_REG",
+    "x24": "CODE_REG",
     "x27": "PP",
     "x28": "HEAP"
   },

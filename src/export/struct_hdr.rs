@@ -52,11 +52,41 @@ fn build_object_pool(analyzer: &Analyzer) -> String {
     s
 }
 
+/// 压缩指针构建要在 `write_barrier_mask` 之后补一个 `heap_base`。
+///
+/// SDK `runtime/vm/thread.h` 里 `heap_base_` 是 `#if defined(DART_COMPRESSED_POINTERS)`
+/// 包着的**条件字段**，而且是 `Thread` 里唯一一个（3.3.4 与 3.13.0 各只有 3 处该宏，
+/// 另两处是访问器方法）。所以压缩构建里它之后的每个字段都比非压缩布局晚 8 字节。
+/// 仓库里 48 份头文件对此**不一致**：2.13.4–2.19.6 已含 `heap_base`，其余不含。
+/// 规则因此是「目标压缩 **且** 头里没有」才插——已经有就不动
+/// （weibo 是 dart 2.19.6 压缩构建、头里已有 `heap_base`@0x48，其屏障表装载
+/// `[x26,#0x248]` 在头里正是 `write_barrier_entry_point`，两端对得上）。
+///
+/// ⚠️ 不插的后果不只是命名：`DartThread` 是**发给 IDA/r2 的结构体**，
+/// 压缩指针（＝每一个移动端 Flutter 产物）会从 `write_barrier_mask` 之后整体错位 8 字节，
+/// 用户在 IDA 里按结构体读线程字段会全错。这一条比 stub 命名严重得多。
+pub fn with_heap_base(hdr: &str, compressed: bool) -> String {
+    if !compressed || hdr.contains("heap_base") {
+        return hdr.to_string();
+    }
+    let mut out = String::with_capacity(hdr.len() + 32);
+    let mut done = false;
+    for ln in hdr.lines() {
+        out.push_str(ln);
+        out.push('\n');
+        if !done && ln.trim_end().trim_end_matches(';').ends_with("write_barrier_mask") {
+            out.push_str("\t__int64 heap_base;\n");
+            done = true;
+        }
+    }
+    out
+}
+
 /// 组装完整结构头（r2 与 ida 共用）。
 pub(crate) fn build(analyzer: &Analyzer) -> String {
     let mut out = String::with_capacity(16 * 1024);
     match crate::struct_tables::dart_thread(&analyzer.profile.abi, &analyzer.platform.arch) {
-        Some(t) => out.push_str(t),
+        Some(t) => out.push_str(&with_heap_base(t, analyzer.profile.compressed_pointers)),
         None => out.push_str(fallback_dart_thread()),
     }
     if !out.ends_with('\n') {

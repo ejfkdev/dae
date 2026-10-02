@@ -2802,6 +2802,12 @@ pub fn render_into(
             names.insert(ep, n);
         }
     }
+    // 一个表项里可能装着**多个**子 stub（写屏障族：640 字节 = 20 个 32 字节变体），
+    // 调用方直接 `bl` 到条目内部地址。这些地址既不是函数入口也不是表项，
+    // 所以上面那趟「按表项遍历」结构上够不到它们（material_3_demo 实测 4569 个调用点）。
+    for (ep, n) in crate::export::callgraph::write_barrier_sub_stubs(analyzer) {
+        names.entry(ep).or_insert(n);
+    }
     for idx in 0..analyzer.pc_offsets.len() {
         if let Some((ep, _)) = analyzer.code_range(idx) {
             names.entry(ep).or_insert_with(|| format!("sub_{ep:#x}"));

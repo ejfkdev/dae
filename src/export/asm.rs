@@ -416,19 +416,20 @@ fn rewrite_ops(analyzer: &Analyzer, ops: &str) -> String {
 // ---------------------------------------------------------------- IL
 
 /// 平台角色寄存器
-struct Roles {
-    thr: String,
-    pp: String,
-    null: String,
-    barrier: String,
-    sp: String,
-    fp: String,
-    lr: String,
+pub(crate) struct Roles {
+    pub(crate) thr: String,
+    pub(crate) pp: String,
+    pub(crate) null: String,
+    pub(crate) barrier: String,
+    pub(crate) sp: String,
+    pub(crate) fp: String,
+    pub(crate) lr: String,
+    pub(crate) code_reg: String,
     array_data_minus_tag: i64,
     non_field: std::collections::HashSet<String>,
 }
 
-fn roles(analyzer: &Analyzer) -> Roles {
+pub(crate) fn roles(analyzer: &Analyzer) -> Roles {
     let g = |k: &str, d: &str| {
         analyzer
             .platform
@@ -446,6 +447,7 @@ fn roles(analyzer: &Analyzer) -> Roles {
         sp: g("sp", "x15"),
         fp: g("fp", "x29"),
         lr: g("lr", "x30"),
+        code_reg: g("code_reg", "x24"),
         array_data_minus_tag: analyzer.profile.offset("array_data_minus_tag") as i64,
         non_field: analyzer.platform.non_field_base.iter().cloned().collect(),
     }
