@@ -9,7 +9,7 @@
 [![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTE4IiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDI1NiAyMTgiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMzQuNCAwLjEzMDE1MkwxMTEuNDggMjUuNjAyMkMxMTEuNjY1IDI5LjU2OTkgMTA5LjA1NCAzMi4wMDE5IDEwNC4wNjQgMzIuMDAxOUg2LjM5OTlWMEM2LjM5OTkgMC4xMzAxNDkgMTM0LjQgMC4xMzAxNTIgMTM0LjQgMC4xMzAxNTJaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTI1NiAwLjEzMDEyN0wxMDIuNDAxIDIxNy43MzJIMDBMMTUzLjU5OSAwLjEzMDEyN0gyNTZaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEyMS42MDEgMjE3LjczMkwxMzkuNjUgMTkyLjEzNEMxNDIuNDY1IDE4OC4xNjYgMTQ3LjA3NiAxODUuNzM0IDE1Mi4wNjcgMTg1LjczNEgyNDkuNjA0VjIxNy43MzZIMTIxLjYwMVYyMTcuNzMyWiIvPjwvc3ZnPg==)](https://zcode.z.ai/)
 
-> 配置驱动的 **Dart AOT 快照**分析与调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位内嵌快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的符号与结构供 IDA / radare2 / Frida 使用（对移植来源的参考实现有四处有意修正，见 `src/export/mod.rs`），并**把函数反编译成 `dart analyze` 认可的 Dart**。覆盖桌面**与**真机移动端（压缩指针）产物。
+> 配置驱动的 **Dart AOT 快照**分析与调试信息导出工具。零依赖 Dart SDK、不运行目标程序：从 Mach-O / ELF / PE 中定位内嵌快照，导出与 [blutter](https://github.com/worawit/blutter) 一致的符号与结构供 IDA / radare2 / Frida 使用（对移植来源的参考实现有六处有意修正，见 `src/export/mod.rs`），并**把函数反编译成 `dart analyze` 认可的 Dart**。覆盖桌面**与**真机移动端（压缩指针）产物。
 
 适用于任意 Dart AOT 产物——Flutter release 构建、`dart compile exe`、`dart compile aot-snapshot`（Dart 2.7+ cluster 快照）。
 
@@ -19,27 +19,43 @@
 
   - **Android arm64**——Reqable 3.3.4、飞书 3.6.1、ChatGLM 3.11.6、学信网 3.7.2、微博 2.19.6。
     五个产物的指令表表项数与 aotopsy **完全一致**（57 960 / 79 327 / 30 782 / 19 752 / 22 623），
-    全部 0 警告；飞书与微博还能端到端反编译成 `dart analyze` **0 错误**的 Dart
-    （结构化 95.9% 与 91.1%）。
-  - **macOS arm64**——Reqable.app 3.3.4：70 996 表项、0 警告、1 808 个函数结构化 94.9%、
-    `dart analyze` **0 错误**。
+    全部 0 警告；Reqable、飞书与微博还能端到端反编译成 `dart analyze` **0 错误**的 Dart
+    （结构化 97.0% / 94.5% / 90.2%，函数数 11 237 / 19 555 / 19 053）。
+  - **macOS arm64**——Reqable.app 3.3.4：70 996 表项、0 警告、17 319 个函数（反编译出 14 392 个）
+    结构化 97.1%、`dart analyze` **0 错误**。
+    > 上一版写的是「1 808 个函数、结构化 94.9%」，与飞书那条同一个故事：那是这个产物**约 90% 的
+    > 函数只有名字没有函数体**时量的，所以比率是在幸存的十分之一上算出来的。见
+    > [有名字没函数体](docs/DECOMPILER.zh.md#有名字没函数体同一个缺陷犯了两次而所有门禁都看不见2026-10-01已修)。
   - **本地构建的 flutter-samples demo**（Dart 3.13.0）——`material_3_demo`（5 107 行）与
-    `animations`（2 108 行）：15 796 与 11 102 个函数，结构化都是 92.5%，`dart analyze` 都 **0 错误**。
+    `animations`（2 108 行）：15 796 与 11 102 个函数，结构化分别 92.0% 与 91.8%，`dart analyze` 都 **0 错误**。
     因为源码已知，这两个是**对着源码判**的：`lib/` 里声明的公开 class/mixin/enum 分别恢复出
     98.8% 与 100%，源码字符串字面量分别有 95.4% 与 97.4% 出现在产物里，源文件到恢复出的库
     分别映射 18/18 与 21/23。`tests/app_truth.rs` 会断言这些比率（下限 0.90），
     链路一旦悄悄退化就会失败。
 - **反编译产出合法 Dart**——lift → CFG → 结构化发射，不是反汇编转储：循环、`if/else`、
   `break`/`continue`、对象池字面量在其载入处内联、恢复出的字段名以归属注释形式标注。
-  26 份语料（291 个文件、24 253 个函数）的产物 **`dart analyze` 错误为 0**；真机应用同样站得住——
-  飞书 3.6.1 结构化 95.9%、微博 2.19.6 结构化 91.1%（19 053 个函数、153 万条语句），两者均 0 错误。
-  不可归约的控制流保留显式 `gotoLabel` 并在函数头打 `NOTE`，绝不静默压平。
+  26 份语料（291 个文件、24 497 个函数）的产物 **`dart analyze` 错误为 0**；真机应用同样站得住——
+  Reqable 3.3.4 结构化 97.0%（11 237 个函数、150 万条语句）、飞书 3.6.1 结构化 94.5%
+  （19 555 个函数）、微博 2.19.6 结构化 90.2%（19 053 个函数、162 万条语句），三者均 0 错误。
+  **每一条条件分支边都有着落**：分支体要么被结构化进 `if`、要么从已发射过的共享块**尾复制**回来、
+  要么如实写成 `gotoLabel(0x…)`，不可归约的控制流另外在函数头打 `NOTE`。空的分支体现在**只有一种
+  含义**——目标就是紧随这个 `if` 之后的代码；而它过去还有第二种含义：「这条边被丢掉了」
+  （上面五份应用合计 9 817 处，现剩 216 处且每一处都对照 raw 反汇编核过）。见
+  [把每一条条件分支边都写进产物](docs/DECOMPILER.zh.md#把每一条条件分支边都写进产物2026-10-01已修)。
   见[反编译器](#反编译器实验性)。
-- **快**——以下都是本版二进制实测：9 MB 的 macOS Flutter 样本导出 0.26 s；`--decompile` 在
-  飞书（25.6 MB 安卓、25 183 个函数）1.5 s、`material_3_demo`（14 MB macOS、15 796 个函数）1.2 s、
-  微博（9 MB 安卓、19 053 个反编译函数 / 163 万条语句）1.7 s，峰值 RSS 172–263 MB。
-  同一产物上比 v0.1.7 **快约 89 倍**（106.8 s → 1.20 s）——收益来自「不再每函数重建全局不变数据」、
+- **快**——下面每个数字都是本版二进制**交替 A/B 三轮的中位数**（本项目单次墙钟能摆动 ±35%，
+  跑一次什么都证明不了）：9 MB 的 macOS Flutter 样本导出 0.27 s；`--decompile` 在
+  `material_3_demo`（14 MB macOS、15 082 个反编译函数）0.82 s、微博（9 MB 安卓、19 053 个函数 /
+  162 万条语句）1.25 s、ChatGLM（14 MB 安卓、27 517 个函数）2.00 s、
+  Reqable（21 MB 安卓、11 237 个函数 / 150 万条语句）2.64 s、
+  飞书（25.6 MB 安卓、19 555 个函数）2.91 s，峰值 RSS 151–834 MB（Reqable 是离群值：150 万条语句）。
+  同一产物上比 v0.1.7 **快约 85 倍**（106.8 s → 1.25 s）——收益来自「不再每函数重建全局不变数据」、
   「产物直接流式落盘而不在内存里攒」、以及「505 个库并行渲染」，不是换了更快的算法。
+  「把每一条分支边都写进产物」（见上）的代价是**最大那份语料上约 3%、其余在噪声内**——
+  这是与修复前的二进制在同样的交替轮次里对拍出来的，不是跟早先引用的数字比。
+  > 上一版写的是「飞书 1.5 s、结构化 95.9%」。这两个数都是在**飞书 79% 的函数有名字却没函数体**
+  > 的情况下量的：跑得当然快，而结构化率是在活下来的那五分之一上算的。见
+  > [有名字没函数体](docs/DECOMPILER.zh.md#有名字没函数体同一个缺陷犯了两次而所有门禁都看不见2026-10-01已修)。
   并行路径与串行**逐字节一致**（1011 个文件 `diff -rq` 干净），因为文件名与「每个入口地址归哪个库
   发射」都在开始渲染之前由一趟顺序预扫描定死。
 - **双语 CLI**——中文语系输出中文，其余英文；`DAE_LANG=zh|en` 可强制指定。
@@ -113,7 +129,7 @@ export done -> /绝对路径/to/out:
 | `functions.txt` | 平铺 `库.类.方法 → 偏移` 索引（在 `text/` 下） |
 | `arrays.txt` / `maps.txt` | 每个 List / Map 对象及其内容（在 `text/` 下） |
 | `text/fields.txt` | 恢复出的具名字段：来源（快照 Field 簇 `rec` / 隐式访问器名 `accessor`）+ 字节偏移 |
-| `text/stubs.txt` | 指令表里**没有** Code 对象的条目（`functions.txt` 略掉的 stub 前缀）；只在能从分配 stub 序言证明时给名字，否则留空 |
+| `text/stubs.txt` | 指令表里**没有被任何 Function 对象引用**的条目（`functions.txt` 略掉的那部分）；只在能证明时给名字，否则留空。**它们并不都是 stub**：在 `first_entry_with_code > 0` 的构建里，很大一块是**没有名字的函数体**——Reqable 有 53.4%（8.09 MB）、飞书有 72.3%（14.67 MB）以标准 Dart `EnterFrame` 序言开头，而该字段为 0 的语料只有 0.4–1.2%。dae 不反编译它们、也不给它们编名字，见[反编译器](docs/DECOMPILER.zh.md)。 |
 | `text/call_edges.txt` | 调用边：直接 `bl`/`call` 目标 + 间接调用点；每类分配 stub 由序言解出名字 |
 | `callgraph.dot` | 已命名函数之间的直接调用图（Graphviz DOT） |
 | `dart/*.dart` | 每函数伪代码，**可过 `dart analyze`**；**一个库一个文件**，由 `--decompile` 或 `decompile` 子命令产出 |
@@ -178,7 +194,7 @@ export done -> /绝对路径/to/out:
 对象层（与 text/ 里的同名产物同源）
   dae pp        <binary> [pattern]              对象池条目
   dae objs      <binary> [pattern]              用户类实例（含字段值）
-  dae stubs     <binary> [pattern]              指令表里没有 Code 对象的条目
+  dae stubs     <binary> [pattern]              指令表里没有被任何 Function 引用的条目
 
 反编译
   dae getclass  <binary> <CLASS>                只反编译这个类
@@ -188,6 +204,8 @@ export done -> /绝对路径/to/out:
 
 低层
   dae disasm    <binary> <CLASS[.method]>       原始反汇编（arm64 保留 IL 注释）
+  dae disasm    <binary> 0xADDR                 ……也可以按地址：函数入口、stub 表项，
+                                                  或表项**内部**的子 stub（见下文）
 
 全量导出
   dae export    <binary> <out_dir> [--decompile]
@@ -274,8 +292,11 @@ export done -> /绝对路径/to/out:
 
 **控制流已结构化**：支配树找出自然循环（回边 = 头支配尾），再按区域递归发射——两分支汇合的
 写成 `if/else`（汇合点正好是区域终点也算合法菱形），一支返回的写成 `if (c) { return ... }`，
-循环头写成 `while`，跳出循环的分支写成 `break`/`continue`。门禁语料上 87–92% 的函数完全结构化；
+循环头写成 `while`，跳出循环的分支写成 `break`/`continue`。门禁语料上 77–90% 的函数完全结构化；
 其余保留 `gotoLabel` 并在函数头打 `NOTE` 标记。
+这个区间过去写的是 87–92%，变宽的原因是：目标为「已发射过的共享块」的分支过去渲染成空的
+`if (c) { }`——**一边被算作 structured、一边把那条边（以及边上的 store/call 副作用）静默丢掉**。
+把这类边如实记成尾复制（优先，函数仍算 structured）或 `gotoLabel`，是**重新分类**而不是退化。
 
 **还没做的**：跨基本块的表达式合成（目前是块内若干层）、**基址类型**的恢复（池值与字段名都有了，
 但基址寄存器属于哪个类没跟踪，所以访问写成 `mem(base, disp) /* 类.字段 */` 而不是 `base.field`；
@@ -329,6 +350,36 @@ DAE_REQUIRE_GATES=1 cargo test --release
 
 会把这类跳过变成**硬失败**。维护者在有语料的检出里跑它；这是区分「门禁通过了」与「门禁根本没跑」
 的唯一办法。显式 opt-in 的跳过（安卓源码真值链需要 `DAE_TRUTH_ANDROID=1`）不受影响。
+
+有两条门禁的盲区是**仓库内语料无论加多少都补不上的**，而它们都会**明说**、不装作通过。
+把真实的大型移动端产物指给它们就能补上：
+
+```bash
+DAE_TRUTH_ANDROID_SO=/path/to/libapp.so[,/path/to/another.so] \
+  cargo test --release --test code_coverage --test cli_query --test stub_names -- --ignored
+```
+
+第三条 `tests/stub_names.rs`（发版前跑、`--ignored`）会扫**能找到的每一份**语料，
+按各语料**自己的** `DartThread` 布局重推四类 stub 名字：29 份语料 / 23 446 个名字 /
+9 份 arm64 / 5 份压缩指针，**0 处可疑**。它存在的原因是：一个错名
+（压缩指针构建上的 `ArrayWriteBarrierStub_*`）曾经**通过了当时每一条单语料门禁**——
+最早验的那两份语料恰好是「查错了也得到对的答案」的那两份。
+
+* `tests/code_coverage.rs` 断言「每个已发布的函数名都必须有函数体」。它看守的缺陷有一半
+  ——`code_size` 里残留的 `idx < first_entry` 判断，曾让 Reqable 83.8%、飞书 79.1% 的函数
+  只剩名字——只在快照的 `first_entry_with_code` 非 0 时才发作，而这个值在**26 份桌面产物、
+  25 份 regress 存档、乃至本机现编的 Flutter `android-arm64` `app.so` 上全是 0**，
+  所以**没法用工具链合成出这种语料**。给足 Reqable、飞书、ChatGLM、微博、学信网后，扫描达到
+  29 份语料 / 241 699 条指令表表项 / 130 435 个已发布函数 / **孤儿 0**，两个负对照都敏感。
+  另一半缺陷（Dart 2.12–2.15 合并字节相同的 `Instructions`）**仓库自带语料就能覆盖**。
+* `tests/cli_query.rs::write_barrier_stub_names_are_provable` 会从指令自己的 `THR` 位移
+  加**该 SDK 版本**的 `DartThread` 布局重推每一个 `*WriteBarrierStub_*` 名字。
+  **只用仓库自带语料时它抓不到「字段名被写死」**，因为那些语料全是 dart 3.13.0、
+  而那一版的字段确实就叫 `write_barrier_entry_point`；加上 Reqable（dart 3.3.4、
+  位移 `0x1e8` → `array_write_barrier_entry_point`）后写死就会失败。
+  这一点是**跑过负对照验证的**，不是推断。
+
+不设这个变量时两条门禁照跑照断言，各自会打印出自己哪一部分没够到。
 
 ## 已知限制
 

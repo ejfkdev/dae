@@ -17,14 +17,40 @@ cargo test --release --test field_names            # 字段名恢复：两源一
 cargo test --release --test source_truth           # 现编 tests/fixtures/truth.dart，反编译后对源码判
 DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # 同一套判据跑压缩指针 arm64 产物
 DAE_REQUIRE_GATES=1 cargo test --release           # 把所有「缺依赖，跳过」变成失败
+cargo test --release --test code_coverage          # 每个已发布函数名都必须有函数体（自带负对照）
+cargo test --release --test stub_names -- --ignored # 扫**全部**语料找编造的 stub 名（发版前跑）
+DAE_TRUTH_ANDROID_SO=/path/libapp.so[,...] cargo test --release --test stub_names -- --ignored
 ```
+
+`tests/stub_names.rs` 的存在源于本次会话犯的一个错。其它命名门禁各自只吃 1–3 份语料，
+而命名逻辑有**三个**随目标变化的输入：SDK 版本（决定 `DartThread` 布局）、架构
+（arm64 与 x64 是两套形状）、以及**压缩指针**（条件字段 `heap_base` 让它之后的每个字段晚 8 字节）。
+给 Reqable 与飞书发布的 `ArrayWriteBarrierStub_*` 是错的，却**通过了当时每一条门禁**——
+因为最早验的两份语料（material_3_demo 非压缩、weibo 的 2.19.6 头里本就有 `heap_base`）
+恰好是「查错了也得到对的答案」的那两份。这条扫描对能找到的每份语料（含移动端共 29 份：
+23 446 个名字、9 份 arm64、5 份压缩指针）按**该语料自己的**布局重推四类名字，
+并断言几条防空过下限让「0 处可疑」真的有意义（≥15 份语料、≥1500 个名字、≥3 份 arm64、
+两个家族各 ≥20）。负对照就是把那个 bug 原样装回去：把词干硬编码成 `array_write_barrier`，
+只要集合里有一份压缩指针语料，它就报 5 处可疑并失败。
 
 最后这条比看上去要紧。6 个门禁文件里有 5 个要吃被 gitignore 的语料（`testing/`、
 `dart/dart_samples/`），缺了就自行跳过，而 `cargo test` 默认把提示吞掉——于是新克隆会报告
 「套件全绿」而实际几乎什么都没量。`DAE_REQUIRE_GATES=1` 让这类跳过直接失败，
 这是区分「门禁通过了」与「门禁根本没跑」的唯一办法。
 
-`tests/source_truth.rs` 是唯一**输入是源码**的门禁：用本机 `dart` 编 `tests/fixtures/truth.dart`，
+**`--no-default-features` 构建现在能编译、测试也全绿了，而它以前从来不行。** `asm` feature 管着
+capstone 与整个反编译器，所以不带它的构建里**根本没有 `dae::decompiler`**——而
+`tests/field_names.rs` 与 `tests/source_truth.rs` 无条件引用了那个模块，于是
+`cargo test --no-default-features` **编译都过不去**。这把后面所有问题都挡住了：
+编译修好之后又冒出 16 个失败（`cli_query.rs` 里 15 个 + `dart_valid` 那两条读 `dart/` 的门禁），
+全都是在这个配置**产不出来**的反编译产物上做断言。现在每条都挂了 `#[cfg(feature = "asm")]`，
+而随后「辅助函数没人用」的两个文件挂了文件级的
+`#![cfg_attr(not(feature = "asm"), allow(dead_code, unused_imports))]`。结果：默认 feature 下
+73 passed / clippy 0；`--no-default-features` 下 **47 passed / 0 failed / 0 warning**，
+且二进制仍能正常导出（`stubs.txt`、`pp.txt`、`functions.txt`——除 `asm/` 与 `dart/` 之外的一切）。
+教训与寄存器别名那次同一个形状：**没人跑的配置会静默腐烂，而腐烂藏在第一个报错后面。**
+
+`tests/source_truth.rs` 是唯一一条**输入是源代码**的门禁：用本机 `dart` 编 `tests/fixtures/truth.dart`，
 反编译后断言源码说必须留下来的东西——快照里归属该库的每个函数都渲染出来、`main` 会走到的字符串常量
 被内联、`Account.withdraw` 保留 `-1` 分支与比较（未被内联时）、产物零 `dart analyze` 错误、解析不漂移。
 安卓变体对 `flutter assemble` 现编的 arm64 **压缩指针**产物跑同一套判据（刻意绕开 Gradle：
@@ -320,6 +346,60 @@ RSS 均值 221 → 210 MB——幅度不大，但三对里**方向一致**。
 语料（arm64 Mach-O、x64 Mach-O、x64 ELF、两个真机 Android `libapp.so`、压力样例）`diff -rq`
 全干净。门禁全绿：59 个测试、`full_scorecard`（26 样本 / 291 文件 / 24 253 函数 /
 `dart analyze` 0 错误）、`regress_all` 25/25、`check_profiles` 47/47、clippy 0。
+
+### 第五轮：自己造出来的 24.8× 变慢，以及两个成因（2026-10-01）
+
+上面那轮 stub 命名让导出**慢了 11–25 倍**，而测试套件里没有任何东西报警。
+同一个二进制各跑三次实测：`material_3_demo` 0.87 → 1.33 s、Reqable 4.80 → **54.3 s**、
+飞书 4.83 → **119.6 s**。两个成因都是**随指令表规模增长**的每地址开销，所以小语料把它藏住了：
+
+1. **一个 O(n²) 查找。** `code_reg_stub_name` 需要「包含这个地址的表项还剩多少字节」，
+   而它的取法是**对每个候选地址**都把 `pc_offsets` 从头扫一遍。飞书有 59 772 个 stub、
+   79 327 条表项——约 **47 亿次**迭代。修法是预建一次「未被 Code 对象认领的表项」索引
+   （`StubIdx`，按入口地址有序，因为 `pc_offsets` 非递减），每地址二分：O(n + m log n)。
+2. **解码的量远超判据所需。** 同一个函数用 `disasm_all` 把整个窗口（最多 4 KiB = 1024 条）全解出来，
+   而它真正要看的那个**本体**在第一条终止指令就结束了，通常 20 条以内。改成 `disasm_count(.., 64)`。
+   （capstone 0.12 的惰性 `disasm_iter` 要 `&mut Capstone`，而调用点拿的是 `&Capstone`，用不了。）
+   对已取证的形状来说 64 条绰绰有余——save-all 序言 11 条就到 `CODE_REG` 装载——
+   而且**取太小的失败模式是「不命名」，绝不会是「命名错」**。
+
+两处都改完：`material_3_demo` **0.82 s** / 144 MB（比 0.87 s 的基线还略快）、
+Reqable **5.70 s** / 888 MB、飞书 **6.38 s** / 243 MB。其中只改 `disasm_count` 这一项就让
+飞书 7.51 → 6.38 s、Reqable 6.33 → 5.70 s，而三份语料的产物与优化前**逐字节一致**——
+是实测过的纯提速，不是想当然。相对基线剩下的部分（Reqable +19%、飞书 +32%）
+就是多命名 31 625 与 36 622 个调用点的**如实代价**。
+
+**第六轮：每个地址只解码一次，而不是五次。** 上面两处修完之后，`names+stubs` 变成主导开销——
+飞书 7.7 s 里占 **3.43 s（45%）**、Reqable 6.6 s 里占 **2.68 s（41%）**，而整个
+lift+结构化+渲染主循环只有 0.33 s / 0.64 s。原因是结构性的：`alloc_stubs_at` 对**每一个**
+未被引用的表项（飞书 59 772 个）依次跑最多 5 个命名器，而**每个命名器各自反汇编自己的窗口**
+（24 / 384 / 32 / ≤4096 / ≤4096 字节），于是同一段字节最多被解码 5 次、合计约 238 条指令。
+（写屏障那条扫描**不是**瓶颈：它的 size 预筛 `size % 32 == 0` 且 64..4096，
+已经把 59 772 个表项砍到 5 050 个才碰 capstone——8.4%；Reqable 9.6%。）
+
+修法是 `disasm_stub`：**每地址只解码一次**（窗口＝所在表项的剩余字节、上限 4 KiB，最多 96 条指令），
+5 个命名器共用；它们的签名从 `(cs, addr)` 改成收 `&capstone::Instructions`。
+96 条覆盖所有已取证的形状——`runtime_stub_name` 的 save-all + 镜像恢复实测 32 条，
+而它旧的 384 字节窗口在 arm64 上正好就是 96 条——不够时的失败模式是「不命名」，**绝不会是「命名错」**。
+`inline_alloc_stub_name` 还额外先看第一条助记符再决定要不要建操作数字符串，
+于是一看就不像的地址不付 String 分配的钱。
+
+实测（`/usr/bin/time -l`，各三轮）：`names+stubs` 飞书 **3.43 s → 1.00 s**、
+Reqable **2.68 s → 0.67 s**；整体导出飞书 **7.71 s → 2.68 s**、Reqable **6.58 s → 2.38 s**。
+两者现在都**比命名工作开始前的基线还快**（4.83 s 与 4.80 s），而具名调用点比那时多了约 4 万个——
+也就是说这几轮命名工作的净耗时是**负的**。material_3_demo 0.76 s、微博 1.17 s、ChatGLM 1.84 s。
+**五份语料的产物与重构前逐字节一致**（`diff -rq`），这也是它敢当纯重构做的唯一理由：
+命名器的**判据一个字没改**，改的只是「谁来解码字节」。有两个窗口上界确实动了
+（`alloc_stub_name` 24 字节 → 共享窗口；`code_reg_stub_name` 的兜底 256 → 384），
+所以「逐字节一致」是**实测出来的结论、不是假设**——而它在 5 个真实应用与全部 25 份 regress 存档上都成立。
+
+> 两条教训，重点在**怎么被发现的**、而不在坏了什么。(a) **测试套件完全看不见性能**——
+> 71 个测试、`regress_all` 25/25、`scorecard` 0 错误全绿，而导出慢了 25 倍。
+> 只有在**大**语料上量墙钟才发现；只看 `material_3_demo` 的话是 +53%，很容易被当成噪声。
+> (b) **任何新增的每地址扫描都要先问「它随什么规模增长」**——这里的答案是指令表表项数，
+> 而它在各语料之间差 4.5 倍（17 839 vs 79 327），所以在桌面样本上看不见的开销
+> 会在移动端样本上变成主导。
+
 
 ## 三个 2026-09-28 用「源码对照」找到的缺陷（都已修）
 
@@ -666,6 +746,11 @@ if let Some(&(_, exit)) = self.loops.get(&b) {
 从 ~88% 掉到 34%。任何改动都要在**每个语料**上重量结构化率，不能只看门禁。
 `stack_check_guards_do_not_regress`（113）与 `empty_if_without_else_does_not_grow`（109）
 已经就位，可以抓住「越改越坏」；如果这两个缺陷同源，一次修复应当让**两条棘轮同时下降**。
+>
+> **2026-10-01 有了答案：不同源。** 守卫那次修复让空 `if` 计数**一动不动地停在 109**，
+> 空 `if` 缺陷后来是按自己的根因单独修的——见
+> [把每一条条件分支边都写进产物](#把每一条条件分支边都写进产物2026-10-01已修)。
+> 它的上限现在是 **5**（5 处逐一验证为正确），所以这两条棘轮不再联动。
 
 ## 用可证的形状给 31% 的未命名调用目标命名（2026-09-28）
 
@@ -694,9 +779,33 @@ add  x15,x15,#8 ; ret
 第 0 条是 `str lr`、≥6 组连续 `stp`、有 `ret`、`ret` 前 ≥6 组连续 `ldp`，
 且**第一组 stp 的寄存器对 == 最后一组 ldp 的寄存器对**（镜像）。命名为 `RuntimeCallStub_0x<addr>`。
 
-**它刻意只走到这一层。** 具体是哪个 runtime entry **不可证**：profile 的 `runtime_offsets`
-只有 7 个键，既不含 `THR+0x188` 也不含 `THR+0x488`，所以再往下命名就是编造——
-与撤回 `isSmi` 时越过的正是同一条线。名字里保留地址，让这 11 个仍可区分。
+> **它刻意只走到这一层。** 具体是哪个 runtime entry **不可证**：profile 的 `runtime_offsets`
+> 只有 7 个键，既不含 `THR+0x188` 也不含 `THR+0x488`，所以再往下命名就是编造——
+> 与撤回 `isSmi` 时越过的正是同一条线。名字里保留地址，让这 11 个仍可区分。
+
+**上面这段论证是错的，而更正的量是实测出来的。** 它是从 `runtime_offsets` 只有 7 个键推出来的，
+但**查错了表**：`struct_tables::dart_thread`——也就是 dae 早已内嵌、并用于生成 r2/IDA 结构头的
+per-version `DartThread` 布局——**484 个字段全都有名字**。dart 3.13.0 的 `THR+0x188` 就是
+`stack_overflow_shared_without_fpu_regs_stub`。所以「具体是哪个 entry」**是可证的**，
+数据本来就在产物里，`RuntimeCallStub_0x…` 只是**说少了**。已发布的名字不改（它不错、只是不够具体），
+更锐利的命名记进下面的优化清单。
+
+> 这一项**第一次量出来的数是 340 个未命名地址里的 338 个（28 106 次调用、全部直接调用的 32.4%）**。
+> **那个数错了大约一倍**，而错因比数字本身值钱：扫描读的是**整个指令表条目**的反汇编，
+> 而一个条目里可能装着多个 stub，于是一个 stub 被记上了**邻居**的 `ldr`。
+> 改成**在第一条终止指令处截断**（`ret`/`brk`/`br`/`b`）、即只扫本 stub 自己的本体之后重测：
+> **340 个地址里的 102 个、14 496 次调用 ＝ 未命名的 51%、全部直接调用的 16.7%**。
+> `AllocateDouble_entry_point`、`AllocateClosure_entry_point`、`AllocateTypedData_entry_point`
+> 以及整个「194 个地址」的 `slow_type_test_entry_point` 组**全部消失**——它们都是邻居的指令。
+> 这与当年「raw 反汇编注释块越过函数边界」是同一类错误。
+> ⚠️ **规律：任何按地址扫一个表项的分析，都必须在第一条终止指令处截断，
+> 否则会把下一个 stub 的代码静默记到当前地址头上。**
+
+那 9 个通不过严格镜像校验的地址现在也**有了解释、不再是谜**：它们的 save-all 序言完全相同，
+但**以 `brk #0` 结尾**——调用 runtime 之后**不返回**，所以根本没有「恢复」可镜像。
+`0x3dc7b0`（5 730 次调用）把 `null_cast_error_shared_without_fpu_regs_stub` 装进 CODE_REG、
+`NullCastError_entry_point` 装进 r5、`call_to_runtime_entry_point` 装进 LR，调用，然后陷阱。
+用**镜像**这条判据拒绝它们是对的；只是镜像不是这一族里唯一可证的判据。
 
 material_3_demo 上只有 **11 个里的 2 个**通过严格镜像校验（其余 9 个在某处细节不同），
 这是**预期行为**：可证地命名 2 个，好过猜着命名 11 个。这 2 个覆盖 **13 316 个调用点**，
@@ -719,6 +828,522 @@ material_3_demo 上只有 **11 个里的 2 个**通过严格镜像校验（其�
 > 而认 `ldp` 之前那条 `add` 时按操作数里有没有 `"sp"` 判断——但 Dart 代码里的 arm64 栈指针是
 > **x15**（`R15 = 15; // SP in Dart code.`），capstone 印的是 `add x15, x15, #8`，
 > 里面根本没有 `"sp"` 这个子串。
+
+## 有名字没函数体：同一个缺陷犯了两次，而所有门禁都看不见（2026-10-01，已修）
+
+Reqable 的 `text/functions.txt` 列了 13 371 个函数，而 `asm/` 里只有 **999** 个。名字是对的，
+函数体根本没生成。**没有任何东西报警**：`dart analyze` 过、结构化率正常、`regress_all` 25/25、
+连「调用具名率」都还涨了——因为这些指标全都是在**已经发射出来的那部分函数**上算的。
+
+根因在 `Analyzer::code_size`，而且是**同一个修复只做了一半**，前后两次。
+
+**缺陷 1：残留的 `idx < first_entry` 守卫。** 早先已经查清 `first_entry_with_code`
+**不是**排除指令表条目的理由（在弄明白这点之前它吃掉了 86% 的函数名），`entry_for` 也照此改了；
+但 `code_size` 留着旧守卫，于是恰恰对这些下标返回 `0` ⇒ `code_range` 因 `size <= eo` 返回 None ⇒
+函数有地址、没字节。实测影响面：**Reqable 11 207/13 371＝83.8%**、
+**飞书 lark-android 19 921/25 183＝79.1%**。
+
+为什么门禁看不见：**26 份桌面语料、全部 25 份 regress 存档、乃至本机现编的 Flutter
+android-arm64 `app.so`，`first_entry_with_code` 全是 0**，守卫在测试能看到的地方从不触发。
+它也不是版本属性——ChatGLM／微博／学信网都是 0，而 Reqable 是 48 455、飞书是 61 609。
+这与早先「语料全是 no-dwarf 所以地址错位测不出」是同一类盲区。
+
+**缺陷 2：「下一条」不等于「下一个*不同*的 offset」。** Dart 2.12–2.15 的 AOT 写入器会合并
+字节相同的 `Instructions`，于是连续多个表条目共享同一个 `pc_offset`；只有 run 的最后一条能从
+`pc_offsets[idx+1] - pc_offsets[idx]` 算出非零长度。实测有名字没函数体：hello_2.12.4 **174**、
+2.13.4 **217**、2.14.4 **221**、2.15.0 **212**。
+**这是编译器去重、不是解码错位**，有独立佐证：hello_2.12.4 里 73 个地址被 2..16 个函数共享，
+而共享者语义上就是同一个函数体——9 个不同 typed_data 类的 `get_elementSizeInBytes`、
+16 个 `_isWindows`/`_setupCompleted`/`_enableSocketProfiling` 这类布尔开关 getter、
+9 个错误类的 `ctor`/`get_stackTrace`。2.16.2 起等值 run 为 0，故本修复对那些版本**恒等**。
+
+修法：长度取到**下一个严格更大**的 `pc_offset` 为止，用 `partition_point` 二分。
+二分的前提是**实测出来的、不是假设的**——在 8 份语料上数了有符号增量
+（2.12.4/2.13.4/2.14.4/2.15.0/2.16.2/3.13.0 + Reqable + 飞书），**负值个数全为 0**，
+即 `pc_offsets` 非递减。没有等值 run 时 `partition_point` 就返回 `idx+1`，所以改动**可证明是恒等**，
+实测也确实如此：`material_3_demo` 逐字节一致；25 份 regress 存档里 21 份逐字节一致，
+动的那 4 份只差三个文件（`call_edges.txt`、`callgraph.dot`、`ida_script/addNames.py`），
+而**整个对象层完全一致**（含 `stubs.txt`、r2 脚本、`frida.js`）。
+
+修复后：
+
+| 语料 | asm/ 函数数 | dart/ 块数 | 结构化 | `dart analyze` |
+|---|---|---|---|---|
+| Reqable（arm64, 3.3.4） | 999 → **9 630** | → **11 237** | 10 916/321＝97.1% | **0 错误** |
+| 飞书 lark-android（arm64, 3.6.1） | → **17 914** | → **19 555** | 18 537/1 018＝94.8% | **0 错误** |
+| full scorecard（26 份桌面） | — | 24 253 → **24 497** | — | **0 错误** |
+
+顺带掉出两条内部一致性，反过来印证了这个读法。指令表**恰好被二分**：
+Reqable 57 960 ＝ 11 237 个有 Code 对象 ＋ 46 723 个没有（`stubs.txt` 从 7 799 涨到 46 723，
+正是因为「无 Code 对象的前缀条目」此前被同一个原因丢掉）；飞书 79 327 ＝ 19 555 ＋ 59 772。
+地址正确性也没有拿 dae 自己的表自证，而是走既定的独立判据——新恢复的 8 631 个 Reqable 函数里
+**95.66% 以 `stp fp, lr` 开头**（Dart arm64 的 `EnterFrame` 序言），而原本就能用的那 999 个是
+**81.58%**；空函数体 0 个、长度全部 4 字节对齐。对照记录在案的阈值（正确 91–100%、错位 51–58%），
+新恢复的区域不只是合格，比从未坏过的那块还干净。
+
+门禁 `tests/code_coverage.rs` 断言的正是被破坏的那条不变量——**每个已发布的函数名都必须有函数体**
+（`entry_for` 给出入口 ⇒ `code_range` 必须给出范围），外加「只要语料有指令表，每一条都要能算出范围」。
+它带**负对照**，因为「断言 0」恰恰是最容易什么都没测的门禁：测试会把两个旧公式**各自单独**装回去，
+并要求它们报出孤儿。装回「只减下一条」必须在 ≥1 份语料上报出孤儿（2.12–2.15 保证 174/217/221/212，
+所以这一半**只靠仓库自带语料就是敏感的**）；装回 `first_entry` 守卫则只在 `first_entry > 0` 时敏感。
+这个对照的第一版归因写错了——它把两个缺陷合在一个公式里，于是在 `first_entry == 0` 的语料上
+退化成另一个，报出「守卫在 4 份语料上敏感」而那 4 份的 `first_entry` 全是 0。
+⚠️ **一条门禁有两种失效模式时，每个对照只能含其中一个。**
+
+剩下的盲区是**打印出来的，不是掩盖掉的**：仓库里没有 `first_entry > 0` 的语料，
+所以缺陷 1 只有在 `DAE_TRUTH_ANDROID_SO=/path/to/libapp.so[,...]` 把真实大型移动端产物
+纳入扫描时才被覆盖。给足 Reqable + 飞书 + ChatGLM + 微博 + 学信网后，扫描达到
+29 份语料 / 241 699 条表项 / 130 435 个已发布函数 / **孤儿 0**，两个对照都敏感（B 在 4 份、A 在 2 份）。
+
+## `DartThread` 少了一个条件字段，于是每一个压缩指针目标都整体错位 8 字节（2026-10-01，已修）
+
+这一起于「为什么胖分配命名只在 material_3_demo 上生效、别处一个都不出」，结果查出本次**最严重**的
+一个缺陷——它不只是在悄悄给 stub 起错名，而是**给每一份移动端语料发了一个错的 IDA/r2 结构体**。
+
+`runtime/vm/thread.h` 在 3.3.4 与 3.13.0 里都是这么声明的：
+
+```c
+volatile RelaxedAtomic<uword> stack_limit_;
+uword                         write_barrier_mask_;
+#if defined(DART_COMPRESSED_POINTERS)
+uword                         heap_base_;        // ← 条件字段
+#endif
+uword                         top_;
+uword                         end_;
+```
+
+`heap_base_` 是 `Thread` 里**唯一**一个 `DART_COMPRESSED_POINTERS` 条件**字段**
+（两版各出现该宏 3 次，另两处是访问器方法）。压缩指针＝每一个移动端 Flutter 构建，
+所以在那些目标上，`write_barrier_mask_` 之后的**每个**字段都比非压缩布局晚 8 字节。
+
+而 `profiles/struct/` 里的 48 份头文件对此**并不一致**：2.13.4–2.19.6（14 份）已含 `heap_base`，
+其余 34 份没有。dae 无论是发出去的结构头、还是 stub 命名背后的线程字段查表，
+都**原样**用它们，完全没有处理压缩与否。
+
+Reqable（dart 3.3.4、压缩指针）上有**三处代码实测**把正确答案钉死。插入 `heap_base` 之后，
+发出的结构体说 `stack_limit` = 0x38、`top` = **0x50**、`write_barrier_entry_point` = **0x1e8**，
+而二进制三处全部对得上：`ldr x16,[x26,#0x38]` + `cmp SP` + `b.ls` 就是 `CheckStackOverflow`；
+胖分配 stub 是 `ldp x0,x2,[x26,#0x50]` 与 `str x0,[x26,#0x50]`；
+屏障子 stub 是 `ldr x30,[x26,#0x1e8]`。修之前结构体把 `top` 放在 0x48、把 0x1e8 读成
+`array_write_barrier_entry_point`。
+
+**所以有两处是错的，其中一处是我本次会话早些时候发出去的。** 给 Reqable 与飞书发布的
+`ArrayWriteBarrierStub_x0` 是**编造**：正确名字是 `WriteBarrierStub_x0`（index 60 而不是 61）。
+material_3_demo 不受影响，因为它**不是**压缩指针；weibo 也不受影响，因为它的 2.19.6 头里
+本来就有 `heap_base`——**这正是错误能存活的原因**：我最早查的两份语料恰好都是对的那两份。
+修好查表还**顺带打通**了胖分配命名在移动端的路，因为它那条「`ldp` 基址必须是名为 `top` 的字段」
+此前正是因为同一个原因一直不成立。
+
+**另一个独立工具逐字段同意。** aotopsy 维护自己的 THR 表、并由它的 `sdk-check` 子命令对着
+dart-lang/sdk 校验，而且它**压缩与非压缩分成两张表**。它的 3.9.2 那一对是：
+
+| | `stack_limit` | `write_barrier_mask` | `heap_base` | `top` | `end` | `write_barrier_entry_point` | `array_write_barrier_entry_point` |
+|---|---|---|---|---|---|---|---|
+| `thrV392`（压缩） | 0x40 | 0x48 | **0x50** | 0x58 | 0x60 | 0x208 | 0x210 |
+| `thrV392_nocompress` | 0x40 | 0x48 | —— | 0x50 | 0x58 | 0x200 | 0x208 |
+
+`write_barrier_mask` 之后的每个字段在压缩变体里都恰好 **+8**、`heap_base` 正好紧跟其后、
+且 `write_barrier_entry_point` 排在 `array_write_barrier_entry_point` **之前**。
+这与 dae 现在采用的规则、插入位置、字段顺序完全一致——一边是从 `thread.h` 读出来的，
+另一边是另一个工具经 sdk 校验的表，两条独立路径同结论。它也确认了原错误的方向：
+既然 `write_barrier` 在前、`array_write_barrier` 在后，把 Reqable 的 `0x1e8` 读成 index 61
+就正好取到了**后一个**，也就是错的那个。
+
+规则是「**当且仅当**目标压缩**且**头里没有 `heap_base` 时，在 `write_barrier_mask` 之后插一个」——
+所以已含它的头保持逐字节不变（幂等），实测也印证了：material_3_demo 与 weibo 的具名调用数
+**一动没动**（77 071 与 108 194），而 Reqable 31 625 → **40 548**、飞书 36 622 → **43 182**、
+ChatGLM 127 663 → **142 415**。五份仍全部 `dart analyze` 0 错误。
+
+门禁 `dart_thread_struct_gets_heap_base_only_for_compressed` **不吃语料**：
+它把发布用的那个变换在全部 48 份头文件 × 两种压缩状态上跑一遍，断言
+非压缩输出与输入逐字节相同、压缩输出恰有一个 `heap_base` 且紧跟 `write_barrier_mask`、
+只有真的插入时 `top` 才后移一个字段、已含的头保持原样、其余字段顺序一律不动。
+34 份需要插入、14 份本来就对。
+
+> 教训在于**检查缺在了哪**。此前没有任何东西把「dae 发出的结构体」与「dae 反汇编出的指令」
+> 放在一起比过，而两者都在手边——而它们的分歧只差一个 `ldr` 的立即数就能看出来。
+> **任何 per-version 布局表都应该至少拿一个「目标代码自己明确写出来的偏移」对一次账**；
+> 最便宜的锚点就是栈溢出守卫里的 `stack_limit`，而它几乎出现在每一个函数里。
+
+## 内联分配 stub：同一种类名，来自另一种形状（2026-10-01）
+
+`alloc_stub_name` 早就认得**瘦**的那一种——12–16 字节的 shim，用 `mov`+`movk` 物化类 tag 后
+立刻 `b` 进共享分配器（`0x4294` → `AllocationStub_Duration`）。但 Dart 还会把**整个分配器内联**
+成胖 stub，而那些此前一个名字都没有：material_3_demo 上 **13 个地址 / 7 275 次调用＝
+全部直接调用的 8.4%**，是剩下最大的一族（占未命名部分的 42.7%）。
+
+胖形状有十条可机械校验的指令：
+
+```
+ldp  <A>, <B>, [THR, #<top>]   ; 一条指令同时取 bump 指针与上限
+add  <A>, <A>, #<size>         ; 大小必须是**定长立即数**
+cmp  <B>, <A>
+b.ls <慢路径>
+str  <A>, [THR, #<top>]        ; 提交 bump——写回**同一个**字段
+sub  <A>, <A>, #<size-1>       ; 退回 tagged 指针，必须恰好是 size-1
+mov  <H>, #<lo>
+movk <H>, #<hi>, lsl #16       ; 对象头
+stur <H>, [<obj>, #-1]         ; 存在 payload 前一个字
+```
+
+`<top>` 的位移是**按字段名**在该版本的 `DartThread` 布局里反查的，不写死
+（3.13.0 是 0x58；写屏障那轮就是前车之鉴）。类 id 由对象头按 profile 自己的
+`tagging.cid_tag_pos`/`cid_tag_mask` 取出，类名先查快照类表、再退回 profile 的预设类表。
+
+**「必须是定长立即数」这一条正是防编造的关键。** 变长分配器（`AllocateArray`、
+`AllocateTypedData`）的大小来自寄存器，而它们本体里的 `mov x17, #0xfffa` 是**长度上界**、
+不是对象头。按「第一个 `mov` + 第一个 `movk`」配对会在 `0x3df2a0` 解出 cid 16
+（`WeakSerializationReference`）、在 `0x3e057c` 解出 cid 95（`TwoByteString`）——**两个都是编造**。
+要求 `add <A>, <A>, #imm` 加 `stur <H>, [obj, #-1]` 之后，这两处**连候选集都进不来**。
+
+13 个全部解到大小与类相符的类上：`_Mint`/`_Double` 是 0x10（头 + 一个值）、
+`_Closure` 0x30 与 0x40、`_Record` 0x20 与 0x30（Dart 3 record 按元数不同）、
+`_GrowableList` 0x20、`_Float64x2`/`_Float32x4`/`_Int32x4` 都是 0x20。
+还有第三条独立旁证：`_Closure` 那个的慢路径调的正是 `AllocateClosure_entry_point`、
+`_Double` 那个调 `AllocateDouble_entry_point`。
+
+名字沿用既有的 `AllocationStub_<Class>`、不带地址后缀。同一个类可以有多个特化
+（`_Mint` 与 `_Closure` 各 2 个、`_Record` 3 个），但这不是新问题：瘦 shim 早就有重名
+（1 858 个名字里 1 839 个不同，`AllocationStub__RenderInputPadding` 出现 3 次），
+而「两个特化都在分配同一个类」本身是对的。
+
+具名直接调用的实测变化：material_3_demo 69 796 → **77 071 / 86 825（88.8%）**
+（这一系列工作开始前是 46.6%）；微博 97 128 → **108 194 / 123 659（87.5%）**。
+五个真实应用仍全部 `dart analyze` 0 错误。
+
+**它在 dart 3.13.0 上生效，而在 3.3.4 / 3.6.1 上一个都不出——那是一个未解决的数据问题，
+不是命名器的 bug。** Reqable 的胖分配 stub 形状相同，但 bump 的是 `[x26, #0x50]`，
+而 3.3.4 的 arm64 `DartThread` 头把 `top` 标在 **0x48**、`end` 标在 0x50；3.6.1 完全一样。
+于是 `inline_alloc_stub_name` 那条「`ldp` 的基址必须是名为 `top` 的字段」不成立，它就一个都不命名——
+**这是对的**，因为在这里猜就等于凭空发明「哪个字段才是 bump 指针」。
+值得追下去的理由是：同一批产物**证实了** `stack_limit` 在 **0x38**
+（`ldr x16, [x26, #0x38]` 后接 `cmp SP, x16` / `b.ls` 就是 `CheckStackOverflow`），
+所以头文件在 0x38 是对的、而代码在 0x50 与它不一致——**中间某处差 8 字节**。
+要么 3.3.4/3.6.1 的 arm64 头文件在这一段错了一个字段（那意味着 dae 发给 IDA/r2 的
+`DartThread` 结构从那一点起对**所有**移动端语料都是错的），要么那两个版本的分配器读的是另一对字段。
+要定案必须从 `runtime/vm/thread.h` 里**按移动端构建配置把所有 `#if` 分支解掉**再逐字段算偏移，
+这不是能猜的事；在定案之前命名器对这些版本保持沉默。
+若能解决，光 Reqable 上 3 个胖分配 stub 就值 **9 191 次调用**。
+
+已有的外部真值门禁**覆盖不到这一条**，而且值得说清为什么：`ground_truth.rs::alloc_stub_naming`
+拿 `.symtab` 里的 `Precompiled_AllocationStub_<Class>_<n>` 对拍，是仓库里最强的一条——
+但它那 6 份语料**全是 x64**（`elf-x64.json`），而本命名只在 arm64 上取证过。
+T4_blank 的 88 个 `AllocationStub_*` 表项长度全是 16 字节即瘦 shim，而胖 stub 至少 9 条指令＝36 字节。
+所以 `inline_alloc_stub_names_match_the_class_table` 改成**重推**：从 `dae disasm` 的文本重解形状、
+用两个立即数重算对象头、按 profile 的 tagging 解出 cid（tagging 在进程内另取，
+与生产代码是不同路径），要求解出的类名与发布的逐字相符；再加 size 16 对齐、
+`sub` 立即数恰好 `size-1`、头字存在 `-1`。`sample_arm64` 上重推 **19 条**。
+负对照跑过：把生产代码的 cid 位移改错一位，门禁立刻失败。
+它的**第一版断言 `size == 表项长度` 是错的**——表项里还含慢路径块
+（`0x4c650c`：对象大小 32、表项 100 字节）——现在改成 `size <= 表项长度`。
+
+## 每一份 arm64 产物里 `CODE_REG` 都标在了错的寄存器上（2026-10-01，已修）
+
+这不是找它时找到的，而是读写屏障取证时撞见的：屏障表第 17 块的原始 capstone 文本是
+`mov x1, x23`、dae 渲染成 `mov r1, CODE_REG`，而第 18 块是 `mov x1, x24`、渲染成 `mov r1, r24`。
+**相邻两块，一块被标成代码寄存器、下一块没有**——两个标签里必有一个是错的。
+
+错的是别名表。三份 arm64 平台 profile 在**同一个文件里**同时写着
+`registers.code_reg = "x24"` 与 `register_aliases["x23"] = "CODE_REG"`。渲染用的是别名表，
+所以每一份 arm64 产物都把 x23 标成 `CODE_REG`、而真正的那个反而裸着。
+`material_3_demo` 实测：**asm/ 里 1 010 处、dart/ 里 3 014 处 `CODE_REG` 是错的**，
+同时 asm/ 里 559 处 `r24`、dart/ 里 2 834 处 `x24` 本该带这个标签。
+
+真值在 SDK 里，而且毫不含糊：`runtime/vm/constants_arm64.h` 在**查过的每一版**
+（2.12.4、2.19.6、3.3.4、3.6.1、3.13.0）都写 `const Register CODE_REG = R24;`，
+而 R23 只是 `kAbiPreservedCpuRegs` 里一个**没有名字角色**的成员。另有两条内部旁证：
+`non_field_base` 里列的是 x24（代码寄存器永远不是对象指针）而没有 x23；
+并且修完之后，runtime-call stub 里那句 `ldr CODE_REG, [THR, #0x110]` 才读得通——
+它就是在把**本 stub 自己的 `Code` 对象**装进代码寄存器，旧渲染让这句话毫无意义。
+
+两个错别名都来自被移植的 Python 参考实现（`dart_aot_export.py` 同一行写着
+`"x18": "ARG2", "x23": "CODE_REG"`），所以记成 `src/export/mod.rs` 的第 5、6 处更正。
+第二个是**编造**而不是搞混：**`ARG2` 在任何版本的 `constants_arm64.h` 里都不存在**；
+R18 的注释是「reserved on iOS, shadow call stack on Fuchsia, TEB on Windows」，
+SDK 还明说「We rely on R18 not being touched by Dart generated assembly or stubs at all」。
+与此一致，`material_3_demo` 与 Reqable 的产物里 `ARG2`/`x18`/`r18` 出现 **0 次**，
+所以删掉这个别名对输出是**可证明的无操作**——只是不再在发布数据里留一个凭空发明的角色名。
+
+修法是把别名指到 x24，并把 x23 的别名整个去掉（它渲染成 `r23`，这是诚实的：
+SDK 里没有任何东西给它角色）。**刻意没做**的是给那些有角色、但 dae 里没别名的寄存器补别名
+（`x21` DISPATCH_TABLE_REG、`x25` kWriteBarrierSlotReg、`x4` ARGS_DESC_REG）：
+那是会带来自己那份产物变动的**功能**，不是正确性修复，而这一轮的范围只限定在「删掉错的说法」。
+
+验证：三个真实应用仍然 `dart analyze` **0 错误**，且结构化/未映射/具名数**逐位不变**
+（material_3_demo 13 947/1 135 与具名 58 478；Reqable 10 916/321 与 28 440；
+飞书 18 537/1 018 与 30 567）——一次渲染改动没有动任何控制流。
+**regress 套件对这个缺陷是盲的**，这一点必须说清楚：它的三份 arm64 存档
+（3.4.0/3.5.0/3.6.1）各只有 **1 个** `asm/` 文件，且 `CODE_REG`/`x23`/`x24` 出现 **0 次**——
+那几个 hello-world 根本不碰这个寄存器。所以覆盖放在一条新门禁里：
+`platform_register_aliases_are_self_consistent`，它用**发布用的那个解析器**
+（`parse_platform`，也就是 `include_str!` 进二进制的同一份数据）读六份平台 profile，
+断言 `registers` 里每个角色：凡别名表中出现该角色名的，其物理寄存器集合**必须包含**
+`registers` 指名的那个。它不吃语料，所以任何检出里都会真跑：6 份 profile、51 个 (profile, 角色) 对。
+判据用「包含」而不是「相等」，因为一个角色可以合法地有两个编码——`sp` 同时对应
+x15（Dart 的栈指针）与 x31（硬件编码），两者都该印 `SP`。
+负对照跑过：把 `CODE_REG` 指回 x23，门禁立刻失败并把矛盾原文印出来。
+
+## 一个表项里装着 20 个 stub：写屏障族的命名（2026-10-01）
+
+最后一簇未命名调用其实**根本不是未命名的 stub**。`material_3_demo` 的指令表条目 `0x3e0a84`
+长 **640 字节**，而调用方是直接 `bl` 到 `0x3e0aa4`、`0x3e0ac4`…… 也就是**条目内部**的地址。
+这些目标既不在函数表也不在 stub 表里，所以任何「按表项遍历」的路径**结构上就够不到它们**。
+实测：**10 个这样的地址 / 4569 个调用点 ＝ 全部直接调用的 5.3%**，全在这一个表项内、间隔恰好 0x20。
+
+反汇编出来就知道为什么了：它是 **20 个 32 字节的子 stub**，20 个块的助记符形状**完全相同**
+（`str, str, mov, ldr, blr, ldr, ldr, ret`——用**原始 capstone** 在两个 SDK 版本、两种容器、
+两个操作系统上核过：160 条指令只有 **1 种**形状）。每块保存 LR 与 x1、把**不同的**寄存器搬进 x1、
+从线程结构里取出一个代码指针、调用它、再严格逆序弹回两个寄存器、返回。唯一的区别就是转发的寄存器：
+x0–x14、x19、x20、x23、x24、x25——恰好是「可能装着被写入值」的那些，
+跳过了所有在 Dart 里有固定职责的寄存器（x15=SP、x16/x17 scratch、x18 platform、x26=THR、
+x27=PP、x29=FP、x30=LR）。
+
+**位移必须从指令里读，绝不能写死。** `material_3_demo`（dart 3.13.0）是 `[x26, #0x1f8]`，
+而 Reqable（dart 3.3.4）是 **`[x26, #0x1e8]`**。并且在各自版本的 `DartThread` 布局里
+它们是**不同的字段**：3.13.0 的 0x1f8 是 `write_barrier_entry_point`，
+3.3.4 的 0x1e8 是 `array_write_barrier_entry_point`。更麻烦的是**同一个位移会换意思**——
+0x1f8 在 3.13.0 是 `write_barrier_entry_point`、在 3.6.1（飞书）却是
+`array_write_barrier_entry_point`，而在 3.3.4 是 `allocate_mint_with_fpu_regs_entry_point`。
+所以名字是这么造出来的：从指令里读出位移 → 在**该版本自己的**布局头文件里查字段名
+（`struct_tables::dart_thread`，与 r2/IDA 结构头同源）→ 要求字段以 `_entry_point` 结尾 →
+词干转 CamelCase：3.13.0 得 `WriteBarrierStub_x0`、3.3.4 得 **`ArrayWriteBarrierStub_x0`**。
+**是两个不同的屏障，所以名字也不同**，因为 profile 自己就这么区分。
+名字**不声称**屏障的语义，寄存器后缀也只声称「这个变体转发那个寄存器」——一对一的形态映射。
+
+`offset = 字段序号 × 8` 这一步也是**实测**的、不是假设：48 份布局头文件（24 版 × arm64/x64）
+**每一行都是 `__int64 <name>;`**（没有第二种类型），并且把推出的 offset 与带**显式 offset** 的
+`dart_struct_fields-*.json` 逐字段对过账（约 1.4 万次比对，**0 处不一致**）。
+
+接线过程中翻出两个 bug，都比这个功能本身更值钱：
+
+* **有一整条命名路径是死的。** `call_edges.txt` 的名字走 `name_alloc_stubs`，而它**只调
+  `alloc_stub_name`**——所以上一轮的 `RuntimeCallStub_*` 进了 `dart/` 与 `text/stubs.txt`，
+  却**从来没进过 `call_edges.txt`**（14 000 处）。而且即便把链接上，名字还是被挡住：
+  `name_map` 给**每个**指令表入口都兜了 `sub_{ep:#x}` 占位，而筛目标的条件是
+  「不在 `name_map` 里」——**占位被当成了名字**。两处都修了；
+  `name_alloc_stubs` 现在统一委托给 `alloc_stubs_at` 里那**一条**链。
+* **同一个占位还在灌水 callgraph 自己的指标。** `edges_resolved` 只判非空，于是报
+  82 256/86 825 ＝ **94.7%**——正是此前在反编译器 `calls_named` 上被揭穿为虚高的那个数
+  （7ea269a 已修），而这边**一直没人修**。现在排除 `sub_0x…`。
+
+`material_3_demo` 上的结果：具名直接调用 **53 909 → 58 478**、`dart/` 里 `sub_0x` 出现次数
+**33 579 → 28 553**、`call_edges.txt` 名字列为空的行 **4 569 → 0**，
+并且 `call_edges.txt` 与 `dart/` 现在报出**同一个**具名调用数（58 478）——两条独立代码路径互证。
+Reqable +896、飞书 +1312。三者 `dart analyze` 仍全 0 错误；结构化数**逐位不变**
+（13 947/1 135、10 916/321、18 537/1 018），说明命名没有动任何控制流。
+23 份存档语料的对象层逐字节一致，动的只有 `text/call_edges.txt`、`callgraph.dot`，
+以及 3.4.0/3.5.0/3.6.1 的 `text/stubs.txt`；`regress_all` 回到 25/25。
+
+`dae disasm <bin> 0xADDR` 现在也接受这些地址，窗口是 **32 字节**、而且**不是猜的**：
+形状校验要求恰好 8 条指令，且只有当表项的**每一个** 32 字节块都通过时才切分。
+块中间的地址（`0x3e0aa8`）照旧 rc=1 拒绝。
+
+门禁 `write_barrier_stub_names_are_provable` 用**三条独立来源**重推每一个发布出来的名字：
+`dae disasm` 的文本（CLI + 渲染路径）、仓库里**该 SDK 版本**的 `DartThread` 头文件
+（与运行时的 `struct_tables` 是不同的文件、不同的解析器）、以及产物本身。
+20 个变体里有 19 个逐寄存器比对（第 20 个渲染成 `CODE_REG`，退化成「必须两两不同」这条），
+并断言 20 个后缀**两两不同**——这正是抓「取了 `mov` 的**目的**寄存器而不是源寄存器」的网，
+因为那样 20 个会全一样。还断言 `stubs.txt` 与 `call_edges.txt` 对每个共同地址给出同一个名字。
+
+两个负对照都真跑过。把 `mov` 的操作数下标换掉，门禁立刻失败。把词干硬编码成 `write_barrier`，
+**只用仓库自带语料时照样通过**——因为那份语料恰好就是 3.13.0——只有当
+`DAE_TRUTH_ANDROID_SO` 把 Reqable 加进来才失败（它的期望名是 `ArrayWriteBarrierStub_x0`）。
+这是个**已被证实的洞**，所以门禁会**打印**它：只有一份位移时明说「写死名字抓不到」，
+有两份以上不同词干时才报「反硬编码覆盖已生效」。这条跨语料检查的**第一版是错的**：
+它断言「位移不同 ⇒ 词干不同」，可**同一个字段会随版本搬家**（3.3.4 的 0x1e8 与 3.6.1 的
+0x1f8 都是 `array_write_barrier`），于是它在**正确的输出**上失败了。
+真正的绊网是逐语料的推导；跨语料那层只汇报、不断言。
+
+## 移动端构建里 25 000 个没有名字的函数体：已量化、已定性到可证边界、未修（2026-10-01）
+
+`text/stubs.txt` 过去把自己描述成「指令表里**没有 Code 对象**的条目（stub 前缀）」。
+这句话两半都不成立，而后一半正好盖住了 dae **不反编译的最大一块代码**。
+
+它实际装的是 `func_eps` 的补集：**没有被任何 Function 对象引用**的表项。dae 从来没检查过
+「有没有 Code 对象」。而且它们也**不是前缀**——Reqable（`first_entry_with_code` = 48 455）的
+46 723 条里有 **7 798 条**下标 ≥ 该值，同时有 **9 530 个已命名函数**下标 < 该值，两类是交错的。
+表头、摘要行、`dae help stubs` 文案、README 的产物表四处都那么写，现已全部更正。
+
+要紧的地方在于：这些条目**并不都是 stub**。对五份语料逐个只看头两条指令：
+
+| 语料 | `first_entry_with_code` | 未被引用的表项 | 以 `EnterFrame` 开头 | 占比 | 字节 |
+|---|---|---|---|---|---|
+| material_3_demo（3.13.0，非压缩） | 0 | 2 735 | 34 | 1.2% | ~0 |
+| 微博（2.19.6，压缩） | 0 | 3 568 | 18 | 0.5% | ~0 |
+| ChatGLM（3.11.6，压缩） | 0 | 4 428 | 18 | 0.4% | ~0 |
+| **Reqable（3.3.4，压缩）** | **48 455** | 46 721 | **24 932** | **53.4%** | **8.09 MB** |
+| **飞书（3.6.1，压缩）** | **61 609** | 59 770 | **43 195** | **72.3%** | **14.67 MB** |
+
+这里的 `EnterFrame` 指 `stp x29, x30, [x15, #-0x10]!` 紧接 `mov x29, x15`——标准的 Dart arm64
+函数序言，stub 不会这么开头。它们的长度最长 27 708 字节、中位数 180。
+所以在 `first_entry_with_code` 非 0 的那两份构建上，**dae 归入「stub」的东西里超过一半是普通函数代码，
+而且从来没进过 `asm/` 或 `dart/`**——分别是 8.09 MB 与 14.67 MB，对照已反编译的 11 237 与 19 555 个函数。
+
+有两个因素**已被排除**：压缩指针（微博与 ChatGLM 都是压缩的，占比却只有 0.4–0.5%）、
+混淆（Reqable 的名字是混淆的——`YDp`、`fOo`——而飞书不是，飞书的占比反而更高）。
+唯一干净的相关项就是 `first_entry_with_code > 0`。
+
+对同一个 Reqable 二进制跑 aotopsy，它报 `instructions: 57960 entries (48455 stubs + 9505 code)`，
+把前一组描述为 **`--split-debug-info`/`--obfuscate` 下的「48455 discarded Code objects」**，
+然后把**全部 57 960 条**都当函数反汇编。也就是说另一个独立工具对同一个字段的读法一致，
+只是它两组都反编译。
+
+**它们到底是什么，现在由 SDK 源码定案了；顺带把另一个问题也定了。**
+`runtime/vm/app_snapshot.cc`（3.3.4）按 `InsertInstructionOfCode` 命令逐条建表——
+也就是**每个 Code 对象一条**——并且断言 `!Code::IsDiscarded(code) || (not_discarded_count == 0)`，
+所以**所有被丢弃的 Code 对象都排在前面**；`first_entry_with_code` 就是在遇到第一个未丢弃的
+Code 时把当前计数记下来。读取侧是：
+
+```c
+if (code_index < first_entry_with_code) {
+  *entry_point = d->instructions_table().EntryPointAt(code_index);   // 入口点**照样给出**
+  return StubCode::UnknownDartCode().ptr();                          // Code 对象没了
+} else {
+  const intptr_t cluster_index = code_index - first_entry_with_code; // 与 Code 簇同序
+  ...
+}
+```
+
+所以那些条目是**Code 对象被丢弃的真代码**，入口点一应俱全——正是 aotopsy 说的
+「48455 discarded Code objects」。它们既不是 stub，也不是填充。
+
+同一段源码还**从原理上**证明了本次会话早先那个 `code_size` 修复是对的（此前只有实测支撑）：
+SDK 对 `code_index < first_entry_with_code` **照样返回入口点**，所以把这一段当成「没有长度」是错的。
+而且 dae 的下标算术与 SDK 的编码一致——`CodeIndexToClusterIndex` 是
+`code_index - 1 - first_entry_with_code`、`GetCodeByIndex` 把 0 留给 `LazyCompile`，
+而 dae 的 `entry_for` 用 `ci - code_base_ref - 1` 得到的是**指令表**下标；
+dae 要的正是这个，因为它索引的是 `pc_offsets`。
+
+**两个开放问题现在都定案了，结论是：这不是 dae 的缺陷。**
+
+*凭什么说它们是函数体而不是 stub？* 不能只靠序言——VM stub 也会发 `EnterFrame`。
+独立证据是**长度分布**，它在 Reqable 上把三个群体干净地分开了：
+
+| 群体 | 条数 | 中位 | p90 | p99 | 最长 | 合计 |
+|---|---|---|---|---|---|---|
+| 被 Function 引用（已命名、已反编译） | 11 234 | 272 B | 2 324 B | 14 168 B | 159 436 B | 12.14 MB |
+| 未被引用、带 `EnterFrame` 序言 | 24 932 | **180 B** | **704 B** | **2 352 B** | **27 708 B** | **8.09 MB** |
+| 未被引用、无 `EnterFrame`（真 stub） | 21 789 | 12 B | 28 B | 204 B | 1 020 B | 0.39 MB |
+
+中间那一行与第一行同数量级、与第三行差三个数量级。**不存在 27 708 字节的 stub。**
+
+*为什么没有 Function 引用它们？* 因为**快照里根本没有它们的 Function 对象**。
+dae 的每个簇的对象个数是**从流里读出来的**（簇头之后紧跟 `count = read_unsigned()`），
+所以它不可能少数；而一旦错位就会撞上 `cid > 60000` 的漂移守卫并告警——
+Reqable 解析出来是 **0 告警**。「13 371 条 Function」是二进制自己说的。
+（早先从 `closure_data: 9304` 对 dae 的 6 505 个 `_anon_closure` 得到的线索只差约 2 800，
+比这里的量小一个数量级，也**不构成截断的证据**。）
+
+所以那些元数据**不在这个文件里**：混淆 / `--split-debug-info` 构建把它外置了，
+这正是 Code 对象被丢弃的原因，也是 aotopsy 对同一批 48 455 条报
+「inline attribution unavailable」的原因。**没有名字可以恢复**——dae 与 aotopsy 处境相同，
+硬起一个就是编造。剩下的纯粹是**覆盖率**问题：把这些函数体以 `sub_0x…` 形式、
+不带库不带类地发射进 `dart/`。那是与产物其余部分**不同的契约**，而且会动到
+「定文件名 + 定每个入口归哪个库发射」那趟顺序预扫描（正是它保证并行反编译逐字节一致），
+所以记录在这里而没有做。`dae disasm <bin> 0xADDR` **今天就能**看到它们，因为它们属于 stub 表项。
+
+## 把每一条条件分支边都写进产物（2026-10-01，已修）
+
+一个 body 为空、又没有 `else` 的 `if`——
+
+```dart
+if (x1 >= x0) {
+}
+x0 = local_m18; // 0x480ab0
+```
+
+——是反编译器在**静默丢掉一条控制流边**。机器码是 `cmp x1, x0; b.hs 0x480afc`，而 `0x480afc`
+（`RangeErrorSharedWithoutFpuRegsStub`）就在同一个文件里，只是挂在另一条分支下。产物告诉读者
+「x1 >= x0 时什么都不发生」，这是假的。修复前实测：sample_arm64 **109** 处、h212keep **1596** 处、
+**五份真实应用合计 9817 处**（material_3_demo 1929、微博 2972、ChatGLM 3209、飞书 1203、Reqable 504）。
+
+`} else` 那种形态（`if (c) { } else { … }`，sample_arm64 上 2560 处）**不是**这个缺陷，也不能跟着一起
+「修」——数它们的门禁专门把两种形态分开，早先的注释也记着「混在一起改会把产物改坏」。
+
+### 根因：`seq` 返回空有**两种**完全不同的原因
+
+给每一个 `Node::If` 构造点加临时插桩（`DAE_DBG_EMPTYIF`，量完即删），109 处被精确归类：
+`find_join` 那条路 **52** 处（其中 25 处汇合点**就是**真支目标、23 处假支目标已发射过）、
+`terminates(ti)` **39** 处（**其中 37 处的 `stop` 就是 `ti`**）、不可归约 **14** 处、镜像支 **4** 处。
+
+`seq(x, stop)` 返回空 `Vec` 有两种从外面看一模一样的情形：
+
+1. `x == stop`——目标是区域终点，它的代码**紧接着**这个 `if` 发射。此时留空是**对的**。
+2. `x` 已在 `done` 里（共享块，代码在别处发射过）或在区域之外——那一支的语句（含 store/call 这类
+   **有副作用**的语句）被整段跳过。这才是丢边。
+
+### 修法：三档，按「能证明的优先」（`Structurer::fill_branch`）
+
+* **①** 目标就是紧随这个 `if` 之后发射的块（汇合点 `j`，或终止/镜像支的落空块）⇒ 留空，那就是真值。
+* **②** 目标是已发射过的共享块、且到汇合点之间是**直线段** ⇒ **尾复制**进分支体
+  （`dup_to_join`，是既有 `dup_tail` 的姊妹函数，只是把收尾条件从「遇到终止符」放宽成
+  「终止符**或**汇合点」）。这正是 IDA/LLVM 对共享尾块的同一套取舍，而且本文件在无条件跳转那条路上
+  **早有这个先例**。它既记下这条边、又**保住函数的 structured 身份**。
+* **③** 抄不了 ⇒ 如实写成 `gotoLabel(0x<目标>)`。地址取自指令表、是事实而不是猜测——
+  与 `RuntimeCallStub_0x…` 同一纪律（保留地址，不编 runtime entry 名）。
+
+外加一次真正的结构化：当 `terminates(ti) && stop == Some(ti) && terminates(fi)` 时两支同归 `stop`，
+正确形态是**镜像发射**（`if (!c) { <落空支> }`）——没有空 body、没有 goto、不掉指标。
+`terminates(ti)` 那 39 处里有 37 处属于这一类。
+
+三处必须说清的取舍：
+
+* **镜像支必须带 `terminates(fi)` 前置条件。** 走到这一支说明 `find_join` 返回 None，即 ti 与 fi
+  **没有共同后继**，所以「两支同归 stop」并不自动成立。少了这个前置条件，fi 不终止时镜像会让
+  c=false 的路径**落进 ti**——那是把一条二进制里不存在的边写进产物。
+* **不可归约那一支的 fallthrough 是 `None` 而不是 `stop`。** 它发完 `if` 紧接着 push 一条
+  `Goto(fi)` 就 `break`，所以 `if` 之后是**假支的 goto**、不是 ti 的代码，档位①的前提不成立。
+  这些函数本来就被 `bail` 记成 unstructured，补 goto 零代价。
+* **空的 `els` 也要补。** `find_join` 只保证两支*最终*都走到 `j`；中间那段共享块的语句同样被跳过，
+  而它们是有副作用的。只补 `then` 的第一版在 h212keep 上留下 483 处这样的沉默。
+
+### 实测（base → 修复后）
+
+| 语料 / 应用 | 无 else 空 if | 结构化率 | 尾复制 | gotoLabel | dart/ 字节 |
+|---|---|---|---|---|---|
+| sample_arm64 | 109 → **5** | 90.21% → 90.04% | 85 | 262 → 308 | +0.5% |
+| T4_blank (x64) | 118 → **6** | 87.60% → 87.28% | 64 | 507 → 558 | +0.4% |
+| hello_3.12.2 (x64) | 103 → **5** | 89.20% → 88.95% | 100 | 269 → 309 | +0.6% |
+| hello_2.13.4 | 102 → **6** | 89.79% → 89.56% | 58 | 514 → 554 | +0.3% |
+| h212keep (elf arm64) | 1596 → **737** | 88.40% → 76.57% | 497 | 1409 → 1882 | +2.8% |
+| material_3_demo | 1929 → **62** | 92.47% → 91.96% | 1467 | 3726 → 3965 | — |
+| Reqable | 504 → **2** | 97.14% → 96.97% | 435 | 1391 → 1445 | — |
+| 飞书 | 1203 → **15** | 94.79% → 94.48% | 2399 | 1966 → 2126 | — |
+| 微博 | 2972 → **67** | 91.08% → 90.23% | 2233 | 8067 → 8600 | — |
+| ChatGLM | 3209 → **70** | 91.95% → 91.48% | 3111 | 6631 → 7123 | — |
+
+`dart analyze`：五份真实应用**各 0 错误**（warning 30 892 / 30 455 / 57 940 / 58 112 / 67 366 条，
+全是 `unused_local_variable`，而且比修复前**更少**——复制体让那个寄存器有了读者）。
+14 797 个产物文件**零非 ASCII**。`unmapped` 行数不变（微博/ChatGLM 1 → 1），具名直接调用数不变
+（m3 77 071/86 825、Reqable 40 548、飞书 43 182、微博 108 194、ChatGLM 142 415），
+`regress_all` 25/25——存档里有 `text/`、`ida_script/`、`r2_script/`、`frida.js`、`callgraph.dot`，
+**没有 `dart/`**，所以这次改动一处也没碰到。
+
+**结构化率就是代价，而它是「重新分类」而不是退化。** `Node::Goto` 会把整个函数记成 unstructured；
+那些函数过去被算作 structured，靠的正是「把这条边藏起来」。尾复制把大部分买了回来
+（h212keep：只用 goto 是 61.2% → 加尾复制 **76.6%**；sample_arm64 86.4% → **90.04%**）。
+最低的语料是 76.57%，`STRUCTURED_FLOOR` 是 0.70，所以**下限没有下调**。
+
+### 残留 5 处是对的，不是漏网
+
+每一处都对照同一文件里的 raw 反汇编核过：
+
+* 三处是 `ti == fi`：`0x4b10dc: b.eq #0x4b10e0`，而**下一条指令就是** `0x4b10e0`。两个分支去同一个
+  地方，这个 `if` 本来就什么都不做（`Uri_replace`、`SimpleUri_replace`、`RegExp_factory_ctor`，
+  都是内联之后剩下的字符串同一性检查）。
+* 两处是外层 `if` 的档位①：`RangeError_checkValidRange` 的 `0x481d3c: b.lt #0x481d48`，汇合点就是
+  `0x481d48`，它的代码（`tbnz x1, #0x3f`）紧随 `if` 之后发射。
+
+### 门禁改动
+
+* `empty_if_without_else_does_not_grow`：上限 **109 → 5**，并新增尾复制数的**下限**
+  （`duplicated branch body` ≥ 40，实测 85）——这样一次把档位②静默关掉的重构不能靠
+  「换一种丢法」蒙过去。两条断言都**负测**过：把 `dup_to_join` 改成 `return None`，计数
+  85 → 25，下限报红；把 `goto_if_empty` 改成空操作，尾复制不变而无 else 空 if 5 → **43**，上限报红。
+* `post_index_stack_slots_do_not_regress` 改成数**不同的 (文件, 机器地址)**而不是裸出现次数：
+  942 → **926**，且 base 与修复后都给 926（裸计数分别是 942 / 943）。多出来的那一次是既有语句的
+  **副本**，不是命名退步——一个会因为「代码被抄了一遍」就移动的计数棘轮，每次这类改动都得重基。
+  同时加了下限（≥ 500），免得探测器坏掉时报 0 反而通过。
 
 ## 已知缺口（量化过，未修）
 
@@ -872,6 +1497,38 @@ dae 不跟踪基址的类型，在不知道基址就是接收者的情况下写�
 `dart analyze` 错误 0 vs 约 7 万，见 [`COMPARISON.zh.md`](COMPARISON.zh.md)。
 
 ## 已知短板（优化清单）
+
+**上面那次测量之后已经做掉的——按 `CODE_REG` 做身份级命名。** Dart 的 shared stub 会把
+**自己的 Code 对象**装进代码寄存器，所以本 stub **自己本体**里的 `ldr x24, [THR, #<字段>]`
+就能给它命名：`code_reg_stub_name` 要求那个字段（位移从指令里读、字段名查**该版本**的
+`DartThread` 布局）以 `_stub` 结尾，输出 `<CamelCase(字段)>_0x<addr>`——例如
+`NullCastErrorSharedWithoutFpuRegsStub_0x3dc7b0`、
+`LateInitializationErrorSharedWithoutFpuRegsStub_0x3dca38`、`DeoptimizeStub_0x3de1a0`、
+`LazyDeoptFromThrowStub_0x3ddd40`。它排在 `runtime_stub_name` **之前**，所以此前叫
+`RuntimeCallStub_0x…` 的 13 316 处也一并升级成真正的身份名（那个形状装的是
+`stack_overflow_shared_without_fpu_regs_stub`）。实测：`material_3_demo` 具名直接调用
+58 478 → **69 796 / 86 825（80.4%）**，而这一系列工作开始前是 46.6%；Reqable
+28 440 → **31 625**；飞书 30 567 → **36 622**。三者 `call_edges.txt` 与 `dart/` 数字一致、
+`dart analyze` 全 0 错误、结构化数逐位不变。**跨版本是构造上保证的**：Reqable（dart 3.3.4）
+的名字来自 3.3.4 的头文件，不是 3.13.0 的。
+门禁 `code_reg_stub_names_trace_back_to_profile_and_instructions` 是**反向**复核：
+从发布出来的名字出发 → 词干必须能在该版本头文件里找到对应的 `*_stub` 字段 →
+再断言反汇编出的**本体**（截到第一条终止指令）里确实有
+`ldr CODE_REG, [THR, #<该字段的 offset>]`；`sample_arm64` 上反推出 26 条。
+负对照跑过：把终止指令截断删掉，门禁立刻失败，而且失败在**预测到的那个假归属**上
+（`SlowTypeTestStub_0x4c47ac`，它自己的本体只有一条 `brk #0`）。
+
+**下一项——剩下的一半，以及必须先定的那条规则。** 本体里唯一能识别的装载是
+`ldr rN, [THR, #<*_entry_point>]` 的那一批（截断后 91 个地址 / 3 178 次调用），
+证明的是「这个 stub **调用**那个 runtime entry」，**不等于**「这个 stub **就是**那个 entry 的 stub」。
+判别器是**重数**：`allocate_object_slow_entry_point` 被 **80 个不同地址**装载——
+80 个分配 stub 共用一条慢路径，它们谁都不是「AllocateObjectSlow stub」；
+而 `Throw_entry_point`、`Instanceof_entry_point`、`ReThrow_entry_point`、
+`DoubleToInteger_entry_point`、`suspend_state_init_async_entry_point`、
+`OldMarkingStackBlockProcess_entry_point` 各只被 **1 个**地址装载。
+所以规则是「**全二进制里只有一个地址装载该字段时才认身份**」，约可得 11 个地址 / 3 000 次调用。
+另外 238 个地址（13 851 次调用）本体里**根本没有**可用的 THR 装载——
+它们是内联了整个分配器的胖 stub、分派 stub、类型测试 stub。
 
 1. 共享尾块与不可归约循环：**前向**跳进已发射块的用尾复制处理（`dup_tail` 把那段直线代码再写一遍，
    打 `duplicated tail` 注释；限 16 块 / 每函数 256 条语句），真实应用里救回 66 个函数。

@@ -9,7 +9,7 @@
 [![Publish CI](https://img.shields.io/github/actions/workflow/status/ejfkdev/dae/publish.yml?label=publish)](https://github.com/ejfkdev/dae/actions/workflows/publish.yml)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTE4IiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDI1NiAyMTgiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMzQuNCAwLjEzMDE1MkwxMTEuNDggMjUuNjAyMkMxMTEuNjY1IDI5LjU2OTkgMTA5LjA1NCAzMi4wMDE5IDEwNC4wNjQgMzIuMDAxOUg2LjM5OTlWMEM2LjM5OTkgMC4xMzAxNDkgMTM0LjQgMC4xMzAxNTIgMTM0LjQgMC4xMzAxNTJaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTI1NiAwLjEzMDEyN0wxMDIuNDAxIDIxNy43MzJIMDBMMTUzLjU5OSAwLjEzMDEyN0gyNTZaIi8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEyMS42MDEgMjE3LjczMkwxMzkuNjUgMTkyLjEzNEMxNDIuNDY1IDE4OC4xNjYgMTQ3LjA3NiAxODUuNzM0IDE1Mi4wNjcgMTg1LjczNEgyNDkuNjA0VjIxNy43MzZIMTIxLjYwMVYyMTcuNzMyWiIvPjwvc3ZnPg==)](https://zcode.z.ai/)
 
-> Config-driven **Dart AOT snapshot** analyzer and debug-info exporter. No Dart SDK, never runs the target: locates the embedded snapshot inside Mach-O / ELF / PE, exports the same symbols and structs as [blutter](https://github.com/worawit/blutter) for IDA / radare2 / Frida (with four deliberate corrections where the reference it was ported from was wrong — see `src/export/mod.rs`), and **decompiles functions into Dart that `dart analyze` accepts**. Covers desktop *and* real-device mobile (compressed-pointer) builds.
+> Config-driven **Dart AOT snapshot** analyzer and debug-info exporter. No Dart SDK, never runs the target: locates the embedded snapshot inside Mach-O / ELF / PE, exports the same symbols and structs as [blutter](https://github.com/worawit/blutter) for IDA / radare2 / Frida (with six deliberate corrections where the reference it was ported from was wrong — see `src/export/mod.rs`), and **decompiles functions into Dart that `dart analyze` accepts**. Covers desktop *and* real-device mobile (compressed-pointer) builds.
 
 Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `dart compile aot-snapshot` (Dart 2.7+ cluster snapshots).
 
@@ -19,12 +19,17 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
 
   - **Android arm64** — Reqable 3.3.4, Lark 3.6.1, ChatGLM 3.11.6, CHSI 3.7.2, Weibo 2.19.6.
     For all five the instructions-table entry count matches aotopsy exactly
-    (57 960 / 79 327 / 30 782 / 19 752 / 22 623), each at zero warnings, and Lark and Weibo
-    decompile to `dart analyze`-clean Dart (95.9% and 91.1% structured).
-  - **macOS arm64** — Reqable.app 3.3.4: 70 996 table entries, 0 warnings, 1 808 functions at
-    94.9% structured, `dart analyze` 0 errors.
+    (57 960 / 79 327 / 30 782 / 19 752 / 22 623), each at zero warnings, and Reqable, Lark and
+    Weibo all decompile to `dart analyze`-clean Dart (97.0% / 94.5% / 90.2% structured, over
+    11 237 / 19 555 / 19 053 functions).
+  - **macOS arm64** — Reqable.app 3.3.4: 70 996 table entries, 0 warnings, 17 319 functions
+    (14 392 decompiled) at 97.1% structured, `dart analyze` 0 errors.
+    > The previous release quoted "1 808 functions at 94.9%". Same story as Lark's: it was measured
+    > while ~90% of this artifact's functions had a name but no body, so the rate was computed over
+    > the tenth that survived. See
+    > [Names without bodies](docs/DECOMPILER.md#names-without-bodies-the-same-defect-twice-invisible-to-every-gate-2026-10-01-fixed).
   - **flutter-samples demos built locally** (Dart 3.13.0) — `material_3_demo` (5 107 lines) and
-    `animations` (2 108 lines): 15 796 and 11 102 functions, both 92.5% structured, both
+    `animations` (2 108 lines): 15 796 and 11 102 functions, 92.0% and 91.8% structured, both
     `dart analyze` 0 errors. Because the source is known, these are checked *against it*:
     98.8% and 100% of the public classes/mixins/enums declared in `lib/` are recovered, 95.4% and
     97.4% of its string literals appear in the output, and 18/18 and 21/23 source files map to a
@@ -32,18 +37,34 @@ Works on any Dart AOT artifact — Flutter release builds, `dart compile exe`, `
     silently rot.
 - **Decompiles to valid Dart** — lift → CFG → structured emission, not a disassembly dump: loops,
   `if/else`, `break`/`continue`, object-pool literals inlined at their load site, recovered field
-  names as attribution comments. Across 26 artifacts (291 files, 24 253 functions) the output
-  analyses with **0 `dart analyze` errors**, and on real apps it holds up too — Lark 3.6.1 at 95.9%
-  structured and Weibo 2.19.6 at 91.1% (19 053 functions, 1.53 M statements), both error-free.
-  Irreducible control flow keeps an explicit `gotoLabel` and a `NOTE` header rather than being
-  silently flattened. See [Decompiler](#decompiler-experimental).
-- **Fast** — all measured with this release's binary: a 9 MB macOS Flutter sample exports in
-  0.26 s; `--decompile` takes 1.5 s on Lark (25.6 MB Android, 25 183 functions), 1.2 s on
-  `material_3_demo` (14 MB macOS, 15 796 functions) and 1.7 s on Weibo (9 MB Android,
-  19 053 decompiled functions / 1.63 M statements), at 172–263 MB peak RSS. That is **~89× faster
-  than v0.1.7** on the same artifact (106.8 s → 1.20 s) — from not rebuilding run-invariant data
-  per function, from streaming artifacts to disk instead of buffering them, and from rendering the
-  505 libraries in parallel; not from a faster algorithm. The parallel path is **byte-identical** to
+  names as attribution comments. Across 26 artifacts (291 files, 24 497 functions) the output
+  analyses with **0 `dart analyze` errors**, and on real apps it holds up too — Reqable 3.3.4 at
+  97.0% structured (11 237 functions, 1.50 M statements), Lark 3.6.1 at 94.5% (19 555 functions)
+  and Weibo 2.19.6 at 90.2% (19 053 functions, 1.62 M statements), all three error-free.
+  **Every conditional branch edge is accounted for**: an arm is either structured into the `if`,
+  tail-duplicated from an already-emitted shared block, or written as an explicit `gotoLabel(0x…)`,
+  and irreducible control flow additionally gets a `NOTE` header. An empty branch body now only ever
+  means one thing — the target *is* the code immediately after the `if` — where it used to also mean
+  "this edge was dropped" (9 817 such sites across the five apps above; 216 remain and each was
+  checked against the raw disassembly). See
+  [Recording every conditional branch edge](docs/DECOMPILER.md#recording-every-conditional-branch-edge-2026-10-01). See [Decompiler](#decompiler-experimental).
+- **Fast** — every number below is the **median of three alternating A/B rounds** with this
+  release's binary (a single wall-clock run on this project swings ±35%, so one run proves nothing):
+  a 9 MB macOS Flutter sample exports in 0.27 s; `--decompile` takes 0.82 s on `material_3_demo`
+  (14 MB macOS, 15 082 decompiled functions), 1.25 s on Weibo (9 MB Android, 19 053 functions /
+  1.62 M statements), 2.00 s on ChatGLM (14 MB Android, 27 517 functions), 2.64 s on Reqable
+  (21 MB Android, 11 237 functions / 1.50 M statements) and 2.91 s on Lark (25.6 MB Android,
+  19 555 functions), at 151–834 MB peak RSS (Reqable is the outlier: 1.50 M statements).
+  That is **~85× faster than v0.1.7** on the same artifact (106.8 s → 1.25 s) — from not rebuilding
+  run-invariant data per function, from streaming artifacts to disk instead of buffering them, and
+  from rendering the 505 libraries in parallel; not from a faster algorithm.
+  Recording every branch edge (above) costs **~3% on the largest corpus and is inside noise on the
+  rest** — measured against the pre-fix binary in the same alternating rounds, not against a
+  number quoted earlier.
+  > The previous release quoted "1.5 s on Lark, 95.9% structured". Both numbers were measured while
+  > 79% of Lark's functions had a name but no body, so the run was fast and the rate was computed
+  > over the fifth that survived. See
+  > [Names without bodies](docs/DECOMPILER.md#names-without-bodies-the-same-defect-twice-invisible-to-every-gate-2026-10-01-fixed). The parallel path is **byte-identical** to
   the serial one (`diff -rq` over 1011 files), because file names and "which library emits each
   entry point" are both settled by a sequential pre-pass before any rendering starts.
 - **Bilingual CLI** — Chinese locale prints Chinese, everything else English; override with `DAE_LANG=zh|en`.
@@ -119,7 +140,7 @@ export done -> /absolute/path/to/out:
 | `functions.txt` | flat `Library.Class.method → offset` index (under `text/`) |
 | `arrays.txt` / `maps.txt` | every List / Map object with its contents (under `text/`) |
 | `text/fields.txt` | named fields recovered from the snapshot's Field cluster (`rec`) or implicit-accessor names (`accessor`), with byte offsets |
-| `text/stubs.txt` | instruction-table entries with **no** Code object (the stub prefix that `functions.txt` omits); names only where provable from the allocation-stub prologue, empty otherwise |
+| `text/stubs.txt` | instruction-table entries that **no Function object references** (what `functions.txt` omits); names only where provable, empty otherwise. **They are not all stubs**: on builds with `first_entry_with_code > 0` a large share are unnamed *function bodies* -- 53.4% (8.09 MB) on Reqable, 72.3% (14.67 MB) on Lark begin with a standard Dart `EnterFrame` prologue, versus 0.4-1.2% on corpora where that field is 0. dae does not decompile them and does not invent names for them; see [Decompiler](docs/DECOMPILER.md). |
 | `text/call_edges.txt` | call edges: direct `bl`/`call` targets + indirect call sites; per-class allocation stubs are named from their prologue |
 | `callgraph.dot` | direct-call graph between named functions (Graphviz DOT) |
 | `dart/*.dart` | per-function pseudocode that passes `dart analyze` — one file per **library**, via `--decompile` or the `decompile` subcommand |
@@ -195,6 +216,8 @@ decompile
 
 low level
   dae disasm    <binary> <CLASS[.method]>       raw disassembly (arm64 keeps the IL comments)
+  dae disasm    <binary> 0xADDR                 ...or by address: a function entry, a stub-table
+                                                  entry, or a sub-stub inside one (see below)
 
 full export
   dae export    <binary> <out_dir> [--decompile]
@@ -302,8 +325,12 @@ Control flow is **structured**: dominators give the natural loops (back edge = h
 dominates its tail), then each region is emitted recursively — a conditional branch whose two
 arms rejoin becomes `if/else`, `join == region end` counts as a valid diamond, an arm that
 returns becomes `if (c) { return ... }`, a loop header becomes `while`, and an arm that leaves
-the loop becomes `break`/`continue`. 87–92% of functions come out fully structured on the
+the loop becomes `break`/`continue`. 77–90% of functions come out fully structured on the
 corpora we gate on; the rest keep a `gotoLabel` and are marked with a `NOTE` header.
+That range used to read 87–92%, and it widened because a branch whose target was an already-emitted
+shared block used to render as an empty `if (c) { }` — counted as *structured* while the edge, and
+any `store`/`call` on it, was silently dropped. Recording those edges as tail duplication (preferred,
+keeps the function structured) or as a `gotoLabel` is a reclassification, not a regression.
 
 What it does **not** do yet: cross-block expression composition beyond a few levels, and type
 recovery (everything is `dynamic`, field access is `mem(base, disp)`). Unrecognised instructions
@@ -370,6 +397,38 @@ DAE_REQUIRE_GATES=1 cargo test --release
 turns any such skip into a hard failure. Maintainers run it in a checkout that has the corpora; it
 is the only way to tell "the gates passed" from "the gates never ran". Deliberate opt-outs (the
 Android source-truth chain, which needs `DAE_TRUTH_ANDROID=1`) are not affected.
+
+Two gates have a blind spot that no amount of in-repo corpus can close, and both say so out loud
+rather than passing quietly. Point them at real large mobile builds to close it:
+
+```bash
+DAE_TRUTH_ANDROID_SO=/path/to/libapp.so[,/path/to/another.so] \
+  cargo test --release --test code_coverage --test cli_query --test stub_names -- --ignored
+```
+
+A third gate, `tests/stub_names.rs` (release-time, `--ignored`), sweeps **every** corpus it can find
+and re-derives all four stub-name families against each corpus's own `DartThread` layout:
+29 corpora / 23 446 names / 9 arm64 / 5 compressed-pointer, 0 suspicious. It exists because a wrong
+name (`ArrayWriteBarrierStub_*` on compressed-pointer builds) once passed every single-corpus gate --
+the two corpora checked first were exactly the two where the faulty lookup still gave the right
+answer.
+
+* `tests/code_coverage.rs` asserts that *every published function name has a body*. Half of the defect
+  it guards — a stale `idx < first_entry` test in `code_size` that cost Reqable 83.8% and Lark 79.1%
+  of their function bodies — only manifests when the snapshot's `first_entry_with_code` is non-zero,
+  and that value is **0 in all 26 desktop artifacts, all 25 `regress` archives, and even a freshly
+  built Flutter `android-arm64` `app.so`**, so it cannot be synthesised from the toolchain. With
+  Reqable, Lark, ChatGLM, Weibo and CHSI supplied it reaches 29 corpora / 241 699 instruction table
+  entries / 130 435 published functions / 0 orphans, and both of its negative controls are sensitive.
+  The other half (Dart 2.12–2.15 deduplicating byte-identical `Instructions`) *is* covered in-repo.
+* `tests/cli_query.rs::write_barrier_stub_names_are_provable` re-derives every
+  `*WriteBarrierStub_*` name from the instruction's own `THR` displacement plus that SDK version's
+  `DartThread` layout. On in-repo corpora alone it **cannot** catch a hardcoded field name, because
+  they are all dart 3.13.0 where the field really is `write_barrier_entry_point`; adding Reqable
+  (dart 3.3.4, displacement `0x1e8` → `array_write_barrier_entry_point`) makes hardcoding fail.
+  This was verified by running the negative control, not assumed.
+
+Without the variable both gates still run and still assert; each prints which part it could not reach.
 
 ## Known limitations
 

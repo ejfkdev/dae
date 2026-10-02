@@ -17,14 +17,43 @@ cargo test --release --test decompiler_shape       # shape + address self-consis
 cargo test --release --test field_names            # field-name recovery: cross-source agreement, zero conflicts
 cargo test --release --test source_truth           # build tests/fixtures/truth.dart, decompile it, check against the source
 DAE_TRUTH_ANDROID=1 cargo test --release --test source_truth   # same gate on a compressed-pointer arm64 build
+cargo test --release --test code_coverage          # every published function name has a body (+ its own negative controls)
+cargo test --release --test stub_names -- --ignored # sweep EVERY corpus for fabricated stub names (release-time gate)
+DAE_TRUTH_ANDROID_SO=/path/libapp.so[,...] cargo test --release --test stub_names -- --ignored
 DAE_REQUIRE_GATES=1 cargo test --release           # turn every "dependency missing, skipping" into a failure
 ```
+
+`tests/stub_names.rs` exists because of a mistake made this session. Every other naming gate eats one
+to three corpora, and the naming logic has **three** inputs that vary by target: SDK version (the
+`DartThread` layout), architecture (arm64 vs x64 shapes), and **compressed pointers** (the
+`heap_base` conditional field shifts every later field by 8). The `ArrayWriteBarrierStub_*` names
+published for Reqable and Lark were wrong, and they passed every gate -- because the two corpora
+checked first (material_3_demo, uncompressed; Weibo, whose 2.19.6 header already had `heap_base`)
+were exactly the two where the wrong lookup still gave the right answer. The sweep re-derives all
+four name families on every corpus it can find (29 with the mobile set: 23 446 names, 9 arm64,
+5 compressed) against that corpus's own layout, and asserts the anti-vacuity floors that make
+"0 suspicious" mean something (>= 15 corpora, >= 1500 names, >= 3 arm64, >= 20 in each of two
+families). Negative-tested by reinstating the exact bug: hardcoding the stem to `array_write_barrier`
+fails it with 5 suspicious names once a compressed corpus is in the set.
 
 The last one matters more than it looks. Five of the six gate files consume corpora that are
 gitignored (`testing/`, `dart/dart_samples/`), and they skip themselves when those are absent while
 `cargo test` swallows the notice — a fresh clone therefore reports a green suite having measured
 almost nothing. `DAE_REQUIRE_GATES=1` makes any such skip fail, which is the only way to
 distinguish "the gates passed" from "the gates never ran".
+
+**The `--no-default-features` build now compiles and tests clean, which it never did.** The `asm`
+feature gates capstone and the whole decompiler, so a build without it has no `dae::decompiler` at
+all -- and `tests/field_names.rs` and `tests/source_truth.rs` referenced that module unconditionally,
+so `cargo test --no-default-features` **failed to compile**. That hid everything behind it: once the
+compile was fixed, 16 more failures surfaced (15 in `cli_query.rs` plus `dart_valid`'s two
+`dart/`-reading gates), all of them asserting on decompiler output that the configuration cannot
+produce. Each is now `#[cfg(feature = "asm")]`, and the two files whose *helpers* then went unused
+carry a file-level `#![cfg_attr(not(feature = "asm"), allow(dead_code, unused_imports))]`. Result:
+default features 73 passed / clippy 0; `--no-default-features` 47 passed / 0 failed / 0 warnings, and
+the binary still exports correctly (`stubs.txt`, `pp.txt`, `functions.txt` -- everything but `asm/`
+and `dart/`). The lesson is the same shape as the register-alias one: **a configuration nobody runs
+rots silently, and the rot hides behind the first error.**
 
 `tests/source_truth.rs` is the only gate whose **input is source code**: it compiles
 `tests/fixtures/truth.dart` with the local `dart`, decompiles the result, and asserts what the
@@ -363,6 +392,68 @@ material_3_demo (1011 files) and on six more corpora (arm64 Mach-O, x64 Mach-O, 
 Android `libapp.so`, the stress sample). All gates green: 59 tests, `full_scorecard` (26 samples /
 291 files / 24,253 functions / 0 `dart analyze` errors), `regress_all` 25/25, `check_profiles`
 47/47, clippy 0.
+
+### Round five: a self-inflicted 24.8x slowdown, and the two things that caused it (2026-10-01)
+
+The stub-naming work above made export **11-25x slower**, and nothing in the test suite noticed.
+Measured on the same binary, three runs each: `material_3_demo` 0.87 -> 1.33 s, Reqable
+4.80 -> **54.3 s**, Lark 4.83 -> **119.6 s**. Both causes were per-address work that scaled with the
+*instruction table*, which is why the small corpora hid it:
+
+1. **An O(n^2) lookup.** `code_reg_stub_name` needed "how many bytes are left in the table entry
+   containing this address", and got it by scanning all of `pc_offsets` **for every candidate
+   address**. Lark has 59,772 stubs and 79,327 table entries -- about **4.7 billion** iterations.
+   Fixed by building the unclaimed-entry index once (`StubIdx`, sorted by entry address because
+   `pc_offsets` is non-decreasing) and binary-searching it: O(n + m log n).
+2. **Decoding far more than the decision needs.** The same function disassembled its whole window
+   (up to 4 KiB = 1024 instructions) with `disasm_all`, when the body it examines ends at the first
+   terminator -- typically within 20 instructions. Switched to `disasm_count(.., 64)`.
+   (capstone 0.12's lazy `disasm_iter` needs `&mut Capstone`; the call sites hold `&Capstone`.)
+   64 is generous for the shapes actually observed -- the save-all prologue reaches the `CODE_REG`
+   load in 11 instructions -- and **the failure mode of too small is "no name", never "wrong name"**.
+
+After both: `material_3_demo` **0.82 s** / 144 MB (slightly *faster* than the 0.87 s baseline),
+Reqable **5.70 s** / 888 MB, Lark **6.38 s** / 243 MB. The `disasm_count` change alone took Lark
+7.51 -> 6.38 s and Reqable 6.33 -> 5.70 s, and all three corpora came out **byte-identical** to the
+pre-optimisation export -- a pure speed win, verified rather than assumed. What remains over baseline
+(Reqable +19%, Lark +32%) is the honest cost of naming 31,625 and 36,622 more call sites.
+
+**Round six: decode each address once, not five times.** After the two fixes above, `names+stubs` had
+become the dominant cost -- **3.43 s of Lark's 7.7 s (45%)** and **2.68 s of Reqable's 6.6 s (41%)**,
+against 0.33 s / 0.64 s for the entire lift+structure+render main loop. The cause was structural:
+`alloc_stubs_at` runs up to five namers over every unreferenced table entry (59,772 on Lark) and
+**each namer disassembled its own window** (24 / 384 / 32 / <=4096 / <=4096 bytes), so the same bytes
+were decoded up to five times -- about 238 instructions per address. (The write-barrier scan was *not*
+the problem: its size pre-filter, `size % 32 == 0` and 64..4096, already cuts 59,772 entries to 5,050
+before capstone is touched -- 8.4%; Reqable 9.6%.)
+
+The fix is `disasm_stub`: one decode per address (window = the remaining bytes of the containing table
+entry, capped at 4 KiB; at most 96 instructions), shared by all five namers, which now take
+`&capstone::Instructions` instead of `(cs, addr)`. 96 instructions covers every shape on record --
+`runtime_stub_name`'s save-all-plus-mirror body measures 32, and its old 384-byte window is exactly 96
+arm64 instructions -- and where it does not, the failure mode is "no name", never "wrong name".
+`inline_alloc_stub_name` additionally bails on the first mnemonic before building any operand strings,
+so addresses that cannot match do not pay for string allocation.
+
+Measured (`/usr/bin/time -l`, three runs each): `names+stubs` **3.43 s -> 1.00 s** on Lark and
+**2.68 s -> 0.67 s** on Reqable; whole-export **7.71 s -> 2.68 s** on Lark and **6.58 s -> 2.38 s** on
+Reqable. Both are now **faster than the pre-naming baseline** (4.83 s and 4.80 s) while naming roughly
+40 000 more call sites than at the start of this work, so the naming rounds net out below zero cost.
+material_3_demo 0.76 s, Weibo 1.17 s, ChatGLM 1.84 s. **All five corpora came out byte-identical** to
+the pre-refactor export (`diff -rq`), which is the only reason this was safe to do as a pure refactor:
+the namers' *criteria* did not change, only who decodes the bytes. Two window bounds did move
+(`alloc_stub_name` 24 bytes -> the shared window; `code_reg_stub_name`'s fallback 256 -> 384), so
+byte-identity was an empirical question, not an assumption -- and it held on 5 real apps plus all 25
+`regress` archives.
+
+> Two lessons, both about *how* this was caught rather than what broke. (a) **The suite cannot see
+> performance at all** -- 71 tests, `regress_all` 25/25, `scorecard` 0 errors, all green while export
+> took 25x longer. Only wall-clock measurement on the **large** corpora found it; `material_3_demo`
+> alone showed +53% and would have looked like noise. (b) **Any new per-address scan must be asked
+> "what does this scale with?"** -- the answer here was the instruction-table size, which varies
+> 4.5x across the corpora (17,839 vs 79,327), so a cost invisible on the desktop samples dominates
+> on the mobile ones.
+
 
 ## Three defects found by reading source against output (2026-09-28, all fixed)
 
@@ -763,6 +854,12 @@ over-eager `bail` here cost 713 branches their structure and dropped the structu
 just the gates. `stack_check_guards_do_not_regress` (113) and
 `empty_if_without_else_does_not_grow` (109) are in place to catch the attempt getting worse; if this
 and the empty-`if` defect share the root cause, one fix should lower **both**.
+>
+> **Answered (2026-10-01): they do not.** The guard fix left the empty-`if` count at exactly 109, and
+> the empty-`if` defect was then fixed on its own terms -- see
+> [Recording every conditional branch edge](#recording-every-conditional-branch-edge-2026-10-01).
+> Its ceiling is now **5** (all five individually verified correct), so the two ratchets no longer
+> move together.
 
 ## Naming 31% of the unnamed call targets by provable shape (2026-09-28)
 
@@ -795,10 +892,38 @@ calling-convention transition wrapper. `runtime_stub_name` requires: `str lr` fi
 `stp`, a `ret`, >= 6 consecutive `ldp` immediately before it, and **the first `stp`'s register pair
 equal to the last `ldp`'s** (the mirror). It names them `RuntimeCallStub_0x<addr>`.
 
-**It stops there on purpose.** Which specific runtime entry it is, is *not* provable: the profile's
-`runtime_offsets` has 7 keys and contains neither `THR+0x188` nor `THR+0x488`, so naming a particular
-entry would be fabrication -- the same line the reverted `isSmi` restoration crossed. The address
-stays in the name so the 11 remain distinguishable.
+> **It stops there on purpose.** Which specific runtime entry it is, is *not* provable: the profile's
+> `runtime_offsets` has 7 keys and contains neither `THR+0x188` nor `THR+0x488`, so naming a
+> particular entry would be fabrication -- the same line the reverted `isSmi` restoration crossed.
+> The address stays in the name so the 11 remain distinguishable.
+
+**That justification was wrong, and the correction is measured.** It was concluded from
+`runtime_offsets` having 7 keys. But that is the wrong table: `struct_tables::dart_thread` -- the per-version
+`DartThread` layout dae already embeds and ships into the r2/IDA struct headers -- names **all 484
+fields**. In dart 3.13.0, `THR+0x188` is `stack_overflow_shared_without_fpu_regs_stub`. So the
+specific entry *is* provable from data already in the binary, and `RuntimeCallStub_0x...` understates
+what the profile supports. It stays as shipped (it is not wrong, only less specific), and the sharper
+naming is recorded as the next item in the backlog below.
+
+> The first measurement of that item said **338 of 340** unnamed addresses (28,106 calls, 32.4% of
+> all direct calls) were nameable this way. **That number was wrong by roughly 2x**, and the reason
+> is worth more than the number: the scan read the disassembly of the whole *instruction-table
+> entry*, and an entry can hold several stubs, so a stub was credited with its neighbour's `ldr`.
+> Re-measured with the scan **cut at the first terminator** (`ret`/`brk`/`br`/`b`), i.e. scoped to
+> the stub's own body: **102 of 340 addresses, 14,496 calls = 51% of the unnamed and 16.7% of all
+> direct calls**. `AllocateDouble_entry_point`, `AllocateClosure_entry_point`,
+> `AllocateTypedData_entry_point` and the whole 194-address `slow_type_test_entry_point` group
+> **disappeared** -- they were all neighbours' instructions. This is the same class of error as the
+> raw-disassembly block that once ran past a function boundary.
+> **Rule: any per-address scan over a table entry must cut at the first terminator, or it silently
+> attributes the next stub's code.**
+
+The 9 addresses that failed the strict mirror check are now explained rather than mysterious: they
+carry the identical save-all prologue but **end in `brk #0`** -- they call the runtime and never
+return, so there is no restore to mirror. `0x3dc7b0` (5,730 calls) loads
+`null_cast_error_shared_without_fpu_regs_stub` into CODE_REG, `NullCastError_entry_point` into r5,
+`call_to_runtime_entry_point` into LR, calls, and traps. Rejecting them was correct for the *mirror*
+criterion; it just is not the only provable criterion in this family.
 
 Only **2 of the 11** addresses pass the strict mirror check on material_3_demo (the other 9 differ in
 some detail); that is the intended behaviour -- naming 2 provably beats naming 11 guessingly. Those 2
@@ -824,6 +949,587 @@ classifier cannot certify itself with its own logic (same pattern as `alloc_stub
 > a register, and the `add` before the `ldp` run was recognised by looking for `"sp"` in its operands
 > -- but Dart's arm64 stack pointer inside Dart code is **x15** (`R15 = 15; // SP in Dart code.`), so
 > capstone prints `add x15, x15, #8` and there is no `"sp"` substring anywhere.
+
+## Names without bodies: the same defect twice, invisible to every gate (2026-10-01, fixed)
+
+`text/functions.txt` listed 13,371 functions for Reqable. `asm/` contained **999**. The names were
+right; the bodies were simply not there. Nothing complained: `dart analyze` passed, the structured
+rate looked fine, `regress_all` was 25/25, and the call-naming metric even improved -- because every
+one of those metrics is computed over *the functions that got emitted*.
+
+The cause was in `Analyzer::code_size`, twice over, and both times it was the second half of a fix
+that only landed its first half.
+
+**Defect 1 -- a stale `idx < first_entry` guard.** An earlier change had established that
+`first_entry_with_code` is *not* a reason to exclude an instruction-table entry (it cost 86% of
+function names before that was understood), and `entry_for` was updated accordingly. `code_size`
+kept the old guard, so for exactly those indices it returned `0`, `code_range` then returned `None`
+on `size <= eo`, and the function had an address but no bytes. Measured blast radius:
+**Reqable 11,207/13,371 = 83.8%**, **lark-android 19,921/25,183 = 79.1%**.
+
+Why no gate saw it: `first_entry_with_code` is **0 in all 26 desktop corpora, all 25 `regress`
+archives, and even a freshly built Flutter android-arm64 `app.so`**. The guard never fired anywhere
+the suite looks. (It is not a version property either -- ChatGLM, weibo and CHSI are all 0 while
+Reqable is 48,455 and lark 61,609.) This is the same shape as the earlier "every corpus is
+`no-dwarf`, so address skew is untestable" blind spot.
+
+**Defect 2 -- "the next entry" is not "the next *different* offset".** Dart 2.12-2.15 deduplicated
+byte-identical `Instructions`, so several consecutive table entries share one `pc_offset`; only the
+last of a run gets a non-zero length from `pc_offsets[idx+1] - pc_offsets[idx]`. Measured:
+hello_2.12.4 **174**, 2.13.4 **217**, 2.14.4 **221**, 2.15.0 **212** names without bodies.
+That this is compiler dedup and not a decoding error is independently evidenced by *who* shares an
+address: 73 addresses in hello_2.12.4 are shared by 2..16 functions, and the sharers are semantically
+the same body -- nine different `typed_data` classes' `get_elementSizeInBytes`, sixteen boolean
+feature getters (`_isWindows`, `_setupCompleted`, `_enableSocketProfiling`, ...), nine error classes'
+`ctor`/`get_stackTrace`. Equal `pc_offset` runs are 0 from 2.16.2 onward, so the fix is an identity
+there.
+
+The fix: length = distance to the **next strictly greater** `pc_offset`, found by `partition_point`.
+The binary search is licensed by measurement, not assumption -- signed deltas were counted on eight
+corpora (2.12.4/2.13.4/2.14.4/2.15.0/2.16.2/3.13.0 + Reqable + lark) and the **negative count is 0
+everywhere**, i.e. `pc_offsets` is non-decreasing. Where there are no equal runs `partition_point`
+returns `idx+1`, so the change is provably a no-op -- and it measured as one: `material_3_demo`
+byte-identical, 21 of 25 `regress` archives byte-identical, and the 4 that moved differ in exactly
+three files (`call_edges.txt`, `callgraph.dot`, `ida_script/addNames.py`) with the **entire object
+layer identical**, including `stubs.txt`, the r2 script and `frida.js`.
+
+Results after the fix:
+
+| corpus | asm/ functions | dart/ blocks | structured | `dart analyze` |
+|---|---|---|---|---|
+| Reqable (arm64, 3.3.4) | 999 -> **9,630** | -> **11,237** | 10,916/321 = 97.1% | **0 errors** |
+| lark-android (arm64, 3.6.1) | -> **17,914** | -> **19,555** | 18,537/1,018 = 94.8% | **0 errors** |
+| full scorecard (26 desktop) | -- | 24,253 -> **24,497** | -- | **0 errors** |
+
+Two internal consistencies fell out that corroborate the reading. The instruction table partitions
+exactly: Reqable 57,960 = 11,237 with a Code object + 46,723 without (and `stubs.txt` grew
+7,799 -> 46,723, because the Code-less prefix entries were being dropped for the same reason);
+lark 79,327 = 19,555 + 59,772. And the address correctness was checked the established independent
+way rather than by dae's own tables -- of the 8,631 newly recovered Reqable functions, **95.66%
+begin with `stp fp, lr`** (the Dart arm64 `EnterFrame` prologue) against **81.58%** for the 999 that
+already worked, with zero empty bodies and every size 4-byte aligned. Against the recorded thresholds
+(correct 91-100%, skewed 51-58%) the recovered region is not merely acceptable, it is cleaner than
+the region that was never broken.
+
+Gate `tests/code_coverage.rs` asserts the invariant that was violated -- *every published function
+name has a body* (`entry_for` yields an entry point => `code_range` yields a range), plus full
+per-entry coverage whenever the corpus has an instruction table. It carries a **negative control**,
+because "assert 0" is exactly the gate that silently measures nothing: the test reinstates each old
+formula *on its own* and requires it to report orphans. Reinstating "subtract the next entry" must
+report orphans on >= 1 corpus (2.12-2.15 guarantee 174/217/221/212, so this half is sensitive using
+only in-repo corpora); reinstating the `first_entry` guard is sensitive only where
+`first_entry > 0`. The first version of that control got the attribution wrong -- it combined both
+defects in one formula, so on `first_entry == 0` corpora it degenerated into the other one and
+reported "guard-sensitive on 4 corpora" for four corpora whose `first_entry` is 0. **When a gate has
+two failure modes, each control must contain exactly one.**
+
+The remaining blind spot is printed rather than papered over: with no `first_entry > 0` corpus in the
+repository, defect 1 is only covered when `DAE_TRUTH_ANDROID_SO=/path/to/libapp.so[,...]` points the
+sweep at a real large mobile build. With Reqable + lark + ChatGLM + weibo + CHSI supplied, the sweep
+reaches 29 corpora / 241,699 table entries / 130,435 published functions / **0 orphans**, and both
+controls are sensitive (B on 4, A on 2).
+
+## `DartThread` was missing a conditional field, so every compressed-pointer target was 8 bytes out (2026-10-01, fixed)
+
+This one started as "why does the fat-allocation namer fire on material_3_demo and nowhere else", and
+turned out to be the most consequential bug found this session -- because it was not only silently
+misnaming stubs, it was shipping a **wrong struct to IDA and r2 for every mobile corpus**.
+
+`runtime/vm/thread.h` declares, in both 3.3.4 and 3.13.0:
+
+```c
+volatile RelaxedAtomic<uword> stack_limit_;
+uword                         write_barrier_mask_;
+#if defined(DART_COMPRESSED_POINTERS)
+uword                         heap_base_;        // <-- conditional
+#endif
+uword                         top_;
+uword                         end_;
+```
+
+`heap_base_` is the **only** `DART_COMPRESSED_POINTERS`-conditional *field* in `Thread` (each version
+has three occurrences of the macro; the other two are accessor methods). Compressed pointers means
+every mobile Flutter build, so on those targets every field after `write_barrier_mask_` sits 8 bytes
+later than the non-compressed layout.
+
+The 48 headers in `profiles/struct/` are **inconsistent about this**: 2.13.4 through 2.19.6 (14 files)
+already contain `heap_base`, the other 34 do not. dae used them verbatim for both the shipped
+`DartThread` struct and the thread-field lookup behind stub naming, with no compression handling.
+
+Three code-observed offsets pin the correct answer for Reqable (dart 3.3.4, compressed). After
+inserting `heap_base`, the emitted struct says `stack_limit` = 0x38, `top` = **0x50**,
+`write_barrier_entry_point` = **0x1e8** -- and the binary agrees on all three: `ldr x16,[x26,#0x38]`
++ `cmp SP` + `b.ls` is `CheckStackOverflow`; the fat allocation stubs do `ldp x0,x2,[x26,#0x50]` and
+`str x0,[x26,#0x50]`; the barrier sub-stubs do `ldr x30,[x26,#0x1e8]`. Before the fix the struct put
+`top` at 0x48 and read 0x1e8 as `array_write_barrier_entry_point`.
+
+**So two things were wrong, and one of them was mine, shipped earlier this session.** The
+`ArrayWriteBarrierStub_x0` names published for Reqable and Lark were **fabricated**: the correct name
+is `WriteBarrierStub_x0` (index 60, not 61). material_3_demo was unaffected because it is *not*
+compressed, and Weibo was unaffected because its 2.19.6 header already had `heap_base` -- which is
+exactly why the error survived: the two corpora I checked first were the two that happened to be
+right. Fixing the lookup also **unlocked** the fat-allocation namer on mobile, because its
+"the `ldp` base must be the field named `top`" check had been failing for the same reason.
+
+**An independent tool agrees, field for field.** [aotopsy](https://github.com/) keeps its own THR
+tables, checked against dart-lang/sdk by its `sdk-check` subcommand, and it carries *separate*
+compressed and non-compressed variants. Its 3.9.2 pair reads:
+
+| | `stack_limit` | `write_barrier_mask` | `heap_base` | `top` | `end` | `write_barrier_entry_point` | `array_write_barrier_entry_point` |
+|---|---|---|---|---|---|---|---|
+| `thrV392` (compressed) | 0x40 | 0x48 | **0x50** | 0x58 | 0x60 | 0x208 | 0x210 |
+| `thrV392_nocompress` | 0x40 | 0x48 | -- | 0x50 | 0x58 | 0x200 | 0x208 |
+
+Every field after `write_barrier_mask` is exactly **+8** in the compressed variant, `heap_base` sits
+immediately after it, and `write_barrier_entry_point` precedes `array_write_barrier_entry_point`.
+That is the same rule, the same insertion point and the same ordering dae now applies -- arrived at
+from `thread.h` on one side and from a separate tool's sdk-checked tables on the other. It also
+confirms the direction of the original error: with `write_barrier` *before* `array_write_barrier`,
+reading Reqable's `0x1e8` as index 61 gave the **second** of the two, i.e. the wrong one.
+
+The rule is "insert `heap_base` after `write_barrier_mask` **iff** the target is compressed *and* the
+header does not already have it" -- so headers that already contain it are left byte-identical
+(idempotent), which the measurements confirm: material_3_demo and Weibo named-call counts did not
+move at all (77,071 and 108,194), while Reqable went 31,625 -> **40,548**, Lark 36,622 -> **43,182**
+and ChatGLM 127,663 -> **142,415**. All five still `dart analyze` clean.
+
+Gate `dart_thread_struct_gets_heap_base_only_for_compressed` needs no corpus: it runs the shipped
+transformation over all 48 headers in both compression states and asserts the non-compressed output
+is byte-identical to the input, the compressed output has exactly one `heap_base` immediately after
+`write_barrier_mask`, `top` moves by exactly one field only when an insertion happened, headers that
+already had it are unchanged, and no other field's order moves. 34 files need the insertion, 14 are
+already correct.
+
+> The general lesson is about **where the check lived**. Nothing compared the struct dae ships against
+> the instructions dae disassembles, even though both were in hand -- and the disagreement is a single
+> `ldr` immediate away from being obvious. Any per-version layout table should be cross-checked
+> against at least one offset that the target's own code states unambiguously (`stack_limit` from the
+> stack-overflow guard is the cheapest such anchor, and it is present in essentially every function).
+
+## Inline allocation stubs: the same class name from a different shape (2026-10-01)
+
+`alloc_stub_name` already named the *thin* form -- a 12-16 byte shim that materialises a class tag
+with `mov`+`movk` and immediately `b`s into the shared allocator (`0x4294` -> `AllocationStub_Duration`).
+Dart also **inlines the whole allocator** into a fat stub, and those had no name at all:
+**13 addresses / 7,275 calls on material_3_demo = 8.4% of all direct calls**, the single largest
+remaining unnamed family (42.7% of what was left).
+
+The fat shape is ten mechanically checkable instructions:
+
+```
+ldp  <A>, <B>, [THR, #<top>]   ; bump pointer and its limit, in one load
+add  <A>, <A>, #<size>         ; size MUST be a fixed immediate
+cmp  <B>, <A>
+b.ls <slow path>
+str  <A>, [THR, #<top>]        ; commit the bump -- same field
+sub  <A>, <A>, #<size-1>       ; back off to the tagged pointer, exactly size-1
+mov  <H>, #<lo>
+movk <H>, #<hi>, lsl #16       ; the object header
+stur <H>, [<obj>, #-1]         ; stored one word before the payload
+```
+
+`<top>`'s displacement is looked up **by field name** in that version's `DartThread` layout, not
+hardcoded (3.13.0 has it at 0x58; the write-barrier round is the cautionary tale). The class id comes
+out of the header via the profile's own `tagging.cid_tag_pos`/`cid_tag_mask`, and the name is looked
+up in the snapshot class table with the profile's predefined-cid table as fallback.
+
+**The "fixed immediate" requirement is what keeps this honest.** Variable-length allocators
+(`AllocateArray`, `AllocateTypedData`) take their size from a register, and the `mov x17, #0xfffa`
+in their body is a *length bound*, not a header. Pairing "first `mov` + first `movk`" decodes cid 16
+(`WeakSerializationReference`) at `0x3df2a0` and cid 95 (`TwoByteString`) at `0x3e057c` -- **both
+fabricated**. Requiring `add <A>, <A>, #imm` plus the `stur <H>, [obj, #-1]` header store keeps those
+out of the candidate set entirely (they never even reach the check).
+
+All 13 decode to classes whose size matches: `_Mint`/`_Double` at 0x10 (header + one value),
+`_Closure` at 0x30 and 0x40, `_Record` at 0x20 and 0x30 (Dart 3 records, by arity),
+`_GrowableList` at 0x20, `_Float64x2`/`_Float32x4`/`_Int32x4` at 0x20. A third, independent
+corroboration: the `_Closure` stub's slow path calls `AllocateClosure_entry_point` and the `_Double`
+one calls `AllocateDouble_entry_point`.
+
+Names keep the existing `AllocationStub_<Class>` convention with no address suffix. The same class can
+have several specialisations (`_Mint` and `_Closure` twice each, `_Record` three times), but that is
+not new: the thin shims already produce duplicates (1,858 names, 1,839 distinct --
+`AllocationStub__RenderInputPadding` appears three times), and "two specialisations both allocate
+this class" is true.
+
+Measured effect on named direct calls: material_3_demo 69,796 -> **77,071 of 86,825 (88.8%)**, up from
+46.6% before this round of work; Weibo 97,128 -> **108,194 of 123,659 (87.5%)**. All five real apps
+still `dart analyze` clean.
+
+**It fires on dart 3.13.0 and yields nothing on 3.3.4 / 3.6.1 -- and that is an unresolved data
+question, not a namer bug.** Reqable's fat allocation stubs are the same shape but bump at
+`[x26, #0x50]`, while the 3.3.4 arm64 `DartThread` header names `top` at **0x48** and `end` at 0x50;
+3.6.1 is identical. So `inline_alloc_stub_name`'s "the `ldp` base must be the field named `top`"
+check fails and it names nothing -- correctly, because guessing here would mean inventing which field
+is the bump pointer. What makes this worth chasing rather than ignoring: `stack_limit` at **0x38**
+*is* confirmed by the same binaries (`ldr x16, [x26, #0x38]` then `cmp SP, x16` / `b.ls` is
+`CheckStackOverflow`), so the header is right at 0x38 and the code disagrees with it at 0x50 -- an
+8-byte discrepancy somewhere in between. Either the 3.3.4/3.6.1 arm64 headers are one field out in
+that region (which would make the `DartThread` struct dae ships to IDA/r2 wrong for every mobile
+corpus from that point on), or those versions' allocators read a different pair. Settling it needs
+the field-by-field offsets out of `runtime/vm/thread.h` **with all its `#if` branches resolved for
+the mobile build configuration**, which is not something to guess at; until then the namer stays
+silent on those versions. Measured prize if it resolves: 3 fat alloc stubs on Reqable alone account
+for 9,191 calls.
+
+The existing external-truth gate could not cover this and it is worth being explicit about why:
+`ground_truth.rs::alloc_stub_naming` diffs against `.symtab`'s `Precompiled_AllocationStub_<Class>_<n>`
+symbols -- the strongest check in the repo -- but its six corpora are **all x64** (`elf-x64.json`) and
+this namer is arm64-only. T4_blank's 88 `AllocationStub_*` entries are all 16 bytes, i.e. thin shims;
+a fat stub is at least 9 instructions = 36 bytes. So `inline_alloc_stub_names_match_the_class_table`
+re-derives instead: it parses the shape back out of `dae disasm` text, recomputes the header from the
+two immediates, decodes the cid with the profile's tagging (obtained in-process, a different code path
+from production), and requires the resulting class name to equal the published one -- plus `size`
+16-aligned, `sub` immediate exactly `size-1`, and header stored at `-1`. 19 stubs re-derived on
+`sample_arm64`. Negative-tested: shifting the production cid decode by one bit fails it immediately.
+Its first version asserted `size == table-entry length` and was **wrong** -- the entry also holds the
+slow-path block (`0x4c650c`: object size 32, entry 100 bytes) -- so it now asserts `size <= entry`.
+
+## `CODE_REG` was on the wrong register in every arm64 artifact (2026-10-01, fixed)
+
+Found while reading the write-barrier forensics, not while looking for it: the raw capstone text for
+block 17 of the barrier table was `mov x1, x23` and dae rendered it `mov r1, CODE_REG`, while block
+18 was `mov x1, x24` and rendered `mov r1, r24`. Two adjacent blocks, one labelled as the code
+register and the next not -- so one of the two labels had to be wrong.
+
+It was the alias table. All three arm64 platform profiles carried, in the same file,
+`registers.code_reg = "x24"` **and** `register_aliases["x23"] = "CODE_REG"`. Rendering uses the alias
+table, so every arm64 artifact labelled x23 as `CODE_REG` and left the real one bare. Measured on
+`material_3_demo`: **1,010 wrong `CODE_REG` in `asm/` and 3,014 in `dart/`**, against 559 `r24` in
+`asm/` and 2,834 `x24` in `dart/` that should have carried the label.
+
+Ground truth is the SDK, and it is unambiguous: `runtime/vm/constants_arm64.h` says
+`const Register CODE_REG = R24;` in **every** version checked (2.12.4, 2.19.6, 3.3.4, 3.6.1, 3.13.0),
+and R23 is only a member of `kAbiPreservedCpuRegs` with no named role. Two internal corroborations:
+`non_field_base` lists x24 (the code register is never an object pointer) and not x23; and after the
+fix, `ldr CODE_REG, [THR, #0x110]` in the runtime-call stubs reads as what it is -- loading that
+stub's own `Code` object into the code register -- which the old rendering made nonsense of.
+
+Both wrong aliases came from the Python reference implementation dae was ported from
+(`dart_aot_export.py` has `"x18": "ARG2", "x23": "CODE_REG"` on one line), so they are recorded as
+corrections 5 and 6 in `src/export/mod.rs`. The second one is a fabrication rather than a mix-up:
+**`ARG2` does not exist in any version of `constants_arm64.h`**; R18 is documented as "reserved on
+iOS, shadow call stack on Fuchsia, TEB on Windows" and the SDK states "We rely on R18 not being
+touched by Dart generated assembly or stubs at all". Consistent with that, `ARG2`/`x18`/`r18` appear
+**0 times** in the material_3_demo and Reqable artifacts, so removing the alias is a provable no-op
+on output -- it only stops shipping an invented role name.
+
+Fixed by pointing the alias at x24 and dropping x23 to no alias at all (it renders `r23`, which is
+honest: nothing in the SDK gives it a role). Deliberately **not** done: adding aliases for registers
+that do have roles but none in dae (`x21` DISPATCH_TABLE_REG, `x25` kWriteBarrierSlotReg,
+`x4` ARGS_DESC_REG). That is a feature with its own output churn, not a correctness fix, and this
+round was scoped to removing wrong claims.
+
+Verification: the three real apps still `dart analyze` at **0 errors**, and structured/unnamed/named
+counts are **identical to the unit** before and after (13,947/1,135 and 58,478 named on
+material_3_demo; 10,916/321 and 28,440 on Reqable; 18,537/1,018 and 30,567 on Lark) -- a rendering
+change moved no control flow. The `regress` suite is **blind to this**, and that is worth stating:
+its three arm64 archives (3.4.0/3.5.0/3.6.1) hold a single `asm/` file each with **zero**
+occurrences of `CODE_REG`, `x23` or `x24`, because those hello-world binaries never touch the
+register. So the coverage lives in a new gate instead, `platform_register_aliases_are_self_consistent`,
+which reads the six platform profiles through the shipping parser (`parse_platform`, the same
+`include_str!` data the binary uses) and asserts that for every role in `registers`, any alias
+bearing that role's name includes the physical register `registers` names. It needs no corpus, so it
+runs in every checkout: 6 profiles, 51 (profile, role) pairs. The comparison is "is among", not
+"equals", because a role can legitimately have two encodings -- `sp` maps to both x15 (Dart's stack
+pointer) and x31 (the hardware encoding), and both should print `SP`. Negative-tested: pointing
+`CODE_REG` back at x23 fails it immediately with the contradiction spelled out.
+
+## One table entry, twenty stubs: naming the write-barrier family (2026-10-01)
+
+The last unnamed-call cluster turned out not to be unnamed stubs at all. `material_3_demo`'s
+instruction-table entry at `0x3e0a84` is **640 bytes**, and callers `bl` straight to `0x3e0aa4`,
+`0x3e0ac4`, ... -- addresses *inside* the entry. Those targets are in neither the function table nor
+the stub table, so no traversal that walks table entries can ever reach them. Measured: **10 such
+addresses / 4569 call sites = 5.3% of all direct calls**, all inside that one entry, spaced exactly
+0x20 apart.
+
+Disassembling the entry shows why: it is **20 sub-stubs of 32 bytes each**, one mnemonic shape for
+all of them (`str, str, mov, ldr, blr, ldr, ldr, ret` -- verified by raw capstone on two SDK
+versions, two containers, two OSes: 160 instructions, **one** distinct shape). Each saves LR and x1,
+moves a different register into x1, loads a code pointer out of the thread struct, calls it, restores
+both in exact reverse order and returns. The forwarded register is the only thing that varies:
+x0-x14, x19, x20, x23, x24, x25 -- precisely the registers that can hold a value being stored,
+skipping every register with a fixed Dart role (x15=SP, x16/x17 scratch, x18 platform, x26=THR,
+x27=PP, x29=FP, x30=LR).
+
+**The offset must be read, never hardcoded.** `material_3_demo` (dart 3.13.0) loads `[x26, #0x1f8]`;
+Reqable (dart 3.3.4) loads **`[x26, #0x1e8]`**. And in the per-version `DartThread` layouts those are
+*different fields*: 0x1f8 in 3.13.0 is `write_barrier_entry_point` while 0x1e8 in 3.3.4 is
+`array_write_barrier_entry_point`. Worse, the same offset can change meaning -- **0x1f8 is
+`write_barrier_entry_point` in 3.13.0 but `array_write_barrier_entry_point` in 3.6.1** (lark), and
+0x1f8 in 3.3.4 is `allocate_mint_with_fpu_regs_entry_point`. So the name is built by reading the
+displacement out of the instruction and looking it up in that version's own layout header
+(`struct_tables::dart_thread`, the same source the r2/IDA struct headers use), requiring the field to
+end in `_entry_point`, and CamelCasing the stem: `WriteBarrierStub_x0` on 3.13.0,
+**`ArrayWriteBarrierStub_x0`** on 3.3.4. Two different barriers, named differently, because the
+profile says they are different. Nothing about the barrier's *semantics* is claimed, and the register
+suffix claims only "this variant forwards that register" -- a one-to-one form-to-name mapping.
+
+The `offset = field_index * 8` step is measured, not assumed: all **48** layout headers (24 versions x
+arm64/x64) contain nothing but `__int64 <name>;` lines, and the derived offsets were cross-checked
+field by field against the `dart_struct_fields-*.json` tables that carry **explicit** offsets
+(~14k comparisons, **0 mismatches**).
+
+Two bugs surfaced while wiring this up, both worth more than the feature:
+
+* **A whole naming path was dead.** `call_edges.txt` resolves names through `name_alloc_stubs`, which
+  called only `alloc_stub_name` -- so the previous round's `RuntimeCallStub_*` names reached `dart/`
+  and `text/stubs.txt` but **never `call_edges.txt`** (14,000 sites). And even after chaining it, the
+  names were still blocked: `name_map` gives *every* instruction-table entry a `sub_{ep:#x}`
+  placeholder, and the target filter was "not already in `name_map`", i.e. placeholders counted as
+  names. Both fixed; `name_alloc_stubs` now delegates to the one chain in `alloc_stubs_at`.
+* **The same placeholder inflated the callgraph's own metric.** `edges_resolved` counted any non-empty
+  name, so it reported 82,256/86,825 = **94.7%** -- the very number previously exposed as dishonest in
+  the decompiler's `calls_named` (fixed in 7ea269a) and simply never fixed here. It now excludes
+  `sub_0x...`.
+
+Result on `material_3_demo`: named direct calls **53,909 -> 58,478**, `sub_0x` occurrences in `dart/`
+**33,579 -> 28,553**, empty name column in `call_edges.txt` **4,569 -> 0**, and `call_edges.txt` and
+`dart/` now report the **same** named-call count (58,478) from two independent code paths. Reqable
++896, lark +1312. All three still `dart analyze` clean; structured counts unchanged to the unit
+(13,947/1,135, 10,916/321, 18,537/1,018), i.e. naming moved no control flow. Object layer of all 23
+archived corpora byte-identical; the only files that moved are `text/call_edges.txt`,
+`callgraph.dot` and (on 3.4.0/3.5.0/3.6.1) `text/stubs.txt`, and `regress_all` is back to 25/25.
+
+`dae disasm <bin> 0xADDR` also accepts these addresses now, with a **32-byte** window that is not a
+guess: the shape check requires exactly 8 instructions, and an entry is only split when *every* one of
+its 32-byte blocks passes. A mid-block address (`0x3e0aa8`) is still refused with rc=1.
+
+Gate `write_barrier_stub_names_are_provable` re-derives every published name from **three independent
+sources**: `dae disasm` text (CLI + rendering path), the repository's `DartThread` header for that SDK
+version (a different file and parser than the runtime's `struct_tables`), and the artifact itself. It
+checks 19 of the 20 variants register-by-register (the 20th renders as `CODE_REG`, so it falls back to
+the distinctness rule), asserts all 20 suffixes are pairwise distinct -- which is what catches taking
+the `mov`'s *destination* instead of its source, since all 20 would then be identical -- and asserts
+`stubs.txt` and `call_edges.txt` agree on every shared address.
+
+Its negative controls were both run. Swapping the `mov` operand index fails it immediately. Hardcoding
+the stem to `write_barrier` **passes on the in-repo corpus alone** -- because that corpus really is
+3.13.0 -- and only fails once `DAE_TRUTH_ANDROID_SO` adds Reqable, whose expected name is
+`ArrayWriteBarrierStub_x0`. That is a demonstrated hole, so the gate *prints* it: with a single
+displacement in play it says out loud that hardcoding would go undetected, and with two or more
+distinct stems it reports the anti-hardcoding coverage as earned. An earlier version of that
+cross-corpus check asserted "different offsets => different stems" and was **wrong**: the same field
+moves between versions (0x1e8 in 3.3.4 and 0x1f8 in 3.6.1 are both `array_write_barrier`), so it
+failed on correct output. The per-corpus derivation is the real tripwire; across corpora the gate only
+reports.
+
+## 25 000 unnamed function bodies on mobile builds: measured, characterised, not fixed (2026-10-01)
+
+`text/stubs.txt` used to describe itself as "instruction-table entries **without a Code object** (stub
+prefix)". Neither half of that was true, and the second half hid the largest block of code dae does
+not decompile.
+
+What the file actually contains is the complement of `func_eps`: entries **no Function object
+references**. dae never checks for a Code object. And they are not a prefix -- on Reqable
+(`first_entry_with_code` = 48 455) **7 798** of the 46 723 sit at index >= that value while **9 530
+named functions** sit below it, so the two kinds are interleaved. The header, the summary line, the
+`dae help stubs` text and the README row all said otherwise; all four are corrected.
+
+The reason it matters: those entries are **not all stubs**. Scanning the first two instructions of
+every one of them across five corpora:
+
+| corpus | `first_entry_with_code` | unreferenced entries | starting with `EnterFrame` | share | bytes |
+|---|---|---|---|---|---|
+| material_3_demo (3.13.0, uncompressed) | 0 | 2 735 | 34 | 1.2% | ~0 |
+| Weibo (2.19.6, compressed) | 0 | 3 568 | 18 | 0.5% | ~0 |
+| ChatGLM (3.11.6, compressed) | 0 | 4 428 | 18 | 0.4% | ~0 |
+| **Reqable (3.3.4, compressed)** | **48 455** | 46 721 | **24 932** | **53.4%** | **8.09 MB** |
+| **Lark (3.6.1, compressed)** | **61 609** | 59 770 | **43 195** | **72.3%** | **14.67 MB** |
+
+`EnterFrame` here means `stp x29, x30, [x15, #-0x10]!` followed by `mov x29, x15` -- the standard Dart
+arm64 function prologue, not something a stub emits. Their sizes run to 27 708 bytes with a median of
+180. So on the two builds where `first_entry_with_code` is non-zero, **more than half of what dae
+files as "stubs" is ordinary function code that never reaches `asm/` or `dart/`** -- 8.09 MB and
+14.67 MB respectively, against 11 237 and 19 555 decompiled functions.
+
+Two things this is *not* correlated with, both checked: compressed pointers (Weibo and ChatGLM are
+compressed and sit at 0.4-0.5%), and obfuscation (Reqable's names are obfuscated -- `YDp`, `fOo` --
+while Lark's are not, yet Lark has the larger share). The only clean correlate is
+`first_entry_with_code > 0`.
+
+aotopsy, run on the same Reqable binary, reports `instructions: 57960 entries (48455 stubs + 9505
+code)`, describes the first group as **"48455 discarded Code objects"** under
+`--split-debug-info`/`--obfuscate`, and then disassembles **all 57 960** as functions. So an
+independent tool reads the same field the same way and simply decompiles both groups.
+
+**What they are is now settled from SDK source, and it settles a second question too.**
+`runtime/vm/app_snapshot.cc` (3.3.4) builds the table one entry per `InsertInstructionOfCode`
+command -- i.e. **one entry per Code object** -- and asserts
+`!Code::IsDiscarded(code) || (not_discarded_count == 0)`, so *all discarded Code objects come first*;
+`first_entry_with_code` is set to the running total at the first non-discarded one. On the read side:
+
+```c
+if (code_index < first_entry_with_code) {
+  *entry_point = d->instructions_table().EntryPointAt(code_index);   // entry point IS available
+  return StubCode::UnknownDartCode().ptr();                          // the Code object is gone
+} else {
+  const intptr_t cluster_index = code_index - first_entry_with_code; // same order as Code cluster
+  ...
+}
+```
+
+So those entries are **real code whose Code objects were discarded**, entry point and all -- exactly
+what aotopsy means by "48455 discarded Code objects". They are not stubs and they are not padding.
+
+The same passage retroactively **justifies the `code_size` fix from source** rather than only from
+measurement: the SDK hands back an entry point for `code_index < first_entry_with_code`, so treating
+that region as size-less was wrong. And dae's index arithmetic matches the SDK's encoding --
+`CodeIndexToClusterIndex` is `code_index - 1 - first_entry_with_code`, `GetCodeByIndex` reserves 0 for
+`LazyCompile`, and dae's `entry_for` uses `ci - code_base_ref - 1` to reach the *instruction-table*
+index, which is the right target since dae indexes `pc_offsets`.
+
+**Both open questions are now closed, and the answer is that this is not a dae defect.**
+
+*Why are they function bodies rather than stubs?* Not from the prologue alone -- VM stubs emit
+`EnterFrame` too. The independent evidence is the **size distribution**, which separates three
+populations cleanly on Reqable:
+
+| population | n | median | p90 | p99 | max | total |
+|---|---|---|---|---|---|---|
+| Function-referenced (named, decompiled) | 11 234 | 272 B | 2 324 B | 14 168 B | 159 436 B | 12.14 MB |
+| unreferenced, `EnterFrame` prologue | 24 932 | **180 B** | **704 B** | **2 352 B** | **27 708 B** | **8.09 MB** |
+| unreferenced, no `EnterFrame` (real stubs) | 21 789 | 12 B | 28 B | 204 B | 1 020 B | 0.39 MB |
+
+The middle row is the same order as the top row and three orders away from the bottom row. There is
+no such thing as a 27 708-byte stub.
+
+*Why does no Function reference them?* Because **the snapshot contains no Function object for them**.
+dae reads each cluster's object count out of the stream itself (`count = read_unsigned()` immediately
+after the cluster header), so it cannot under-count a cluster, and any misalignment would trip the
+`cid > 60000` drift guard and warn -- Reqable parses with **0 warnings**. 13 371 Function records is
+what the binary says. (The earlier hint from `closure_data: 9304` vs dae's 6 505 `_anon_closure`
+is a ~2 800 gap, an order of magnitude too small to matter here, and is not evidence of truncation.)
+
+So the metadata is **not in the file**: an obfuscated / `--split-debug-info` build externalises it,
+which is exactly why the Code objects are discarded and why aotopsy reports "inline attribution
+unavailable" for the same 48 455 entries. **There is no name to recover** -- dae and aotopsy are in
+the same position, and inventing one would be fabrication. What remains is a pure *coverage*
+question: emit those bodies into `dart/` as `sub_0x...` with no library and no class. That is a
+different contract from the rest of the artifact and touches the sequential pre-pass that fixes file
+names and per-entry-point library ownership -- the thing that keeps the parallel decompiler
+byte-identical -- so it is recorded here rather than done. `dae disasm <bin> 0xADDR` **does** reach
+them today, since they are stub-table entries.
+
+## Recording every conditional branch edge (2026-10-01)
+
+An `if` whose body is empty and which has no `else` --
+
+```dart
+if (x1 >= x0) {
+}
+x0 = local_m18; // 0x480ab0
+```
+
+-- is the decompiler *silently dropping a control-flow edge*. The machine code was
+`cmp x1, x0; b.hs 0x480afc`, and `0x480afc` (`RangeErrorSharedWithoutFpuRegsStub`) is in the same
+file, just hanging off a different branch. The reader is told "if x1 >= x0, nothing happens", which
+is false. Measured before the fix: **109** sites on sample_arm64, **1596** on h212keep, and
+**9817 across five real apps** (material_3_demo 1929, weibo 2972, chatglm 3209, lark 1203,
+Reqable 504).
+
+The `} else` variant (`if (c) { } else { … }`, 2560 sites on sample_arm64) is *not* this defect and
+must not be "fixed" with it -- the gate that counts them keeps the two shapes apart, and an earlier
+note records that treating them as one breaks the output.
+
+### Root cause: `seq` returns empty for two different reasons
+
+Instrumenting every `Node::If` construction site (temporary `DAE_DBG_EMPTYIF` probe, removed after
+measurement) split the 109 sites exactly: **52** from the `find_join` path (25 where the join *is*
+the true-target, 23 where the false-target was already emitted), **39** from `terminates(ti)`
+(**37 of them with `stop == ti`**), **14** from the irreducible path, **4** from the mirror path.
+
+`seq(x, stop)` returns an empty `Vec` in two situations that look identical from the outside:
+
+1. `x == stop` -- the target is the region end, so its code is emitted *right after* the `if`.
+   Leaving the body empty is then **correct**.
+2. `x` is already in `done` (a shared block emitted elsewhere) or lies outside the region -- the
+   body's statements, including `store`/`call` **side effects**, are skipped entirely. This is the
+   lost edge.
+
+### The fix: three tiers, most provable first (`Structurer::fill_branch`)
+
+* **①** target is the block emitted immediately after the `if` (the join `j`, or the fallthrough for
+  the terminating/mirror paths) -> leave empty; that *is* the truth.
+* **②** target is an already-emitted shared block and the walk to the join is a **straight line** ->
+  **tail-duplicate** it into the branch (`dup_to_join`, a sibling of the existing `dup_tail` with the
+  stop condition widened from "terminator" to "terminator *or* join"). This is the same trade IDA and
+  LLVM make for shared tails, and the file already had that precedent on the unconditional-branch
+  path. It records the edge **and keeps the function structured**.
+* **③** otherwise -> write the edge as `gotoLabel(0x<target>)`. The address comes from the
+  instruction table, so it is a fact, not a guess -- the same discipline as `RuntimeCallStub_0x…`,
+  which keeps the address instead of inventing a runtime-entry name.
+
+Plus one real restructuring: when `terminates(ti) && stop == Some(ti) && terminates(fi)`, both paths
+end at `stop`, so the honest form is the **mirror** (`if (!c) { <fallthrough side> }`) -- no empty
+body, no goto, no metric cost. That single case was 37 of the 39 `terminates(ti)` sites.
+
+Three things that had to be pinned down the hard way:
+
+* **The mirror needs `terminates(fi)`.** Reaching that arm means `find_join` returned `None`, i.e.
+  `ti` and `fi` have *no* common successor -- so "both paths reach `stop`" does **not** follow
+  automatically. Without the guard, a non-terminating `fi` would fall through into `ti`, writing an
+  edge into the artifact that does not exist in the binary.
+* **The irreducible path's fallthrough is `None`, not `stop`.** It pushes `Goto(fi)` and `break`s
+  right after the `if`, so what follows the `if` is the *false* branch's goto, not `ti`'s code; tier
+  ① does not apply. Those functions are already `unstructured` (the path calls `bail`), so the goto
+  costs nothing.
+* **An empty `els` is filled too.** `find_join` only guarantees both sides *eventually* reach `j`;
+  the shared block's statements in between are skipped just the same, and they have side effects.
+  A first version that filled only `then` left 483 such sites on h212keep silent.
+
+### Measured (base -> fixed)
+
+| corpus / app | no-else empty `if` | structured rate | tail-duplicated | `gotoLabel` | `dart/` bytes |
+|---|---|---|---|---|---|
+| sample_arm64 | 109 -> **5** | 90.21% -> 90.04% | 85 | 262 -> 308 | +0.5% |
+| T4_blank (x64) | 118 -> **6** | 87.60% -> 87.28% | 64 | 507 -> 558 | +0.4% |
+| hello_3.12.2 (x64) | 103 -> **5** | 89.20% -> 88.95% | 100 | 269 -> 309 | +0.6% |
+| hello_2.13.4 | 102 -> **6** | 89.79% -> 89.56% | 58 | 514 -> 554 | +0.3% |
+| h212keep (elf arm64) | 1596 -> **737** | 88.40% -> 76.57% | 497 | 1409 -> 1882 | +2.8% |
+| material_3_demo | 1929 -> **62** | 92.47% -> 91.96% | 1467 | 3726 -> 3965 | -- |
+| Reqable | 504 -> **2** | 97.14% -> 96.97% | 435 | 1391 -> 1445 | -- |
+| lark | 1203 -> **15** | 94.79% -> 94.48% | 2399 | 1966 -> 2126 | -- |
+| weibo | 2972 -> **67** | 91.08% -> 90.23% | 2233 | 8067 -> 8600 | -- |
+| chatglm | 3209 -> **70** | 91.95% -> 91.48% | 3111 | 6631 -> 7123 | -- |
+
+`dart analyze`: **0 errors** on all five real apps (30 892 / 30 455 / 57 940 / 58 112 / 67 366
+warnings, all `unused_local_variable`, and *fewer* than before the fix -- a duplicated body gives the
+register a reader). Zero non-ASCII across all 14 797 artifact files. `unmapped` lines unchanged
+(weibo/chatglm 1 -> 1), named direct calls unchanged (m3 77 071/86 825, Reqable 40 548, lark 43 182,
+weibo 108 194, chatglm 142 415), and `regress_all` 25/25 -- the archives hold `text/`, `ida_script/`,
+`r2_script/`, `frida.js` and `callgraph.dot` but **not** `dart/`, so this change touches none of them.
+
+**The structured rate is the price, and it is a reclassification, not a regression.** `Node::Goto`
+marks the whole function `unstructured`; those functions were counted as structured *precisely
+because* the edge was hidden. Tail duplication buys most of it back (h212keep: 61.2% with gotos only
+-> **76.6%**; sample_arm64 86.4% -> **90.04%**). The lowest corpus is 76.57% against a
+`STRUCTURED_FLOOR` of 0.70, so the floor was **not** lowered.
+
+### The five remaining sites are correct, not leftovers
+
+Each was checked against the raw disassembly emitted in the same file:
+
+* three are `ti == fi`: `0x4b10dc: b.eq #0x4b10e0` where the *next* instruction is `0x4b10e0`. Both
+  outcomes go to the same place, so the `if` genuinely does nothing (`Uri_replace`,
+  `SimpleUri_replace`, `RegExp_factory_ctor` -- all string-identity checks left over after inlining).
+* two are tier ① on the outer `if`: `RangeError_checkValidRange`'s `0x481d3c: b.lt #0x481d48` has
+  join `0x481d48`, whose code (`tbnz x1, #0x3f`) is emitted immediately after the `if`.
+
+### Gate changes
+
+* `empty_if_without_else_does_not_grow`: ceiling **109 -> 5**, and a new **floor** on the
+  tail-duplication count (`duplicated branch body` >= 40, measured 85) so a refactor that silently
+  disables tier ② cannot pass by "changing how it loses the edge". Both assertions were
+  **negative-tested**: stubbing `dup_to_join` to `return None` drops the count 85 -> 25 and fails the
+  floor; stubbing `goto_if_empty` leaves duplication intact and pushes no-else 5 -> **43**, failing
+  the ceiling.
+* `post_index_stack_slots_do_not_regress` now counts **distinct (file, machine address)** instead of
+  raw occurrences: 942 -> **926**, and base and fixed both give 926 while the raw counts differ
+  (942 vs 943). The extra raw hit was a *copy* of an existing statement, which is not a naming
+  regression -- a count-based ratchet that moves when code is duplicated would have to be re-based on
+  every such change. Added a floor (>= 500) so a broken detector cannot pass by reporting 0.
 
 ## Known gaps (measured, not fixed)
 
@@ -1009,6 +1715,37 @@ Also re-measured against aotopsy's numbers on the same file: dae 89% structured 
 corpora both tools read, 0 `dart analyze` errors vs ~70k — see [`COMPARISON.md`](COMPARISON.md).
 
 ## Known weak spots (the backlog)
+
+**Done since that measurement -- identity-level naming from `CODE_REG`.** Dart's shared stubs load
+their own `Code` object into the code register, so `ldr x24, [THR, #<field>]` inside a stub's *own
+body* names it: `code_reg_stub_name` requires the field (looked up in that version's
+`DartThread` layout, offset read from the instruction) to end in `_stub`, and emits
+`<CamelCase(field)>_0x<addr>` -- e.g. `NullCastErrorSharedWithoutFpuRegsStub_0x3dc7b0`,
+`LateInitializationErrorSharedWithoutFpuRegsStub_0x3dca38`, `DeoptimizeStub_0x3de1a0`,
+`LazyDeoptFromThrowStub_0x3ddd40`. It is tried **before** `runtime_stub_name`, so the 13,316 sites
+previously called `RuntimeCallStub_0x...` are upgraded to their real identities too (that shape
+loads `stack_overflow_shared_without_fpu_regs_stub`). Measured: `material_3_demo` named direct calls
+58,478 -> **69,796 of 86,825 (80.4%)**, up from 46.6% before this round of work; Reqable
+28,440 -> **31,625**; Lark 30,567 -> **36,622**. `call_edges.txt` and `dart/` agree on all three.
+All three still `dart analyze` clean with structured counts unchanged to the unit. Cross-version by
+construction: Reqable (dart 3.3.4) resolves its names from the 3.3.4 header, not 3.13.0's.
+Gate `code_reg_stub_names_trace_back_to_profile_and_instructions` works **backwards** from the
+published name -- stem must exist as a `*_stub` field in that version's header, and the disassembled
+body (cut at the first terminator) must contain `ldr CODE_REG, [THR, #<that field's offset>]`;
+26 names re-derived on `sample_arm64`. Negative-tested: deleting the terminator cut fails it at once,
+on exactly the predicted mis-attribution (`SlowTypeTestStub_0x4c47ac`, whose own body is one
+instruction, `brk #0`).
+
+**Next up -- the remaining half, with the rule that must be settled first.** A body whose only
+identifying load is `ldr rN, [THR, #<*_entry_point>]` (91 addresses / 3,178 calls once scoped) proves
+"this stub calls that runtime entry", **not** "this stub *is* that entry's stub". The discriminator
+is multiplicity: `allocate_object_slow_entry_point` is loaded by **80 different addresses** -- 80
+allocation stubs sharing one slow path, none of which is "the AllocateObjectSlow stub" -- while
+`Throw_entry_point`, `Instanceof_entry_point`, `ReThrow_entry_point`, `DoubleToInteger_entry_point`,
+`suspend_state_init_async_entry_point` and `OldMarkingStackBlockProcess_entry_point` are each loaded
+by exactly one. So the rule is "name it only if exactly one address in the binary loads that field",
+which yields ~11 addresses / ~3,000 calls. The other 238 addresses (13,851 calls) have no usable
+`THR` load in their own body at all -- fat inlined allocators, dispatch stubs, type-test stubs.
 
 1. Shared tails and irreducible loops: **forward** jumps into an already-emitted block are now
    handled by tail duplication (`dup_tail` re-emits the straight-line run, marked with a
