@@ -18,6 +18,13 @@
 //! - **零编造**：产物里出现的每个 `/* 类.字段 (off 0x..) */` 注解都必须能在恢复表里
 //!   找到同名同偏移的条目，且该偏移换算回机器码位移后确实是 8 的倍数 + 1。
 
+// 整份门禁都建立在反编译器之上（`dae::decompiler::{recover_fields, render}`），
+// 而 `decompiler` 模块只在 `asm` feature 下存在 ⇒ 无 capstone 的构建里**没有可测对象**，
+// 整个文件 gate 掉。这不是「跳过以免失败」：`--no-default-features` 下反编译器根本不存在，
+// 之前不 gate 的直接后果是 `cargo test --no-default-features` **编译不过**
+// （`cannot find `decompiler` in `dae``），于是那条配置在 CI/本地都无法验证。
+#![cfg(feature = "asm")]
+
 use dae::analyzer::Analyzer;
 use dae::profile::{parse_platform, parse_sdk};
 

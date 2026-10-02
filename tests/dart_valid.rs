@@ -16,6 +16,11 @@
 //! `dart` 不在 PATH 或语料缺失时跳过；全量基线用
 //! `cargo test --release --test dart_valid -- --ignored --nocapture`。
 
+// 本文件三条门禁里有两条（`emitted_dart_is_valid`、`full_scorecard`）要读 `dart/`，
+// 已 gate 到 `asm`；剩下的辅助函数在无 capstone 的构建里就用不上了。
+// 对整份文件在非 asm 构建下放掉 dead_code/unused_imports，不影响默认构建的任何 lint。
+#![cfg_attr(not(feature = "asm"), allow(dead_code, unused_imports))]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -209,6 +214,8 @@ fn parse_dart_summary(stdout: &str) -> (usize, usize, usize) {
     )
 }
 
+// 要读 `dart/`（反编译产物），无 capstone 的构建里没有 ⇒ gate 到 asm。
+#[cfg(feature = "asm")]
 #[test]
 fn emitted_dart_is_valid() {
     if dart_bin().is_none() {
@@ -290,6 +297,8 @@ const SCORECARD_NO_ADDRESS_LAYER: &[&str] = &["hello_2.7.2.exe", "hello_2.10.4.e
 
 /// 全量基线：`dart/dart_samples/artifacts/` 下每个版本都跑一遍并打印表。
 /// 默认 `#[ignore]`——25 个版本 × dart analyze 要几分钟，不进每次提交的门禁。
+// 这两条都要读 `dart/` 目录，而无 capstone 的构建不产出反编译结果 ⇒ gate 到 asm。
+#[cfg(feature = "asm")]
 #[test]
 #[ignore]
 fn full_scorecard() {

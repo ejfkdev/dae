@@ -16,7 +16,13 @@
 //!
 //! 语料缺失时整体跳过；`DAE_REQUIRE_GATES=1` 下跳过即失败（口径同 tests/cli.rs）。
 
-use std::collections::BTreeSet;
+// 本文件 18 条门禁里有 15 条断言的是反编译/反汇编产物，已逐条 gate 到 `asm`；
+// 剩下那些辅助函数与 import 在无 capstone 的构建里就全都用不上了。
+// 与其给每个辅助函数再挂一个 cfg（容易漏、且改动面大），这里对**整份文件**在
+// 非 asm 构建下放掉 dead_code/unused_imports——不影响默认构建的任何一条 lint。
+#![cfg_attr(not(feature = "asm"), allow(dead_code, unused_imports))]
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -114,6 +120,8 @@ fn verify_hit(
     Ok(())
 }
 
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn query_commands_are_honest() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -365,6 +373,8 @@ fn query_commands_are_honest() {
 /// 每一项都带**负对照**：光断言「加了 --no-sdk 之后没有 dart_* 文件」是假的——
 /// 如果 flag 根本没接上，输出可能恰好也没有那些文件。所以同时断言「不加 flag 时
 /// 确实有 dart_* 文件」，两边一比才证明是这个 flag 起的作用。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn decompile_verb_and_scope_flags() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -517,6 +527,8 @@ fn same_tree(a: &Path, b: &Path) -> bool {
 /// （名字都是 `dynamic`）、结构化率不变、地址自洽性不变、`regress_all` 也不变（它跑的是全量）。
 /// 判据取「收窄产物的匿名调用集合 ⊆ 全量产物的匿名调用集合」，与语料无关：
 /// 收窄只应该**减少**发射的函数，不应该让任何原本有名字的调用变成没名字。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn scoped_decompile_keeps_cross_library_call_names() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -610,6 +622,8 @@ fn scoped_decompile_keeps_cross_library_call_names() {
 /// 实测同一语料：修复前 **70.1%**（129/184），修复后 **78.3%**（144/184），门槛取 **0.75**
 /// 落在两者之间——回退修复即失败（已负测）。不到 100% 是正常的：`cmp` 折进条件、
 /// 分支目标折进 `if`、`frame/align` 只出注释，这些都不带语句地址。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn decompiled_body_covers_instruction_addresses() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -714,6 +728,8 @@ fn collect_addrs(dir: &Path, into: &mut BTreeSet<String>, pick: &dyn Fn(&str) ->
 ///
 /// 判据与语料无关：**参数里出现比较/位运算就说明它本该直接当条件用**。
 /// 真占位只有 `vc`/`vs`/`eq`/`ne`/`hs`/`lo` 这类两三个字符的条件码。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn condflag_only_wraps_bare_condition_codes() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -796,6 +812,8 @@ fn condflag_only_wraps_bare_condition_codes() {
 /// 不变量按函数统计：函数体里 `? 1 : 0` / `? -1 : 0` 的个数 ≥ 该函数 raw 反汇编注释里
 /// `cset`/`csetm` 的条数。基线 v0.1.9 在 sample_arm64 上是 **8 条指令 ↔ 0 个三元式**
 /// （本门禁必红），修复后 8 ↔ 8。顺带钉住 (1)：函数体里不许出现裸条件码三元式。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn cset_instructions_materialize_as_ternaries() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -943,6 +961,8 @@ fn cset_instructions_materialize_as_ternaries() {
 /// 实测 T4_blank（elf x64）：raw 注释里 8 条 setcc ↔ 函数体 8 个 `? 1 : 0`、unmapped
 /// 残留 0；基线 v0.1.9 是 8 条**全部** unmapped、0 个三元式（本门禁必红）。
 /// hello_3.12.2（macho x64）同样 5 ↔ 5。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn x86_setcc_materializes_as_ternary() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1053,6 +1073,8 @@ fn x86_setcc_materializes_as_ternary() {
 ///
 /// 门禁判据与实测口径一致：material_3_demo 上修复前 **3 590 个读点 / 1 135 个函数（7.6%）**，
 /// 修复后 **16 / 13（0.1%）**。门槛定 40 处——远高于修复后、远低于修复前。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn w_register_write_aliases_x_register() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1183,6 +1205,8 @@ fn w_register_write_aliases_x_register() {
 /// `x17 = "autoCapture" /* pp+0x2a608 */; memSet(x3, 0x27, x17);`——顺带把一个此前丢失的
 /// 字符串字面量也恢复了。诊断指纹是「**纯前缀相关**」：16 种 ppmem 偏移全部以 `0x27`
 /// 开头、而 `mem(..., 0x27*)` 零幸存，`mem(PP,0x5270)`/0x26x/0x28x 全正常。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn no_register_substring_false_positives_in_output() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1246,6 +1270,8 @@ fn no_register_substring_false_positives_in_output() {
 /// 而对 k < 32，`wN` 的第 k 位与 `xN` 的第 k 位恒等（`wN` 就是 `xN` 的低 32 位），
 /// 与高位内容、与之前谁写过它都无关。实测 Reqable：这类陈旧读 **1690 → 0**，
 /// 1671 处位测试改为读真正被写入的 `xN`。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn bit_test_conditions_use_the_64bit_view() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1315,7 +1341,7 @@ fn bit_test_conditions_use_the_64bit_view() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
-/// 棘轮门禁：**无 else 的空 `if`** 数量不许增长。
+/// 门禁：**无 else 的空 `if`** 数量不许增长（缺陷已修，上限从 109 收到 5）。
 ///
 /// 形态判据（两种必须分开数，混在一起这个门禁就没有意义）：
 /// * 闭合行**正好是** `}` ⇒ then 分支是空的**且没有 else** —— 机器码里那条条件分支的
@@ -1326,9 +1352,53 @@ fn bit_test_conditions_use_the_64bit_view() {
 ///   或共享尾部里）。已抽查对照 raw 反汇编确认没有丢东西，**不要把它当 bug 修**——
 ///   在 sample_arm64 上它是 2560 处 vs 真丢的 109 处，一起「修」会把产物改坏。
 ///
-/// 这条门禁**不断言已经修好**，只钉住当前数量：改结构化器时任何让分支边丢得更多的副作用
-/// 会立刻报红。修好之后应当把上限往下调（并且调之前先确认下降来自真的补回了分支，
-/// 而不是来自把 `} else` 那种形态误判掉）。
+/// ## 根因（2026-10-01 用临时插桩按结构化路径归类，109 处逐一对上）
+///
+/// `seq` 返回空**有两种完全不同的原因**，而发射器对两者一视同仁地留下一个空 `{ }`：
+/// ① 目标块就是区域终点/汇合点（它的代码紧接着这个 `if` 发射，留空即真值）；
+/// ② 目标块**已经发射过**（共享块）或在区域之外——这时那一支的语句（含 store/call 这类
+/// **有副作用**的语句）在产物里被整段跳过，是真丢边。插桩实测 109 处的分布：
+/// 52 走 `find_join`（其中 25 处 `j == ti`、23 处 `fi_done`）、39 走 `terminates(ti)`
+/// （**37 处的 `stop` 就是 `ti`**）、14 走不可归约、4 走镜像支。
+///
+/// ## 修法（三档，按「能证明的优先」，见 `Structurer::fill_branch`）
+///
+/// ① 目标 == 紧随其后发射的块 ⇒ 留空；② 目标是已发射的共享块、且到汇合点是**直线段**
+/// ⇒ **尾复制**回来（`dup_to_join`，与无条件跳转那条路既有的 `dup_tail` 同一先例：
+/// IDA/LLVM 对共享尾块同样做复制），语义补齐且不需要 goto；③ 复制不了 ⇒ 如实写
+/// `gotoLabel(0x<目标>)`。另外 `terminates(ti) && stop == ti && terminates(fi)` 这一类
+/// 改成**镜像发射**（条件取反、落空支作 then）——两支同归 `stop`，既补回边也不掉结构化率。
+///
+/// 三处必须说清的取舍：
+/// * **镜像支必须带 `terminates(fi)` 前置条件**。走到这一支说明 `find_join` 返回 None，
+///   即 ti 与 fi 没有共同后继，「两支同归 stop」并不自动成立；fi 不终止时镜像会让
+///   c=false 的路径**落进 ti**，那是把一条不存在的边写进产物。
+/// * **不可归约那一支的 fallthrough 是 `None` 而不是 `stop`**：它发完 `if` 紧接着 push
+///   一条 `Goto(fi)` 就 `break`，所以 `if` 之后不是 ti 的代码，档位①的前提不成立。
+/// * **`els` 只在 `then` 也空时才算缺陷**？不——`find_join` 只保证两支*最终*都走到 j，
+///   中间那段共享块的语句被跳过同样是丢语义，所以 els 也走同一套三档。代价是
+///   `Node::Goto` 会把整个函数记成 unstructured：h212keep 的结构化率 88.4%→76.6%。
+///   这是**重新分类**而不是退化（那些函数过去被算作 structured，靠的正是把这条边藏起来），
+///   尾复制把 sample_arm64 的代价压到 90.21%→90.04%，5 份语料最低 76.57% 仍在
+///   `STRUCTURED_FLOOR`(0.70) 之上。
+///
+/// ## 实测（base → 修复后）
+///
+/// | 语料 | 无 else 空 if | 结构化率 | 尾复制 | gotoLabel | dart/ 字节 |
+/// |---|---|---|---|---|---|
+/// | sample_arm64 | 109 → **5** | 90.21% → 90.04% | 85 | 262 → 308 | +0.5% |
+/// | T4_blank (x64) | 118 → **6** | 87.60% → 87.28% | 64 | 507 → 558 | +0.4% |
+/// | hello_3.12.2 (x64) | 103 → **5** | 89.20% → 88.95% | 100 | 269 → 309 | +0.6% |
+/// | hello_2.13.4 | 102 → **6** | 89.79% → 89.56% | 58 | 514 → 554 | +0.3% |
+/// | h212keep (elf arm64) | 1596 → **737** | 88.40% → 76.57% | 497 | 1409 → 1882 | +2.8% |
+///
+/// 残留 5 处**逐一对照 raw 反汇编验证为正确**，不是漏网：3 处是 `ti == fi`
+/// （`0x4b10dc: b.eq #0x4b10e0` 而下一条指令就是 `0x4b10e0`，两支同归、`if` 是空操作），
+/// 2 处是外层 `if (x4 < 2)` 的汇合点正好是 `ti = 0x481d48`、其代码（`tbnz x1, #0x3f`）
+/// 紧随其后发射。所以本门禁同时断言**机制在跑**（尾复制数有下限），
+/// 免得将来一次重构把三档静默退化成「一律留空」而数字看起来没变。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn empty_if_without_else_does_not_grow() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1344,17 +1414,24 @@ fn empty_if_without_else_does_not_grow() {
     let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
     assert_eq!(rc, 0, "全量导出失败: {se}");
 
-    // 2026-09-28 在 sample_arm64 上实测：无 else 空 if = 109，空 then 有 else = 2560，
-    // `if (` 总数 5445。上限取实测值，即「不许变差」。
-    const CEIL_NO_ELSE: usize = 109;
+    // 2026-10-01 修复后在 sample_arm64 上实测：无 else 空 if = **5**（全部逐一验证为正确，
+    // 见上）、空 then 有 else = 2549、`if (` 总数 5562、尾复制 85 处、gotoLabel 308 处。
+    // 修复前是 109 / 2560 / 5562 / 0 / 262。上限取实测值，即「不许变差」。
+    const CEIL_NO_ELSE: usize = 5;
+    /// 尾复制触发数下限：三档里的第②档。掉到 0 说明 `fill_branch` 被绕过或
+    /// `dup_to_join`/`dup_tail` 的判据被改坏——那时 no_else 会涨，但**涨多少取决于语料**，
+    /// 所以这条要单独钉住（防空过：机制在跑才算数）。
+    const FLOOR_DUP: usize = 40;
     let dart = out.join("dart");
     let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
     let mut no_else = 0usize;
     let mut with_else = 0usize;
     let mut ifs = 0usize;
+    let mut dup = 0usize;
     let mut examples: Vec<String> = Vec::new();
     for e in rd.flatten() {
         let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        dup += text.matches("duplicated branch body").count();
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             if line.contains("if (") {
@@ -1388,13 +1465,20 @@ fn empty_if_without_else_does_not_grow() {
          那么 no_else 的计数也不可信（sample_arm64 实测 2560）"
     );
     assert!(
+        dup >= FLOOR_DUP,
+        "只找到 {dup} 处尾复制注释（`duplicated branch body`），下限 {FLOOR_DUP}\
+         （sample_arm64 实测 85）——三档里的第②档大概没在跑，\
+         那么 no_else 的下降就不是「补回了分支」而是「换了一种丢法」"
+    );
+    assert!(
         no_else <= CEIL_NO_ELSE,
         "无 else 的空 if 从 {CEIL_NO_ELSE} 涨到 {no_else}（样例 {examples:?}）——\
          结构化器丢了更多分支边。注意别把「空 then + 有 else」（{with_else} 处，良性跳跃形态）\
          算进来，也不要为了压低这个数字去改判据"
     );
     println!(
-        "空 if 棘轮: 无 else {no_else} / 上限 {CEIL_NO_ELSE}；空 then 有 else {with_else}（良性）；`if (` 共 {ifs}"
+        "空 if 门禁: 无 else {no_else} / 上限 {CEIL_NO_ELSE}；空 then 有 else {with_else}（良性）；\
+         `if (` 共 {ifs}；尾复制 {dup} / 下限 {FLOOR_DUP}"
     );
     let _ = std::fs::remove_dir_all(&out);
 }
@@ -1426,6 +1510,8 @@ fn empty_if_without_else_does_not_grow() {
 /// 实测 sample_arm64：无守卫 **113 → 0**、有守卫 758 → **875**、`if (` 5445 → 5562；
 /// **7 个语料的结构化率逐一完全不变**，material_3_demo 与 Reqable 全量 `dart analyze` 0 错误，
 /// 非 `dart/` 产物逐字节一致。上限因此收到 0。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn stack_check_guards_do_not_regress() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1538,6 +1624,8 @@ fn stack_check_guards_do_not_regress() {
 ///
 /// 所以这条门禁只钉住数量：真做了 SP 跟踪之后 `local_0` 应当**下降**，届时把上限调低。
 /// 上限涨了就说明有别的东西也开始把栈访问错误地归到位移 0。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn post_index_stack_slots_do_not_regress() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1553,42 +1641,76 @@ fn post_index_stack_slots_do_not_regress() {
     let (_so, se, rc) = run(bin, &[&s, &o, "--decompile"]);
     assert_eq!(rc, 0, "全量导出失败: {se}");
 
-    // 2026-09-28 sample_arm64 实测：local_0 出现 942 次、分布在 518 个函数
-    const CEIL_LOCAL0: usize = 942;
-    let dart = out.join("dart");
-    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
-    let mut n = 0usize;
-    let mut slots = 0usize; // 所有 local_* 槽位引用，作非空断言的分母
-    for e in rd.flatten() {
-        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
-        let b = text.as_bytes();
+    // 2026-09-28 sample_arm64 实测：local_0 裸出现 942 次、分布在 518 个函数。
+    // 2026-10-01 改为**按 (文件, 机器地址) 去重**后是 926：尾复制（`fill_branch` 的第②档）
+    // 会把同一条语句再抄一遍，裸计数因此从 942 变成 943 —— 而这条棘轮量的是
+    // 「多少条**指令**被错误地按方括号里的位移 0 命名」，同一条指令抄两遍不是退步。
+    // 去重前后 base/new 两个二进制都给 926（裸计数 942/943），证明这 +1 纯粹是副本。
+    // 语句行尾的 `// 0xADDR` 就是它的机器地址；没有地址注释的行按行号入键（各算一次）。
+    const CEIL_LOCAL0: usize = 926;
+    /// `local_0` 是否作为**完整标识符**出现（`local_0x…`/`xlocal_0` 都不算）
+    fn has_word(line: &str, w: &str) -> bool {
+        let b = line.as_bytes();
+        let wb = w.as_bytes();
         let mut i = 0usize;
-        while i + 7 <= b.len() {
-            if &b[i..i + 7] == b"local_0"
-                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-                && (i + 7 >= b.len() || !(b[i + 7].is_ascii_alphanumeric() || b[i + 7] == b'_'))
-            {
-                n += 1;
-                i += 7;
-                continue;
-            }
-            if &b[i..i + 6] == b"local_" {
-                slots += 1;
+        while i + wb.len() <= b.len() {
+            if &b[i..i + wb.len()] == wb {
+                let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                let j = i + wb.len();
+                let after_ok = j >= b.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_');
+                if before_ok && after_ok {
+                    return true;
+                }
             }
             i += 1;
         }
+        false
     }
+    /// 行尾 `// 0x480ab0` → `0x480ab0`；不是这个形状就返回 None
+    fn addr_of(line: &str) -> Option<String> {
+        let t = line.rsplit("//").next().unwrap_or("").trim();
+        let h = t.strip_prefix("0x")?;
+        (!h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_string())
+    }
+    let dart = out.join("dart");
+    let rd = std::fs::read_dir(&dart).expect("dart/ 应存在");
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    let mut slots = 0usize; // 所有 local_* 槽位引用，作非空断言的分母
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let fname = e.file_name().to_string_lossy().to_string();
+        for (i, line) in text.lines().enumerate() {
+            slots += line.matches("local_").count();
+            if !has_word(line, "local_0") {
+                continue;
+            }
+            keys.insert(match addr_of(line) {
+                Some(a) => format!("{fname}|{a}"),
+                None => format!("{fname}|line{i}"),
+            });
+        }
+    }
+    let n = keys.len();
     assert!(
         slots >= 5000,
         "只解析出 {slots} 处 local_* 槽位引用——分母太小，门禁会空过"
     );
     assert!(
-        n <= CEIL_LOCAL0,
-        "local_0 从 {CEIL_LOCAL0} 涨到 {n} 处——更多栈访问被错误地归到「位移 0」。\
-         post-index 形态（`ldr q0, [SP], #0x10`）本应与配对的 pre-index `local_m10` 同名，\
-         那需要跨指令跟踪 SP，见本测试的文档注释"
+        n >= 500,
+        "只数出 {n} 条含 local_0 的**不同指令**（sample_arm64 实测 926）——\
+         探测器大概没匹配上（`has_word`/`addr_of` 被改坏、或行尾地址注释换了形状），\
+         那么「没超过上限」这个结论也不可信"
     );
-    println!("post-index 槽位棘轮: local_0 {n} / 上限 {CEIL_LOCAL0}（local_* 引用共 {slots}）");
+    assert!(
+        n <= CEIL_LOCAL0,
+        "local_0 从 {CEIL_LOCAL0} 涨到 {n} 条**不同指令**——更多栈访问被错误地归到「位移 0」。\
+         post-index 形态（`ldr q0, [SP], #0x10`）本应与配对的 pre-index `local_m10` 同名，\
+         那需要跨指令跟踪 SP，见本测试的文档注释。（按 (文件, 地址) 去重，\
+         所以尾复制多抄一遍不会推动它）"
+    );
+    println!(
+        "post-index 槽位棘轮: local_0 {n} 条不同指令 / 上限 {CEIL_LOCAL0}（local_* 引用共 {slots}）"
+    );
     let _ = std::fs::remove_dir_all(&out);
 }
 
@@ -1602,6 +1724,8 @@ fn post_index_stack_slots_do_not_regress() {
 ///
 /// 「不猜长度」是硬要求：猜一个窗口会反汇编到**别的字节**上，而输出看起来完全正常
 /// （本项目在快照定位上踩过三次这类「指标全绿但读的是别的代码」的坑）。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
 #[test]
 fn disasm_accepts_address_and_refuses_unknown() {
     let bin = env!("CARGO_BIN_EXE_dae");
@@ -1755,6 +1879,622 @@ fn runtime_call_stub_names_are_provable() {
     println!(
         "runtime stub 命名可复核: {} 条全部满足 stp≥6 / ldp≥6 / ret / 首末镜像",
         named.len()
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+fn re_sub_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 从 `dae disasm` 的输出里取出**原始指令行**（`//     0x…: mnem ops`，`//` 后是 5 个空格）。
+/// IL 分组行是 `// 0x…: EnterFrame`（1 个空格），据此区分。
+/// ⚠️ 冒号在**地址之后**，不是 `": 0x"`——本会话有一个探测器就是这么写错的，
+/// 一条都没解析到，于是把正确命名的 stub 全报成不合格。
+fn parse_disasm(od: &str) -> Vec<(u64, String, String)> {
+    let mut v = Vec::new();
+    for line in od.lines() {
+        let line = line.trim();
+        // 只取原始指令行（`//` 后是 5 个空格再 `0x`）；IL 分组行是 `// 0x…: EnterFrame`（1 个空格）
+        let Some(t) = line.strip_prefix("//") else { continue };
+        if !t.starts_with("     0x") {
+            continue;
+        }
+        let t = t.trim(); // 去掉 `//` 与地址之间的那 5 个空格
+        let Some(k) = t.find(':') else { continue };
+        let (a, body) = t.split_at(k);
+        let Ok(av) = u64::from_str_radix(a.trim_start_matches("0x"), 16) else { continue };
+        let body = re_sub_ws(body[1..].trim());
+        let mut it = body.split(' ');
+        let m = it.next().unwrap_or("").to_ascii_lowercase();
+        v.push((av, m, it.collect::<Vec<_>>().join(" ")));
+    }
+    v
+}
+
+/// 读某版本 `DartThread` 布局头文件，返回「字段序号 → 字段名」。
+/// 48 份头文件实测**每行都是 `__int64 <name>;`**（没有第二种类型），故 offset = 序号 × 8；
+/// 该换算还与带**显式 offset** 的 `dart_struct_fields-*.json` 逐字段对过账
+/// （约 1.4 万次比对、0 处不一致）。
+/// ⚠️ `compressed` 必须传目标产物的真实取值。SDK `runtime/vm/thread.h` 里 `heap_base_` 是
+/// `#if defined(DART_COMPRESSED_POINTERS)` 包着的**唯一**条件字段，位于 `write_barrier_mask_`
+/// 与 `top_` 之间；压缩指针构建（＝每个移动端 Flutter 产物）里它之后的字段全部晚 8 字节。
+/// 仓库里 48 份头文件对此**不一致**（2.13.4–2.19.6 的 14 份已含 `heap_base`，其余 34 份没有），
+/// 所以规则是「目标压缩 **且** 头里没有」才插一个——与生产代码
+/// `export/struct_hdr.rs::with_heap_base` 同一条规则，但**在这里独立实现一遍**：
+/// 门禁若直接调生产函数，这一步就不再是独立来源了。
+///
+/// 这条不是理论担心：本门禁的第一版漏了它，于是在非压缩语料上全绿、
+/// 一加 Reqable（3.3.4 压缩）就把**正确的** `WriteBarrierStub_x0` 报成
+/// 「应是 ArrayWriteBarrierStub_」——正是生产代码早先真犯过的那个错，在门禁里重演了一次。
+fn dart_thread_fields(root: &Path, sdk: &str, arch: &str, compressed: bool) -> Option<Vec<String>> {
+    let p = root
+        .join("profiles/struct")
+        .join(sdk.replace('/', "-"))
+        .join(format!("dart_struct-{arch}.h"));
+    let txt = std::fs::read_to_string(&p).ok()?;
+    let mut f: Vec<String> = txt
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.trim_start().starts_with('}'))
+        .filter_map(|l| l.trim().trim_end_matches(';').split_whitespace().last().map(String::from))
+        .collect();
+    if f.len() <= 100 {
+        return None;
+    }
+    if compressed && !f.iter().any(|x| x == "heap_base") {
+        if let Some(i) = f.iter().position(|x| x == "write_barrier_mask") {
+            f.insert(i + 1, "heap_base".to_string());
+        }
+    }
+    Some(f)
+}
+
+fn camel_case(snake: &str) -> String {
+    let mut o = String::with_capacity(snake.len());
+    let mut up = true;
+    for c in snake.chars() {
+        if c == '_' {
+            up = true;
+        } else if up {
+            o.extend(c.to_uppercase());
+            up = false;
+        } else {
+            o.push(c);
+        }
+    }
+    o
+}
+
+/// 复核一份语料的**写屏障子 stub** 命名。返回 `Some((位移, 字段词干, 变体数))`；
+/// 语料不是 arm64、或没有这个形状时返回 `None`（调用方负责区分「没测到」与「测过了」）。
+///
+/// 一个指令表条目里可能装着**多个**子 stub：material_3_demo 的 `0x3e0a84` 表项长 640 字节，
+/// 实际是 **20 个 32 字节变体**，每个把不同的寄存器转发给同一个线程字段里的入口地址。
+/// 调用方直接 `bl` 到条目**内部**地址，所以这些目标既不在函数表也不在 stub 表里
+/// （material_3_demo 实测 10 个地址 / 4569 次调用 = 全部直接调用的 5.3%）。
+///
+/// **位移必须从指令里读、字段名必须查该版本的布局**：material_3_demo（dart 3.13.0）是
+/// `#0x1f8`、Reqable（dart 3.3.4）是 **`#0x1e8`**；而且**同一个位移跨版本会换意思**——
+/// 0x1f8 在 3.13.0 是 `write_barrier_entry_point`、在 3.6.1 是 `array_write_barrier_entry_point`。
+/// 把位移或字段名写死，另一版的名字就是编造的。
+fn verify_barrier_corpus(
+    bin: &str,
+    root: &Path,
+    sample: &Path,
+    out: &Path,
+    label: &str,
+) -> Option<(u64, String, usize)> {
+    let s = sample.to_string_lossy().to_string();
+    let (info, _e, rc) = run(bin, &["info", &s]);
+    assert_eq!(rc, 0, "info 失败: {_e}");
+    let (mut sdk, mut arch, mut feats) = (String::new(), String::new(), String::new());
+    for ln in info.lines() {
+        let c: Vec<&str> = ln.split('\t').collect();
+        if c.len() >= 2 {
+            match c[0] {
+                "sdk" => sdk = c[1].trim().to_string(),
+                "arch" => arch = c[1].trim().to_string(),
+                "features" => feats = c[1].trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    if arch != "arm64" {
+        println!("[{label}] 写屏障 stub: 语料是 {arch}，该形状只在 arm64 上取证过——不产生断言");
+        return None;
+    }
+    // features 串里 `no-compressed-pointers` 与 `compressed-pointers` 都可能出现，先判否
+    let compressed = feats.contains("compressed-pointers") && !feats.contains("no-compressed-pointers");
+    let fields = dart_thread_fields(root, &sdk, &arch, compressed)?;
+    let _ = std::fs::remove_dir_all(out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+
+    let stubs = std::fs::read_to_string(out.join("text/stubs.txt")).ok()?;
+    let mut entry: Option<(u64, u64)> = None;
+    let mut from_stubs: BTreeMap<u64, String> = BTreeMap::new();
+    for line in stubs.lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() >= 4 && c[3].contains("WriteBarrierStub_") {
+            let a = u64::from_str_radix(c[0].trim_start_matches("0x"), 16).unwrap();
+            from_stubs.insert(a, c[3].to_string());
+            entry.get_or_insert((a, c[1].parse().unwrap_or(0)));
+        }
+    }
+    let edges = std::fs::read_to_string(out.join("text/call_edges.txt")).ok()?;
+    let mut from_edges: BTreeMap<u64, String> = BTreeMap::new();
+    for line in edges.lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() >= 5 && c[4].contains("WriteBarrierStub_") {
+            let a = u64::from_str_radix(c[3].trim_start_matches("0x"), 16).unwrap();
+            from_edges.insert(a, c[4].to_string());
+        }
+    }
+    if from_edges.is_empty() && from_stubs.is_empty() {
+        println!("[{label}] 写屏障 stub 命名: 0 条（无该形状），未产生断言");
+        let _ = std::fs::remove_dir_all(out);
+        return None;
+    }
+    // 防空过 + 两条命名路径必须一致（历史上 call_edges 走 name_alloc_stubs、
+    // 曾只调 alloc_stub_name，于是 RuntimeCallStub 在 call_edges 里一个都没有）
+    assert!(
+        !from_edges.is_empty(),
+        "[{label}] stubs.txt 里有 {} 条写屏障名，而 call_edges.txt 一条都没有——两条命名路径分叉了",
+        from_stubs.len()
+    );
+    for (a, n) in &from_edges {
+        if let Some(m) = from_stubs.get(a) {
+            assert_eq!(m, n, "[{label}] 同一地址 {a:#x} 在 stubs.txt 与 call_edges.txt 里名字不同");
+        }
+    }
+
+    let (ep, size) = entry.expect("stubs.txt 里应有被命名的表项");
+    assert!(size >= 64 && size % 32 == 0, "表项 {ep:#x} 长度 {size} 不像 32 字节块数组");
+    let nblk = (size / 32) as usize;
+    let expect: BTreeSet<u64> = (0..nblk).map(|k| ep + (k as u64) * 32).collect();
+    for a in from_edges.keys() {
+        assert!(expect.contains(a), "[{label}] call_edges 里的 {a:#x} 不在表项 {ep:#x}+32k 上");
+    }
+
+    // 一次 disasm 整个表项，再按 32 字节切块复核。
+    // ⚠️ 不能对每个地址都只期待 8 条指令：**表项入口 ep 本身**同时是「表项」和「第 0 个子 stub」，
+    // `dae disasm ep` 走表项那条路径、印出整条 640 字节（这也是正确行为）。
+    let (od, ed, rd) = run(bin, &["disasm", &s, &format!("{ep:#x}")]);
+    assert_eq!(rd, 0, "disasm 表项 {ep:#x} 失败: {ed}");
+    let ins = parse_disasm(&od);
+    assert_eq!(
+        ins.len(),
+        nblk * 8,
+        "表项 {ep:#x} 长 {size} 应是 {nblk} 块 × 8 条 = {} 条，disasm 实得 {}",
+        nblk * 8,
+        ins.len()
+    );
+    let want_mn = ["str", "str", "mov", "ldr", "blr", "ldr", "ldr", "ret"];
+    let mut suffixes: BTreeSet<String> = BTreeSet::new();
+    let (mut numeric, mut alias, mut blk_off, mut blk_stem) = (0usize, 0usize, 0u64, String::new());
+    for b in 0..nblk {
+        let blk = &ins[b * 8..(b + 1) * 8];
+        let addr = ep + (b as u64) * 32;
+        assert_eq!(blk[0].0, addr, "第 {b} 块首指令地址不是 {addr:#x}");
+        for (i, w) in want_mn.iter().enumerate() {
+            assert_eq!(&blk[i].1, w, "{addr:#x}: 第 {i} 条应是 {w}，实得 {}", blk[i].1);
+        }
+        assert!(blk[2].2.starts_with("r1,") || blk[2].2.starts_with("x1,"),
+            "{addr:#x}: mov 的目的应是 x1，实得 {}", blk[2].2);
+        let seg = blk[3].2.split('[').nth(1).unwrap_or("");
+        assert!(seg.contains("THR"), "{addr:#x}: ldr 基址不是 THR（{}）", blk[3].2);
+        let hx = seg.split('#').nth(1).unwrap_or("").trim().trim_end_matches(']');
+        let off = u64::from_str_radix(hx.trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(off % 8, 0, "{addr:#x}: 位移 {off} 不是 8 的倍数");
+        let field = fields.get((off / 8) as usize)
+            .unwrap_or_else(|| panic!("{addr:#x}: 位移 {off} 超出 {sdk} 的 DartThread 布局"));
+        let stem = field.strip_suffix("_entry_point").unwrap_or_else(|| {
+            panic!("{addr:#x}: {sdk} 的字段 {field}（位移 {off}）不以 _entry_point 结尾，本不该被命名")
+        });
+        if b == 0 {
+            blk_off = off;
+            blk_stem = stem.to_string();
+        } else {
+            assert_eq!(off, blk_off, "{addr:#x}: 同一族子 stub 的位移应相同");
+        }
+        let src = blk[2].2.split(',').nth(1).map(|x| x.trim().to_ascii_lowercase()).unwrap_or_default();
+        // 产物里是 dae 的**别名**渲染（x0..x22 → r0..r22，x23 → CODE_REG），名字里用**物理名**，
+        // 故只对数字形逐字比；别名形退化成「必须两两不同」。
+        if let Some(d) = src.strip_prefix('r').or_else(|| src.strip_prefix('x')) {
+            if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
+                numeric += 1;
+                suffixes.insert(format!("x{d}"));
+            } else {
+                alias += 1;
+                suffixes.insert(src.clone());
+            }
+        } else {
+            alias += 1;
+            suffixes.insert(src.clone());
+        }
+        if let Some(p) = from_edges.get(&addr).or_else(|| from_stubs.get(&addr)) {
+            let expected = format!("{}Stub_", camel_case(stem));
+            assert!(
+                p.starts_with(&expected),
+                "{addr:#x}: 由 {sdk} 的 {field}（位移 {off}）推出的前缀应是 {expected}，发布的是 {p}"
+            );
+        }
+    }
+    // 防空过（对「检查本身」防空过）：20 个变体里应有 19 个是数字形，只有 x23 渲染成 CODE_REG
+    assert!(
+        numeric >= 15,
+        "[{label}] 只有 {numeric} 个子 stub 能与 mov 源寄存器逐字比对（别名形 {alias} 个）——\
+         数字太少说明 disasm 文本解析没生效，比对不可信"
+    );
+    // 后缀两两不同：20 个变体的**唯一**区别就是转发哪个寄存器。
+    // 后缀若取错操作数（例如取了目的寄存器 x1），20 个会全一样，这条就会失败。
+    assert_eq!(
+        suffixes.len(),
+        nblk,
+        "[{label}] 寄存器后缀有重复（{} 个不同 / {nblk} 块）：{:?}",
+        suffixes.len(),
+        suffixes
+    );
+    // call_edges 里的每个子 stub 地址都必须能单独 disasm 出 32 字节（这条能力是复核路径本身）
+    let mut sub_checked = 0usize;
+    for addr in from_edges.keys().filter(|a| **a != ep) {
+        let (od2, ed2, rd2) = run(bin, &["disasm", &s, &format!("{addr:#x}")]);
+        assert_eq!(rd2, 0, "disasm 子 stub {addr:#x} 失败: {ed2}");
+        let i2 = parse_disasm(&od2);
+        assert_eq!(i2.len(), 8, "子 stub {addr:#x} 的窗口应是 32 字节 = 8 条，实得 {}", i2.len());
+        sub_checked += 1;
+    }
+    assert!(sub_checked >= 2, "[{label}] 只单独复核了 {sub_checked} 个子 stub 地址——太少");
+    println!(
+        "[{label}] 写屏障 stub 可复核: 表项 {ep:#x} 长 {size} = {nblk} 个 32 字节变体，\
+         字段名取自 {sdk} 的 DartThread 布局（compressed={compressed}，位移 {blk_off:#x} → {blk_stem}）；\
+         {numeric} 个逐字比对寄存器后缀、{alias} 个走别名形；另单独 disasm 复核 {sub_checked} 个地址"
+    );
+    let _ = std::fs::remove_dir_all(out);
+    assert!(!blk_stem.is_empty(), "[{label}] 没取到字段词干");
+    Some((blk_off, blk_stem, nblk))
+}
+
+/// 见 `verify_barrier_corpus`。这一层负责**语料编排与防空过**：
+///
+/// * 仓库自带语料 `testing/decompiler_corpus/sample_arm64` **必须**验到（否则整条门禁空过）；
+/// * `DAE_TRUTH_ANDROID_SO=a.so,b.so` 可把真实移动端产物纳入——这不是锦上添花，
+///   而是**唯一能抓住「字段名被写死」的一条**。负对照实测过：把生产代码里的词干
+///   硬写成 `write_barrier`，仓库自带语料**照样通过**（它那一版真名就是这个），
+///   而 dart 3.3.4 的 Reqable 位移是 `#0x1e8` → `array_write_barrier_entry_point`，会立刻失败。
+/// * ⚠️ **不能断言「位移不同 ⇒ 词干不同」**：同一个字段会随版本搬家
+///   （3.3.4 的 0x1e8 与 3.6.1 的 0x1f8 都是 `array_write_barrier`），
+///   第一版就是这么写的，于是在**正确的输出**上失败了。跨语料这层只汇报、不断言；
+///   真正的绊网是 `verify_barrier_corpus` 里那条**逐语料**推导。
+// 断言的是反编译/反汇编产物，无 capstone 的构建里没有可测对象
+#[cfg(feature = "asm")]
+#[test]
+fn write_barrier_stub_names_are_provable() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sample = root.join("testing/decompiler_corpus/sample_arm64");
+    if !sample.exists() {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过写屏障 stub 门禁");
+        return;
+    }
+    let mut facts: Vec<(String, u64, String)> = Vec::new();
+    let out = root.join("target").join("cli_query_wbstub");
+    if let Some((off, stem, nblk)) = verify_barrier_corpus(bin, root, &sample, &out, "sample_arm64") {
+        assert!(nblk >= 2, "只切出 {nblk} 个变体——不像一族子 stub");
+        facts.push(("sample_arm64".to_string(), off, stem));
+    }
+    for p in std::env::var("DAE_TRUTH_ANDROID_SO")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
+        let pb = Path::new(p);
+        if !pb.exists() {
+            println!("[opt-in] 路径不存在，跳过: {p}");
+            continue;
+        }
+        let label = pb.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string());
+        let o = root.join("target").join(format!("cli_query_wbstub_{}", label.replace(['/', '.'], "_")));
+        if let Some((off, stem, _n)) = verify_barrier_corpus(bin, root, pb, &o, &label) {
+            facts.push((label, off, stem));
+        }
+    }
+    assert!(
+        !facts.is_empty(),
+        "写屏障 stub 门禁一份语料都没验到——这等于没测（防空过断言）"
+    );
+    let mut distinct: BTreeSet<String> = BTreeSet::new();
+    for f in &facts {
+        println!("  {} 位移 {:#x} → {}", f.0, f.1, f.2);
+        distinct.insert(f.2.clone());
+    }
+    if distinct.len() >= 2 {
+        println!(
+            "反硬编码覆盖 ✓：{} 份语料查出 {} 个不同字段词干 {:?}——把名字写死会在其中至少一份上失败",
+            facts.len(),
+            distinct.len(),
+            distinct
+        );
+    } else {
+        println!(
+            "⚠️ 盲区（如实记录）：本次 {} 份语料的字段词干都是 {:?}，所以**把这个名字写死本门禁抓不到**。\n\
+             修好 DartThread 的 heap_base 条件字段之后，各版本这一族都落在 write_barrier_entry_point 上\n\
+             （3.13.0 是 0x1f8、3.3.4/3.6.1 压缩布局下是 0x1e8/0x1f8，查到的都是同一个字段），\n\
+             于是「换个版本就会露馅」这条对照在这一族上不再可用。抓硬编码靠的是另外两条门禁：\n\
+             code_reg_stub_names_trace_back_to_profile_and_instructions（字段名有十几种）与\n\
+             inline_alloc_stub_names_match_the_class_table（类名来自快照类表），以及跨语料的 stub_names 扫描。",
+            facts.len(),
+            distinct
+        );
+    }
+}
+
+/// CODE_REG 身份命名必须能**从名字反推回指令与 profile**。
+///
+/// 这一族的判据是「本 stub 往 CODE_REG 里装的是哪个 `*_stub` 线程字段」，名字直接取
+/// **该版本 `DartThread` 布局里那个字段名**的 CamelCase + 地址。所以复核方向是反的、也更强：
+/// 从**发布出来的名字**出发 → 在该版本的布局头文件里找到 CamelCase 对应的字段 → 取它的 offset →
+/// 断言 `dae disasm` 的**本体**（到第一条终止指令为止）里确实有 `ldr CODE_REG, [THR, #<那个 offset>]`。
+/// 三条独立来源（产物 / 仓库里的头文件 / 反汇编文本）对不上就失败。
+///
+/// ⚠️ **「本体」必须按终止指令截断**，这一条本身就是被测对象的一部分：一个指令表条目里
+/// 可能装着多个 stub，不截断就会把邻居的指令算到本地址头上。负对照实测过：把生产代码里的
+/// 截断删掉，本门禁立刻失败在**预测到的那个假归属**上（`SlowTypeTestStub_0x4c47ac`，
+/// 它自己的本体只有一条 `brk #0`）。
+#[test]
+fn code_reg_stub_names_trace_back_to_profile_and_instructions() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sample = root.join("testing/decompiler_corpus/sample_arm64");
+    if !sample.exists() {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 CODE_REG stub 门禁");
+        return;
+    }
+    let s = sample.to_string_lossy().to_string();
+    let (info, _e, rc) = run(bin, &["info", &s]);
+    assert_eq!(rc, 0, "info 失败: {_e}");
+    let (mut sdk, mut arch, mut feats) = (String::new(), String::new(), String::new());
+    for ln in info.lines() {
+        let c: Vec<&str> = ln.split('\t').collect();
+        if c.len() >= 2 {
+            match c[0] {
+                "sdk" => sdk = c[1].trim().to_string(),
+                "arch" => arch = c[1].trim().to_string(),
+                "features" => feats = c[1].trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    if arch != "arm64" {
+        println!("[{arch}] CODE_REG stub 门禁: 该形状只在 arm64 上取证过——不产生断言");
+        return;
+    }
+    let compressed = feats.contains("compressed-pointers") && !feats.contains("no-compressed-pointers");
+    let fields = dart_thread_fields(root, &sdk, &arch, compressed)
+        .expect("应能读到该版本的 DartThread 布局");
+    // 字段名 → offset（8 字节一格）
+    let mut off_of: BTreeMap<String, u64> = BTreeMap::new();
+    for (i, f) in fields.iter().enumerate() {
+        if f.ends_with("_stub") {
+            off_of.entry(camel_case(f)).or_insert((i as u64) * 8);
+        }
+    }
+    assert!(
+        off_of.len() >= 20,
+        "只找到 {} 个 *_stub 字段（期望 ≥20）——头文件解析或该版本布局有问题",
+        off_of.len()
+    );
+
+    let out = root.join("target").join("cli_query_codereg");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+    let stubs = std::fs::read_to_string(out.join("text/stubs.txt")).expect("stubs.txt 应存在");
+    let mut named: Vec<(u64, String)> = Vec::new();
+    for line in stubs.lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() < 4 {
+            continue;
+        }
+        // 只认这一族的形状：<Camel>Stub_0x<addr> 且地址就是本行地址；
+        // 排除固定字面量 RuntimeCallStub（那是泛化形状命名，另有判据）
+        if let Some(stem) = c[3].strip_suffix(&format!("_{}", c[0])) {
+            if stem.ends_with("Stub")
+                && stem != "RuntimeCallStub"
+                && stem.starts_with(|ch: char| ch.is_uppercase())
+            {
+                let a = u64::from_str_radix(c[0].trim_start_matches("0x"), 16).unwrap();
+                named.push((a, c[3].to_string()));
+            }
+        }
+    }
+    if named.is_empty() {
+        println!("CODE_REG stub 命名: 本语料 0 条，门禁未产生断言");
+        let _ = std::fs::remove_dir_all(&out);
+        return;
+    }
+    let mut checked = 0usize;
+    for (addr, name) in &named {
+        let stem = name.strip_suffix(&format!("_0x{addr:x}")).expect("名字应带自己的地址");
+        let off = *off_of.get(stem).unwrap_or_else(|| {
+            panic!(
+                "{name}: 词干 {stem} 在 {sdk} 的 DartThread 布局里找不到对应的 *_stub 字段——\
+                 名字不是从 profile 来的（编造）"
+            )
+        });
+        let (od, ed, rd) = run(bin, &["disasm", &s, &format!("{addr:#x}")]);
+        assert_eq!(rd, 0, "disasm {addr:#x} 失败: {ed}");
+        let ins = parse_disasm(&od);
+        // 本体：到第一条终止指令为止
+        let mut cut: Vec<&(u64, String, String)> = Vec::new();
+        for x in &ins {
+            cut.push(x);
+            if matches!(x.1.as_str(), "ret" | "brk" | "br" | "b") {
+                break;
+            }
+        }
+        assert!(!cut.is_empty(), "{addr:#x}: disasm 没有解析出任何指令行");
+        let want = format!("#0x{off:x}");
+        let hit = cut.iter().any(|i| {
+            i.1 == "ldr"
+                && (i.2.contains("CODE_REG") || i.2.contains("r24") || i.2.contains("x24"))
+                && i.2.contains("THR")
+                && i.2.contains(&want)
+        });
+        assert!(
+            hit,
+            "{name}（{addr:#x}）: 本体 {} 条指令里没有 `ldr CODE_REG, [THR, {want}]`。\n\
+             本体前几条：{:?}\n\
+             要么名字不是从这条装载推出来的，要么「按终止指令截断」这一步没生效\n\
+             （不截断就会把同表项里邻居 stub 的装载算到本地址头上）。",
+            cut.len(),
+            cut.iter().take(6).map(|i| format!("{} {}", i.1, i.2)).collect::<Vec<_>>()
+        );
+        checked += 1;
+    }
+    // 防空过：这一族在本语料上必须真的有货（sample_arm64 实测 26 条）
+    assert!(
+        checked >= 5,
+        "只复核了 {checked} 条 CODE_REG 身份命名（sample_arm64 实测应有 20+ 条）——\
+         要么是命名链没生效，要么是 stubs.txt 解析没生效，两种情况下这条门禁都是空过的"
+    );
+    println!(
+        "CODE_REG 身份命名可反推: {checked} 条全部满足「名字词干 ∈ {sdk} 的 *_stub 字段」\
+         且「本体（截到终止指令）里有 ldr CODE_REG, [THR, #该字段 offset]」（compressed={compressed}）"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 内联（胖）分配 stub 的类名必须与**快照类表**一致，且大小自洽。
+///
+/// ## 为什么这条要单独存在
+///
+/// 已有的 `ground_truth.rs::alloc_stub_naming` 拿 ELF `.symtab` 里的
+/// `Precompiled_AllocationStub_<Class>_<n>` 当外部真值，是最强的一条——但它那 6 份语料
+/// **全是 x64**（`elf-x64.json`），而内联分配 stub 的命名只在 arm64 上取证过，
+/// 所以那条门禁**结构上覆盖不到这里**（实测 T4_blank 的 88 个 `AllocationStub_*`
+/// 表项长度全是 16 字节＝瘦 shim，胖 stub 至少 9 条指令＝36 字节）。
+/// 没有外部真值时退而求其次，用**两条独立内部来源互证**：类名（指令里的对象头 → cid →
+/// 类表）与大小（`add` 的定长立即数、`sub` 必须恰好 size−1、16 对齐）。
+///
+/// ## 判据为什么必须要求「定长立即数」
+///
+/// 变长分配器（`AllocateArray`/`AllocateTypedData`）的大小来自寄存器，其本体里的
+/// `mov x17, #0xfffa` 是**长度上界**不是对象头。按「第一个 mov + 第一个 movk」配对会在
+/// `0x3df2a0`/`0x3e057c` 上解出 cid 16（WeakSerializationReference）与 95（TwoByteString）
+/// ——两个都是编造。material_3_demo 实测：13 个胖 stub 全部通过紧判据，解出的类是
+/// `_Closure`(0x30/0x40)、`_Mint`(0x10)、`_Double`(0x10)、`_Record`(0x20/0x30)、
+/// `_GrowableList`(0x20)、`_Float64x2`/`_Float32x4`/`_Int32x4`(0x20)，**大小与类逐一相符**。
+#[test]
+fn inline_alloc_stub_names_match_the_class_table() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sample = root.join("testing/decompiler_corpus/sample_arm64");
+    if !sample.exists() {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过内联分配 stub 门禁");
+        return;
+    }
+    let s = sample.to_string_lossy().to_string();
+    // in-process 打开同一份语料，只为拿 tagging / 类表 / 预设类名表（与产物是两条不同路径）
+    let data = std::fs::read(&sample).expect("读语料");
+    let msgs = dae::locale::messages(dae::locale::Lang::En);
+    let plat = dae::cli::resolve_platform(&data, None, &msgs).expect("平台 profile");
+    let (offs, _) = dae::platform::locate_snapshots(&data, &plat).expect("定位快照");
+    let (sdk, _) = dae::profile::detect::detect_sdk(&data, offs.0 as usize, offs.1 as usize)
+        .expect("识别 SDK profile");
+    let platref: &'static _ = Box::leak(Box::new(plat));
+    let a = dae::analyzer::Analyzer::new_located(
+        Box::leak(data.into_boxed_slice()),
+        sdk,
+        platref,
+        offs,
+        false,
+    )
+    .expect("解析快照");
+    let align = a.profile.tagging.object_alignment.max(1) as u64;
+
+    let out = root.join("target").join("cli_query_inlinealloc");
+    let _ = std::fs::remove_dir_all(&out);
+    let o = out.to_string_lossy().to_string();
+    let (_so, se, rc) = run(bin, &[&s, &o]);
+    assert_eq!(rc, 0, "全量导出失败: {se}");
+    let stubs = std::fs::read_to_string(out.join("text/stubs.txt")).expect("stubs.txt");
+    // 胖 stub 至少 9 条指令 = 36 字节；瘦 shim 是 12–16 字节，据此把两者分开
+    let mut cands: Vec<(u64, u64, String)> = Vec::new();
+    for line in stubs.lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() >= 4 && c[3].starts_with("AllocationStub_") {
+            let size: u64 = c[1].parse().unwrap_or(0);
+            if size >= 36 {
+                let addr = u64::from_str_radix(c[0].trim_start_matches("0x"), 16).unwrap();
+                cands.push((addr, size, c[3].to_string()));
+            }
+        }
+    }
+    if cands.is_empty() {
+        println!("内联分配 stub: 本语料 0 条（只有瘦 shim），门禁未产生断言");
+        let _ = std::fs::remove_dir_all(&out);
+        return;
+    }
+    let mut checked = 0usize;
+    for (addr, size, name) in &cands {
+        let want_cls = name.strip_prefix("AllocationStub_").unwrap();
+        let (od, ed, rd) = run(bin, &["disasm", &s, &format!("{addr:#x}")]);
+        assert_eq!(rd, 0, "disasm {addr:#x} 失败: {ed}");
+        let ins = parse_disasm(&od);
+        assert!(ins.len() >= 9, "{addr:#x}: 胖分配 stub 应至少 9 条指令，实得 {}", ins.len());
+        let want = ["ldp", "add", "cmp", "b.ls", "str", "sub", "mov", "movk", "stur"];
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(&ins[i].1, w, "{addr:#x}: 第 {i} 条应是 {w}，实得 {}", ins[i].1);
+        }
+        assert!(ins[0].2.contains("THR"), "{addr:#x}: ldp 的基址不是 THR：{}", ins[0].2);
+        assert!(ins[4].2.contains("THR"), "{addr:#x}: 提交 bump 的 str 基址不是 THR：{}", ins[4].2);
+        let imm = |txt: &str, n: usize| -> u64 {
+            let seg = txt.split('#').nth(n).unwrap_or("");
+            let seg = seg.trim().trim_end_matches(']');
+            let seg = seg.split(',').next().unwrap_or("").trim();
+            u64::from_str_radix(seg.trim_start_matches("0x"), 16)
+                .unwrap_or_else(|_| panic!("{addr:#x}: 立即数 {seg:?} 解析失败（原文 {txt}）"))
+        };
+        let sz = imm(&ins[1].2, 1);
+        // ⚠️ 不能断言 sz == 表项长度：表项里还含慢路径块（甚至邻居 stub），
+        // 实测 0x4c650c 的对象大小是 32 而表项长 100。只要求对象大小落在表项内。
+        assert!(sz <= *size, "{addr:#x}: 对象大小 {sz} 超过表项长度 {size}——立即数解错了");
+        assert_eq!(sz % align, 0, "{addr:#x}: 对象大小 {sz} 不是 object_alignment({align}) 的倍数");
+        assert_eq!(imm(&ins[5].2, 1), sz - 1, "{addr:#x}: sub 的立即数应恰好是 size-1（tagged 回退）");
+        assert!(ins[8].2.contains("#-1"), "{addr:#x}: 对象头必须存在 payload 前一个字：{}", ins[8].2);
+        assert!(ins[7].2.contains("lsl #16"), "{addr:#x}: movk 应带 lsl #16：{}", ins[7].2);
+        let lo = imm(&ins[6].2, 1);
+        let hi = imm(&ins[7].2, 1);
+        let hdr = lo | (hi << 16);
+        let tg = &a.profile.tagging;
+        let cid = ((hdr >> tg.cid_tag_pos) & tg.cid_tag_mask) as i64;
+        let got = a
+            .cname_by_cid
+            .get(&cid)
+            .cloned()
+            .or_else(|| a.profile.class_id_names.get(&cid.to_string()).cloned())
+            .unwrap_or_else(|| {
+                panic!("{addr:#x}: cid {cid}（头字 {hdr:#x}）在类表与预设类表里都查不到")
+            });
+        assert_eq!(
+            &got, want_cls,
+            "{addr:#x}: 由头字 {hdr:#x} 解出 cid {cid} → 类名 {got:?}，与发布的 {name} 不符"
+        );
+        checked += 1;
+    }
+    // 防空过：material_3_demo 实测 13 条、sample_arm64 实测 19 条
+    assert!(
+        checked >= 3,
+        "只复核了 {checked} 个内联分配 stub——太少，这条门禁等于没跑"
+    );
+    println!(
+        "内联分配 stub 命名可复核: {checked} 条，类名全部与快照类表/预设类表一致，\
+         且 size 与 add 立即数相符、{align} 对齐、sub 立即数 == size-1"
     );
     let _ = std::fs::remove_dir_all(&out);
 }

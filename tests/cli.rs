@@ -10,6 +10,7 @@
 //!
 //! 语料缺失（`testing/decompiler_corpus/sample_arm64` 未编译）时整体跳过。
 
+#[cfg(feature = "asm")] // 只有 progressive_cli 用它
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,6 +45,7 @@ fn run(bin: &str, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+#[cfg(feature = "asm")]  // 只有 progressive_cli 用它，而那条门禁本身是 asm-only
 /// 从伪代码正文里抓函数名。**只认函数头** `dynamic <name>() {`：
 /// 函数体内的局部声明也是 `dynamic x0;`，认错会把局部变量当成函数（试过，会误判）。
 fn fn_names(text: &str) -> BTreeSet<String> {
@@ -56,6 +58,12 @@ fn fn_names(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+// 这条门禁整个建立在反编译器之上（`--decompile` + 读 `dart/` 目录），
+// 而 `dart/` 只在 `asm` feature 下才会产出 ⇒ 无 capstone 的构建里它必然失败
+// （`dart/ 目录: NotFound`）。此前没 gate，是因为 `cargo test --no-default-features`
+// 根本**编译不过**（另两个测试文件直接引用了 `dae::decompiler`），失败被编译错误挡住了；
+// 编译修好之后它就暴露出来。同文件其余三条门禁不依赖反编译器，照常两种配置都跑。
+#[cfg(feature = "asm")]
 #[test]
 fn progressive_cli() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -266,5 +274,222 @@ fn pp_header_is_not_fabricated() {
     assert!(
         value.starts_with("unavailable"),
         "pool heap offset 应如实写成 unavailable，实得：{value}"
+    );
+}
+
+/// 平台 profile 的 `register_aliases` 必须与 `registers` **自洽**。
+///
+/// ## 为什么需要这条
+///
+/// 三个 arm64 平台 profile 里同时写着 `registers.code_reg = "x24"` 和
+/// `register_aliases["x23"] = "CODE_REG"`——**互相矛盾**，而且错的是别名那一边：
+/// Dart SDK `runtime/vm/constants_arm64.h` 从 2.12.4 到 3.13.0 **每一版**都写
+/// `const Register CODE_REG = R24;`，而 R23 只是 `kAbiPreservedCpuRegs` 里一个
+/// **没有名字角色**的普通被保留寄存器。于是每一份 arm64 产物都把 x23 印成 `CODE_REG`、
+/// 把真正的 CODE_REG（x24）印成裸 `r24`/`x24`（material_3_demo 实测 asm/ 里 1010 处、
+/// dart/ 里 3014 处错标）。两个错误都来自被移植的 Python 参考实现
+/// （`dart_aot_export.py` 同一行还写了 `"x18": "ARG2"`，而 `ARG2` 在**任何版本的
+/// constants_arm64.h 里都不存在**；R18 的注释是「reserved on iOS, shadow call stack on
+/// Fuchsia, TEB on Windows」，SDK 还明说「We rely on R18 not being touched by Dart
+/// generated assembly or stubs at all」——实测产物里 x18/ARG2 出现 **0 次**，
+/// 所以删掉它对输出是可证明的无操作）。
+///
+/// 这类矛盾能长期存活，是因为**没有任何检查把两张表对在一起看**：
+/// `scripts/check_profiles.sh` 只管 SDK profile 的新鲜度，不碰平台 profile 的寄存器表。
+///
+/// ## 判据
+///
+/// 对每个 `registers` 里的角色：若它的名字（大写）出现在 `register_aliases` 的值里，
+/// 那么 `registers` 给的物理寄存器**必须在**那些物理寄存器之中。
+/// 用「在其中」而不是「恰好相等」，是因为一个角色可以有多个编码——
+/// `sp` 就同时对应 `x15`（Dart 代码里的 SP）与 `x31`（硬件 SP 编码），两者都该印 `SP`。
+///
+/// 反向也查：任何被标成某角色名的物理寄存器，如果 `registers` 里有这个角色、
+/// 却指向别的寄存器，就是本条要抓的矛盾。
+///
+/// 这条门禁**不吃语料**（只读仓库里被 include_str! 的那几份 JSON），所以任何检出里都会真跑。
+#[test]
+fn platform_register_aliases_are_self_consistent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("profiles/platform");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("读不到 {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 6,
+        "只找到 {} 份平台 profile（期望 ≥6：macho/elf/pe × arm64/x64）——路径是不是错了？\
+         这条门禁不吃语料，份数不对就说明它根本没在测东西",
+        files.len()
+    );
+    let mut checked = 0usize;
+    let mut arm64 = 0usize;
+    for f in &files {
+        let txt = std::fs::read_to_string(f).unwrap();
+        // 走**发布用的那个解析器**（`parse_platform`，也就是 `include_str!` 进二进制的同一份数据
+        // 与同一条反序列化路径），这样测的是产物真正用到的表，而不是文件里的字面 JSON。
+        let pp = dae::profile::parse_platform(&txt)
+            .unwrap_or_else(|e| panic!("{} 解析失败: {e}", f.display()));
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let regs = &pp.registers;
+        let al = &pp.register_aliases;
+        if pp.arch == "arm64" {
+            arm64 += 1;
+        }
+        // 角色名（大写）→ 被标成该名字的物理寄存器集合
+        let mut by_role: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        #[allow(clippy::implicit_clone)]
+        for (phys, alias) in al {
+            by_role.entry(alias.to_ascii_uppercase()).or_default().push(phys.clone());
+        }
+        for (role, p) in regs {
+            let p = p.as_str();
+            checked += 1;
+            let key = role.to_ascii_uppercase();
+            if let Some(who) = by_role.get(&key) {
+                assert!(
+                    who.iter().any(|x| x == p),
+                    "{name}: registers.{role} = {p}，但 register_aliases 把 {key} 标在 {who:?} 上。\n\
+                     两张表矛盾时，产物会用**别名表**渲染，于是寄存器被印成错的角色名。\n\
+                     历史故障：三个 arm64 profile 都写 code_reg=x24 而别名把 CODE_REG 标在 x23；\n\
+                     SDK constants_arm64.h（2.12.4–3.13.0 每一版）都是 `CODE_REG = R24`，\n\
+                     R23 没有名字角色，所以错的是别名表。"
+                );
+            }
+        }
+        // 反向：别名表里出现的角色名，若 registers 有同名角色则上面已查；
+        // 这里额外钉住「CODE_REG 必须标在 registers.code_reg 上」这一条最要命的，
+        // 因为它是唯一被产物大量渲染、且曾经标错的那个。
+        if let Some(cr) = regs.get("code_reg") {
+            if by_role.contains_key("CODE_REG") {
+                assert_eq!(
+                    by_role["CODE_REG"],
+                    vec![cr.to_string()],
+                    "{name}: CODE_REG 别名必须恰好标在 registers.code_reg（{cr}）上"
+                );
+            }
+        }
+    }
+    assert!(
+        checked >= 20,
+        "只比对了 {checked} 个 (profile, 角色) 对——太少，这条门禁等于没跑"
+    );
+    assert!(arm64 >= 3, "只看到 {arm64} 份 arm64 profile（期望 macho/elf/pe 三份）");
+    println!(
+        "平台寄存器别名自洽: {} 份 profile、{} 个 (profile, 角色) 对、其中 arm64 {} 份",
+        files.len(),
+        checked,
+        arm64
+    );
+}
+
+/// 压缩指针目标的 `DartThread` 必须补上 `heap_base`，且**只补一个、补在正确位置**。
+///
+/// ## 为什么这条比 stub 命名严重
+///
+/// `DartThread` 是**发给 IDA/r2 的结构体**。SDK `runtime/vm/thread.h` 里 `heap_base_` 是
+/// `#if defined(DART_COMPRESSED_POINTERS)` 包着的条件字段，而且是 `Thread` 里唯一一个；
+/// 压缩指针＝**每一个移动端 Flutter 产物**，所以不补就意味着从 `write_barrier_mask` 之后
+/// 所有字段整体错位 8 字节，用户在 IDA 里按结构体读线程字段会全错。
+/// 仓库里 48 份头文件对此不一致（2.13.4–2.19.6 已含 `heap_base`，其余不含），
+/// 所以规则是「目标压缩 **且** 头里没有」才插——已含的必须**原样不动**（幂等）。
+///
+/// ## 三处代码实测把这条钉死了（dart 3.3.4 / Reqable，压缩指针）
+///
+/// 补完之后结构头给出的偏移与产物里的代码**逐一对上**：
+/// `stack_limit` = 0x38（`ldr x16,[x26,#0x38]` + `cmp SP` + `b.ls` 就是 CheckStackOverflow）、
+/// `top` = **0x50**（胖分配 stub 的 `ldp x0,x2,[x26,#0x50]` 与 `str x0,[x26,#0x50]`）、
+/// `write_barrier_entry_point` = **0x1e8**（屏障子 stub 的 `ldr x30,[x26,#0x1e8]`）。
+/// 补之前 `top` 会算成 0x48、屏障字段会算成 `array_write_barrier_entry_point`——
+/// 后者正是当时对 Reqable/飞书发布出 `ArrayWriteBarrierStub_*` 这个**错名**的原因。
+#[test]
+fn dart_thread_struct_gets_heap_base_only_for_compressed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("profiles/struct");
+    let mut vers: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("读不到 {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    vers.sort();
+    assert!(vers.len() >= 20, "只找到 {} 个 struct 版本目录（期望 ≥20）", vers.len());
+    let fields = |txt: &str| -> Vec<String> {
+        txt.lines()
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with('}'))
+            .filter_map(|l| l.trim().trim_end_matches(';').split_whitespace().last().map(String::from))
+            .collect()
+    };
+    let (mut n, mut had, mut inserted) = (0usize, 0usize, 0usize);
+    for v in &vers {
+        for arch in ["arm64", "x64"] {
+            let p = v.join(format!("dart_struct-{arch}.h"));
+            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            n += 1;
+            let base = fields(&src);
+            assert!(
+                base.iter().filter(|x| *x == "write_barrier_mask").count() == 1,
+                "{}: 应恰有一个 write_barrier_mask",
+                p.display()
+            );
+            let had_hb = base.iter().any(|x| x == "heap_base");
+            // 非压缩：必须原样
+            assert_eq!(
+                dae::export::struct_hdr::with_heap_base(&src, false),
+                src,
+                "{}: 非压缩目标不该改动结构头",
+                p.display()
+            );
+            let out = dae::export::struct_hdr::with_heap_base(&src, true);
+            let got = fields(&out);
+            assert_eq!(
+                got.iter().filter(|x| *x == "heap_base").count(),
+                1,
+                "{}: 压缩目标必须恰好有一个 heap_base（原来{}）",
+                p.display(),
+                if had_hb { "就有" } else { "没有" }
+            );
+            // 位置：紧跟 write_barrier_mask
+            let wm = got.iter().position(|x| x == "write_barrier_mask").unwrap();
+            let hb = got.iter().position(|x| x == "heap_base").unwrap();
+            assert_eq!(
+                hb,
+                wm + 1,
+                "{}: heap_base 必须紧跟 write_barrier_mask（wm={wm} hb={hb}）",
+                p.display()
+            );
+            // top 必须因此后移 8 字节（1 个字段）——除非头里本来就有 heap_base
+            let top_before = base.iter().position(|x| x == "top").expect("应有 top");
+            let top_after = got.iter().position(|x| x == "top").expect("应有 top");
+            if had_hb {
+                had += 1;
+                assert_eq!(out, src, "{}: 头里已有 heap_base 就必须幂等", p.display());
+                assert_eq!(top_after, top_before);
+            } else {
+                inserted += 1;
+                assert_eq!(
+                    top_after,
+                    top_before + 1,
+                    "{}: 插入 heap_base 后 top 应后移一个字段（{} -> {}）",
+                    p.display(),
+                    top_before * 8,
+                    top_after * 8
+                );
+            }
+            // 其余字段顺序不变
+            let strip = |v: &Vec<String>| -> Vec<String> {
+                v.iter().filter(|x| *x != "heap_base").cloned().collect()
+            };
+            assert_eq!(strip(&base), strip(&got), "{}: 除 heap_base 外字段顺序不得改变", p.display());
+        }
+    }
+    assert!(n >= 40, "只检查了 {n} 份结构头（期望 ≥40：20+ 版本 × 2 架构）");
+    assert!(inserted >= 20, "只有 {inserted} 份需要插入 heap_base——预期约一半，数字太小可能是解析没生效");
+    println!(
+        "DartThread 压缩变体: {n} 份结构头，{inserted} 份需插入 heap_base、{had} 份本就有（幂等）"
     );
 }

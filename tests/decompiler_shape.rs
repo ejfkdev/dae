@@ -8,6 +8,12 @@
 //!
 //! 语料缺失时跳过；语料在但一个函数都反编译不出来视为失败。
 
+// 本文件两条门禁都是反编译产物形态判据，已各自带 `#[cfg(feature = "asm")]`；
+// 但文件顶部的 imports / 辅助函数 / 门槛常量在**无 capstone 的构建里全都用不上**，
+// 会产出 10 条 unused 警告，于是那条配置在 CI 里既不干净也读不出「哪些是真警告」。
+// 两个 test 已经 gate 了，所以整份文件 gate 掉等价、且更干净。
+#![cfg(feature = "asm")]
+
 use dae::analyzer::Analyzer;
 use dae::profile::{parse_platform, parse_sdk, PlatformProfile, SdkProfile};
 use std::path::Path;

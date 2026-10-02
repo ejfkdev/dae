@@ -4009,6 +4009,69 @@ impl<'a> Structurer<'a> {
         None
     }
 
+    /// 尾复制到**汇合点**：与 [`Self::dup_tail`] 同一套纪律，只是收尾条件从「遇到终止符」
+    /// 放宽成「遇到终止符**或**汇合点 `join`」。
+    ///
+    /// 用途：`find_join` 认定 ti/fi 两支都能走到 j，但其中一支的块**已经发射过**（`done`），
+    /// `seq` 因此返回空——那一支的语句（含 store/call 这类**有副作用**的语句）在产物里被整段
+    /// 跳过，读起来就是「这条路径什么都不做」。把这段直线代码抄进分支体，语义补齐了，
+    /// 而且不需要 goto（函数仍算 structured）。
+    ///
+    /// 返回 `Some(空 vec)` 是有意义的一种结果：**这条路一句语句都没有、直接落到 j**，
+    /// 此时空分支体就是真值，调用方既不该抄也不该补 goto。
+    ///
+    /// 不抄的情况（返回 None，调用方退回 `gotoLabel`）：目标未发射过（那 `seq` 本来就该有内容，
+    /// 返回空另有原因）、回头跳（与 `dup_tail` 同口径，只抄前向，避免抄循环体）、
+    /// 含条件分支（抄它就得连两支一起抄）、含循环头、自环、超预算（≤16 块 / 每函数 256 行）。
+    fn dup_to_join(&mut self, start: usize, join: usize, cur: usize) -> Option<Vec<Node>> {
+        if !self.done.contains(&start) || self.blocks[start].start <= self.blocks[cur].start {
+            return None;
+        }
+        let mut out: Vec<Node> = Vec::new();
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut b = start;
+        let mut lines = 0usize;
+        for _ in 0..16 {
+            if b == join {
+                self.dup_lines += lines;
+                return Some(out);
+            }
+            if !seen.insert(b) || self.loops.contains_key(&b) {
+                return None;
+            }
+            lines += self.body_lines(b).len();
+            if self.dup_lines + lines > 256 {
+                return None;
+            }
+            out.extend(self.body_lines(b));
+            match self.term(b) {
+                Some(Op::Return { value }) => {
+                    out.push(Node::Line(self.ret_line(b, &value)));
+                    self.dup_lines += lines;
+                    return Some(out);
+                }
+                Some(Op::Abort(n)) => {
+                    out.push(Node::Line(format!("abort(); // brk #{n:#x}")));
+                    self.dup_lines += lines;
+                    return Some(out);
+                }
+                Some(Op::Branch { cond: Some(_), .. }) => return None,
+                Some(Op::Branch { cond: None, target }) => match self.idx.get(&target) {
+                    Some(&t) if t != b => b = t,
+                    _ => return None,
+                },
+                _ => match self.succ(b, 0) {
+                    Some(n) if n != b => b = n,
+                    _ => {
+                        self.dup_lines += lines;
+                        return Some(out);
+                    }
+                },
+            }
+        }
+        None
+    }
+
     /// `ret` 的渲染：`Return { value: None }` 在机器层是「x0/rax 里是返回值」。
     /// 若本块最后一条语句正是写返回寄存器，就写成 `return x0;`——比裸 `return;` 忠实，
     /// 也消掉一大类 `unused_local_variable`（实测一个自编程序里 3,290 条警告，多数是
@@ -4157,7 +4220,8 @@ impl<'a> Structurer<'a> {
                         (self.idx.get(&target).copied(), self.succ(b, 1))
                     {
                         if ti != body_entry && self.is_rejoin_side_block(ti, fi) {
-                            let then = self.seq(ti, Some(body_entry), depth + 1);
+                            let mut then = self.seq(ti, Some(body_entry), depth + 1);
+                            self.goto_if_empty(&mut then, ti, Some(body_entry));
                             body.push(Node::If {
                                 cond: gc.clone(),
                                 then,
@@ -4220,7 +4284,8 @@ impl<'a> Structurer<'a> {
                     // （arm64 ELF 语料实测：结构化率因此从 ~88% 掉到 34%）。
                     if f.is_none() {
                         if let Some(ti) = t {
-                            let then = self.seq(ti, stop, depth + 1);
+                            let mut then = self.seq(ti, stop, depth + 1);
+                            self.fill_branch(&mut then, ti, None, b, stop);
                             out.push(Node::If {
                                 cond: c.clone(),
                                 then,
@@ -4235,8 +4300,15 @@ impl<'a> Structurer<'a> {
                             // 只是不再有「汇合之后」的语句（历史实现把它排除掉，
                             // 白白让 1/4 的 if/else 退回 goto）。
                             if let Some(j) = self.find_join(ti, fi) {
-                                let then = self.seq(ti, Some(j), depth + 1);
-                                let els = self.seq(fi, Some(j), depth + 1);
+                                let mut then = self.seq(ti, Some(j), depth + 1);
+                                let mut els = self.seq(fi, Some(j), depth + 1);
+                                // 空分支体按「能证明的优先」三档处理，绝不静默留空：
+                                //   ① 目标就是汇合点 j ⇒ 它的代码紧接着这个 `if` 发射，留空是对的；
+                                //   ② 目标是已发射过的共享块且到 j 之间是直线段 ⇒ 尾复制回来
+                                //      （与上面无条件跳转那条路的 `dup_tail` 同一先例）；
+                                //   ③ 复制不了 ⇒ 如实写 `gotoLabel(0x<目标>)`。
+                                self.fill_branch(&mut then, ti, Some(j), b, Some(j));
+                                self.fill_branch(&mut els, fi, Some(j), b, Some(j));
                                 out.push(Node::If {
                                     cond: c.clone(),
                                     then,
@@ -4249,7 +4321,30 @@ impl<'a> Structurer<'a> {
                             } else if self.terminates(ti) {
                                 // if-return 形状：true 支自身终止（return/brk/跳出区域），
                                 // 另一支继续——直接发射 `if (c) { 支 }` 并顺着 else 支走。
-                                let then = self.seq(ti, stop, depth + 1);
+                                if stop == Some(ti) && self.terminates(fi) {
+                                    // 目标块就是**区域终点**：`seq(ti, Some(ti))` 必然返回空，
+                                    // 于是过去这里发一个空 then 再顺着 fi 走——文本上与「真丢了
+                                    // 一条边」完全一样，读者无从区分（sample_arm64 实测 37/39
+                                    // 处空 then 属于这一类）。
+                                    //
+                                    // 能镜像的前提是 **fi 自己也终止**（`terminates(fi)`）：
+                                    // 走到这一支说明 `find_join` 返回 None，即 ti 与 fi
+                                    // **没有共同后继**——所以「两支同归 stop」并不自动成立，
+                                    // 只有 fi 以 return/abort 收尾时，`if (!c) { fi }` 才等价
+                                    // （c=true 落到调用方随后发射的 stop=ti，c=false 在 fi 内终止）。
+                                    // fi 不终止时必须留 goto：镜像会让 c=false 的路径**落进 ti**，
+                                    // 那是把一条不存在的边写进产物。判据与既有的
+                                    // `terminates(fi)` 镜像支完全一致，不新造规则。
+                                    let body = self.seq(fi, stop, depth + 1);
+                                    out.push(Node::If {
+                                        cond: negate_cond(&c),
+                                        then: body,
+                                        els: vec![],
+                                    });
+                                    break;
+                                }
+                                let mut then = self.seq(ti, stop, depth + 1);
+                                self.fill_branch(&mut then, ti, None, b, Some(fi));
                                 out.push(Node::If {
                                     cond: c.clone(),
                                     then,
@@ -4258,7 +4353,8 @@ impl<'a> Structurer<'a> {
                                 cur = Some(fi);
                             } else if self.terminates(fi) {
                                 // 镜像形状：else 支终止 → 取反后作为 then 发射
-                                let els = self.seq(fi, stop, depth + 1);
+                                let mut els = self.seq(fi, stop, depth + 1);
+                                self.fill_branch(&mut els, fi, None, b, Some(ti));
                                 out.push(Node::If {
                                     cond: negate_cond(&c),
                                     then: els,
@@ -4268,9 +4364,17 @@ impl<'a> Structurer<'a> {
                             } else {
                                 // 真正不可归约：只保留 true 支，其余如实退回 goto
                                 self.bail("no-join:irreducible");
+                                let mut then_i = self.seq(ti, stop, depth + 1);
+                                // fallthrough 传 **None** 而不是 `stop`：这一支发完 `if` 紧接着
+                                // 就 push 一条 `Goto(fi)` 然后 `break`，所以 `if` 之后**不是**
+                                // ti 的代码而是假支的 goto——`fill_branch` 的档位①
+                                // （「目标就是紧随其后的块 ⇒ 留空即真值」）在这里不成立。
+                                // 补上 goto 让两条边都写出来；代价为零，因为 `bail` 已经把
+                                // 这个函数记成 unstructured 了。
+                                self.fill_branch(&mut then_i, ti, None, b, None);
                                 out.push(Node::If {
                                     cond: c.clone(),
-                                    then: self.seq(ti, stop, depth + 1),
+                                    then: then_i,
                                     els: vec![],
                                 });
                                 out.push(Node::Goto(self.blocks[fi].start));
@@ -4355,6 +4459,90 @@ impl<'a> Structurer<'a> {
     /// `in_loop[target] != Some(h)` 判别失败了，因为 Dart 的 out-of-line 栈溢出处理块
     /// 形态是 `bl <stub>; b <落空块>`，它**跳回循环内**，于是被循环检测标成 in_loop，
     /// 判据恒假。改成看形状之后就不受归属影响了。
+    /// 空分支体不许静默。
+    ///
+    /// `seq` 有两种情况返回空：目标块**就是区域终点**（`stop` / 汇合点，它的代码紧接着这个
+    /// `if` 发射），或目标块**已经发射过**（共享块，代码在文件别处）。第一种留下的空 `{ }`
+    /// 语义是对的——两条路径最终都走到紧随其后的代码；第二种是**真丢了一条边**：产物里
+    /// 完全看不出那条路径去了哪儿。两种形态在文本上一模一样，读者无从区分。
+    ///
+    /// 所以只在「目标不是紧随其后发射的那个块」时补一条 `gotoLabel(0x<目标>)`：地址取自
+    /// 指令表、是事实，不猜任何语义（判据同 `RuntimeCallStub_0x…`——名字里保留地址而
+    /// 不编 entry 名）。`fallthrough` 就是这个 `if` 之后紧接着会发射的块：join 路径是
+    /// 汇合点 `j`，终止/镜像路径是落空块。
+    ///
+    /// 实测 sample_arm64：无 else 空 if **109 → 5**，剩下的 5 处是 `ti == fi`
+    /// （条件分支的目标就是落空块，两支同归）——那种 `if` 本来就不该有内容。
+    /// 良性的 `if (c) { } else { … }` **2560 处一处不动**：它们的汇合点正是 `ti`，
+    /// 补 goto 只会写成「跳到下一行」。
+    /// 空分支体的三档处理，按「能证明的优先」：
+    /// ① 目标**就是汇合点** `join` ⇒ 它的代码紧接着这个 `if` 发射，留空即真值（不抄不 goto）；
+    /// ② 目标是**已发射过的共享块**、且到 `join` 之间是直线段 ⇒ 尾复制回来
+    ///    （[`Self::dup_to_join`]，与无条件跳转那条路的 `dup_tail` 同一先例：
+    ///    IDA/LLVM 对共享尾块同样做复制）——语义补齐且**不需要 goto**，函数仍算 structured；
+    /// ③ 复制不了 ⇒ 如实写 `gotoLabel(0x<目标>)`（[`Self::goto_if_empty`]）。
+    ///
+    /// 为什么不能一律留空：`find_join` 只保证两支**最终**都走到 `join`，中间那段语句
+    /// （实测这一类 100% 是 `done=true`，即共享块）含 store/call 这类**有副作用**的语句，
+    /// 留空就是把它们在产物里整段跳过——那是丢语义，不只是丢可读性。
+    fn fill_branch(
+        &mut self,
+        body: &mut Vec<Node>,
+        target: usize,
+        join: Option<usize>,
+        cur: usize,
+        fallthrough: Option<usize>,
+    ) {
+        if !body.is_empty() || Some(target) == join || Some(target) == fallthrough {
+            return;
+        }
+        // join = None（终止/镜像/末块路径）：没有汇合点可停，改用 `dup_tail`——
+        // 它要求直线段以终止符收尾，正是「守卫式抛出/返回」这类形状
+        // （实测 sample_arm64 的 `b.hs <RangeError stub>` 只有 1 条语句，抄回来比 goto 可读）。
+        if join.is_none() {
+            if self.blocks[target].start > self.blocks[cur].start {
+                if let Some(tail) = self.dup_tail(target, 16) {
+                    if !tail.is_empty() {
+                        body.push(Node::Line(format!(
+                            "// duplicated branch body (target {:#x} terminates; \
+                             the same code is emitted below)",
+                            self.blocks[target].start
+                        )));
+                        body.extend(tail);
+                        return;
+                    }
+                }
+            }
+            self.goto_if_empty(body, target, fallthrough);
+            return;
+        }
+        let join = join.unwrap();
+        match self.dup_to_join(target, join, cur) {
+            Some(d) if !d.is_empty() => {
+                body.push(Node::Line(format!(
+                    "// duplicated branch body (shared block {:#x}, joins at {:#x}; \
+                     the same code was emitted above)",
+                    self.blocks[target].start, self.blocks[join].start
+                )));
+                body.extend(d);
+            }
+            // 空 vec ＝ 这条路一句语句都没有、直接落到 join：空分支体就是真值
+            Some(_) => {}
+            None => self.goto_if_empty(body, target, fallthrough),
+        }
+    }
+
+    fn goto_if_empty(
+        &self,
+        nodes: &mut Vec<Node>,
+        target: usize,
+        fallthrough: Option<usize>,
+    ) {
+        if nodes.is_empty() && Some(target) != fallthrough {
+            nodes.push(Node::Goto(self.blocks[target].start));
+        }
+    }
+
     fn is_rejoin_side_block(&self, t: usize, rejoin: usize) -> bool {
         matches!(
             self.term(t),

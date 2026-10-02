@@ -19,6 +19,13 @@
 //! `app.so` 再跑同一套判据。默认跳过——它要 flutter 工具链与 android 引擎缓存，
 //! 而且刻意绕开 Gradle（首跑会长时间卡在依赖下载）。
 
+// 整份门禁都建立在反编译器之上（`dae::decompiler::{recover_fields, render}`），
+// 而 `decompiler` 模块只在 `asm` feature 下存在 ⇒ 无 capstone 的构建里**没有可测对象**，
+// 整个文件 gate 掉。这不是「跳过以免失败」：`--no-default-features` 下反编译器根本不存在，
+// 之前不 gate 的直接后果是 `cargo test --no-default-features` **编译不过**
+// （`cannot find `decompiler` in `dae``），于是那条配置在 CI/本地都无法验证。
+#![cfg(feature = "asm")]
+
 use dae::analyzer::Analyzer;
 use std::path::Path;
 
