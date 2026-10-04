@@ -232,6 +232,173 @@ fn progressive_cli() {
     let _ = std::fs::remove_dir_all(&sel);
 }
 
+/// 帮助信息的形态门禁。**不需要语料**（帮助与快照无关），所以缺语料的检出里它照样跑——
+/// 这正是它必须独立于 `progressive_cli` 的原因：那条整段挂在语料存在性上。
+///
+/// 钉住四件事：
+/// 1. `dae`（无参数）、`dae -h`、`dae --help`、`dae help` 四种形态输出**逐字节相同**、退出码 0。
+///    无参数曾经是「打印帮助但退出码 2」，而它并不是一个失败的调用。
+/// 2. 每条命令的 `dae <cmd> -h`、`dae <cmd> --help`、`dae help <cmd>` 三种形态**逐字节相同**、
+///    退出码 0，且**不需要位置参数**。第 2 条曾经对全部 22 条命令都是坏的：clap 的必填位置
+///    参数校验发生在解析阶段、早于 handler，于是 `dae libs -h` 先撞上「required arguments
+///    were not provided」而以 2 退出。而当时唯一的门禁跑的是 `dae help <cmd>`——它没有必填
+///    位置参数、是好的，所以缺陷整整一个版本没被发现（`scripts/cmp_cli.sh` 的注释写着
+///    「每条命令的 -h」而代码跑的是 `help "$c"`）。
+/// 3. 顶层帮助**必须逐条列出全部子命令**。
+/// 4. `dae help <不存在的命令>` 是用法错误（退出码 2），不是「退回打印整份指南并返回 0」。
+#[test]
+fn help_is_consistent_and_lists_every_command() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    // 命令清单写死在这里：新增命令而忘了写进帮助时，第 3 条断言会失败。
+    const CMDS: [&str; 22] = [
+        "export", "info", "libs", "classes", "functions", "strings", "fields", "largest", "pp",
+        "objs", "stubs", "members", "callers", "callees", "findrefs", "disasm", "getclass",
+        "getmethod", "getlib", "decompile", "help", "version",
+    ];
+    let out = |args: &[&str], env: Option<(&str, &str)>| -> (String, i32) {
+        let mut c = Command::new(bin);
+        c.args(args);
+        if let Some((k, v)) = env {
+            c.env(k, v);
+        }
+        let o = c.output().expect("启动 dae 失败");
+        (
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            o.status.code().unwrap_or(-1),
+        )
+    };
+
+    for lang in [None, Some(("DAE_LANG", "zh"))] {
+        let tag = lang.map(|(_, v)| v).unwrap_or("en");
+
+        // 1) 顶层四种形态逐字节相同
+        let (want, rc) = out(&["help"], lang);
+        assert_eq!(rc, 0, "[{tag}] `dae help` 退出码应是 0");
+        for form in [&[""][..], &["-h"][..], &["--help"][..]] {
+            let args: Vec<&str> = form.iter().filter(|a| !a.is_empty()).copied().collect();
+            let (got, rc) = out(&args, lang);
+            assert_eq!(rc, 0, "[{tag}] `dae {}` 退出码应是 0", args.join(" "));
+            assert_eq!(
+                got, want,
+                "[{tag}] `dae {}` 与 `dae help` 的输出必须逐字节相同（同一份文档只能有一处）",
+                args.join(" ")
+            );
+        }
+        assert!(
+            want.lines().count() >= 60,
+            "[{tag}] 顶层帮助只有 {} 行，大概没渲染出来",
+            want.lines().count()
+        );
+
+        // 3) 顶层帮助逐条列出全部子命令
+        for c in CMDS {
+            assert!(
+                want.contains(&format!("dae {c}")) || want.contains(&format!("dae {c} ")),
+                "[{tag}] 顶层帮助没有列出子命令 `{c}`"
+            );
+        }
+
+        // 2) 每条命令的三种形态逐字节相同、且不需要位置参数
+        for c in CMDS {
+            let (want, rc) = out(&["help", c], lang);
+            assert_eq!(rc, 0, "[{tag}] `dae help {c}` 退出码应是 0");
+            assert!(
+                want.lines().count() >= 3,
+                "[{tag}] `dae help {c}` 只有 {} 行，help_for 大概没覆盖到它",
+                want.lines().count()
+            );
+            for flag in ["-h", "--help"] {
+                let (got, rc) = out(&[c, flag], lang);
+                assert_eq!(
+                    rc, 0,
+                    "[{tag}] `dae {c} {flag}` 退出码应是 0（缺位置参数时也必须能出帮助）"
+                );
+                assert_eq!(got, want, "[{tag}] `dae {c} {flag}` 与 `dae help {c}` 输出必须相同");
+            }
+        }
+
+        // 4) 未知命令名是用法错误
+        let (got, rc) = out(&["help", "nosuchcommand"], lang);
+        assert_eq!(rc, 2, "[{tag}] `dae help nosuchcommand` 应是用法错误 2，实际 {rc}");
+        assert!(
+            got.is_empty(),
+            "[{tag}] 未知命令名不该往 stdout 打整份指南（那会把拼写错误藏起来）"
+        );
+    }
+
+    // 帮助文本是**终端输出**，不是 Markdown：粗体标记与字面量 `\t` 都不会被渲染，
+    // 只会变成噪声（实测曾有 33 行含 `**`、12 行把制表符印成两个字符 `\t`）。
+    let (en, _) = out(&["help"], None);
+    for c in CMDS {
+        let (t, _) = out(&["help", c], None);
+        assert!(!t.contains("**"), "`dae help {c}` 含 Markdown 粗体标记，终端不渲染");
+        assert!(
+            !t.contains("\\t"),
+            "`dae help {c}` 含字面量 \\t（应写成「制表符分隔」并用逗号列举）"
+        );
+    }
+    assert!(!en.contains("**"), "顶层帮助含 Markdown 粗体标记");
+    assert!(!en.contains("\\t"), "顶层帮助含字面量 \\t");
+}
+
+/// README 里内嵌的命令表必须与 `dae help` 的 COMMANDS 一节**逐字节一致**。
+///
+/// 这条盯的是一类已经真实发生过的漂移：README 抄了一份命令表，改了帮助却忘了改 README。
+/// 具体实例——v0.1.12 把 `stubs` 的假说法（"instruction-table entries with no Code object"）
+/// 在四处改正，中文 README 改了、**英文 README 这一份副本漏了**，于是发布出去的文档里
+/// 还留着一个已经定性为错误的说法。
+///
+/// 两份 README 各取「渐进式」小节后第一个围栏块；权威来源是 `dae help` 的输出本身。
+#[test]
+fn readme_command_table_matches_help() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    /// 取出帮助输出里 COMMANDS（中文「命令」）与 OPTIONS（中文「选项」）之间的那一段
+    fn commands_section(text: &str, head: &str, tail: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let a = lines.iter().position(|l| l.trim() == head)?;
+        let b = lines.iter().position(|l| l.trim() == tail)?;
+        Some(lines[a + 1..b].join("\n").trim_matches('\n').to_string())
+    }
+
+    /// 取出 README 里指定小节后的第一个 ``` 围栏块
+    fn fenced_block(md: &str, section: &str) -> Option<String> {
+        let sec = md.get(md.find(section)?..)?;
+        let mut it = sec.split("```");
+        it.next()?; // 小节标题到第一个围栏之间的正文
+        Some(it.next()?.trim_matches('\n').to_string())
+    }
+
+    for (readme, section, head, tail) in [
+        ("README.md", "## Progressive mode", "COMMANDS", "OPTIONS"),
+        ("README.zh.md", "## 渐进式", "命令", "选项"),
+    ] {
+        let path = root.join(readme);
+        let Ok(md) = std::fs::read_to_string(&path) else { continue };
+        let want = commands_section(
+            &String::from_utf8_lossy(
+                &Command::new(bin)
+                    .arg("help")
+                    .env("DAE_LANG", if head == "命令" { "zh" } else { "en" })
+                    .output()
+                    .expect("启动 dae 失败")
+                    .stdout,
+            ),
+            head,
+            tail,
+        )
+        .expect("`dae help` 输出里应有 COMMANDS/OPTIONS 分节标题");
+        let got = fenced_block(&md, section)
+            .unwrap_or_else(|| panic!("{readme} 里找不到 `{section}` 小节后的围栏块"));
+        assert_eq!(
+            got, want,
+            "{readme} 内嵌的命令表与 `dae help` 的 {head} 一节不一致——\
+             改了帮助就要同步这份副本（历史上英文 README 就曾漏改，留下一个已定性为错误的说法）"
+        );
+    }
+}
+
 /// pp.txt 的首行**不许**是一个编造出来的十六进制数。
 ///
 /// 这一行曾经硬编码为 `0x10f000080`（从 Python 参考实现原样移植，而参考实现自己也写死）。
