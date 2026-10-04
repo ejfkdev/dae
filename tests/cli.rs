@@ -399,6 +399,71 @@ fn readme_command_table_matches_help() {
     }
 }
 
+/// `members` 的库筛选只作用于方法——字段走 `field_rows()`，而快照里的 Field 记录不带库
+/// 归属，所以 `--lib` / `--exclude-lib` / `--no-sdk` / `--app` 对它无从生效。
+///
+/// 这个不对称本身是**有意**的（`dae help members` 里写着「与其让 --lib 对字段静默无效，
+/// 不如明说」），但帮助只在被问到时才看到，而输出里「已筛的方法」与「未筛的字段」长得
+/// 一模一样。所以它必须在**会产生误解的那一次调用**上自己说一声。这条门禁钉住三件事：
+/// 提示只在有库筛选时出现、只走 stderr（stdout 是数据通道）、且两次运行都真的有字段命中
+/// （否则这条门禁什么都没量到）。
+#[test]
+fn members_lib_filter_note_goes_to_stderr() {
+    let bin = env!("CARGO_BIN_EXE_dae");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sample = root.join("testing/decompiler_corpus/sample_arm64");
+    if !sample.exists() {
+        skip_or_fail("缺语料 testing/decompiler_corpus/sample_arm64，跳过 members 库筛选提示门禁");
+        return;
+    }
+    let s = sample.to_string_lossy().to_string();
+    let run = |args: &[&str]| -> (String, String) {
+        let o = Command::new(bin)
+            .args(args)
+            .output()
+            .expect("启动 dae 失败");
+        assert_eq!(o.status.code(), Some(0), "`dae {}` 应成功", args.join(" "));
+        (
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+    /// 中英文两种措辞都认，免得门禁绑死在某一种语系上
+    fn has_note(t: &str) -> bool {
+        t.contains("library filters apply to methods only") || t.contains("库筛选只作用于方法")
+    }
+
+    // 有库筛选：必须有提示，且只在 stderr
+    let (so, se) = run(&["members", &s, "--lib", "dart_core", "-n", "5000"]);
+    assert!(has_note(&se), "有库筛选时 stderr 应说明字段未经筛选，实际 stderr:\n{se}");
+    assert!(
+        !has_note(&so),
+        "提示不许进 stdout——stdout 是数据通道，多一行就毁了管道"
+    );
+    // 防空过：这次输出里真的有字段行，否则「提示存在」证明不了什么
+    let n_field_rows = so.lines().filter(|l| l.starts_with("field\t")).count();
+    assert!(
+        n_field_rows > 0,
+        "输出里没有 field 行，这条门禁没量到东西（-n 5000 应有 60 行）"
+    );
+    // 字段确实**没有**被 --lib 筛掉：这就是要提示的那件事
+    let (so_all, _) = run(&["members", &s, "-n", "5000"]);
+    let n_all = so_all.lines().filter(|l| l.starts_with("field\t")).count();
+    assert_eq!(
+        n_field_rows, n_all,
+        "加 --lib 后字段行数从 {n_all} 变成 {n_field_rows}——若相等则说明字段确实未被筛选，\
+         提示是对的；若不等则行为已变，这条门禁与 help 文本都要跟着改"
+    );
+
+    // 无库筛选：不该出现提示
+    let (_, se2) = run(&["members", &s, "-n", "5000"]);
+    assert!(!has_note(&se2), "没有库筛选时不该出现该提示，实际 stderr:\n{se2}");
+
+    // --field 单独用时也算「有库筛选」的情形之一：同样要提示
+    let (_, se3) = run(&["members", &s, "--field", "--no-sdk"]);
+    assert!(has_note(&se3), "--field --no-sdk 时也应提示，实际 stderr:\n{se3}");
+}
+
 /// pp.txt 的首行**不许**是一个编造出来的十六进制数。
 ///
 /// 这一行曾经硬编码为 `0x10f000080`（从 Python 参考实现原样移植，而参考实现自己也写死）。

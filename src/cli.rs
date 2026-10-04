@@ -1650,6 +1650,27 @@ fn cmd_members(
                 &format!("dae: {shown} members matched ({n_m} methods + {n_f} fields)")
             )
         );
+        // 库筛选**只作用于方法**：字段走 `field_rows()`，而快照里的 Field 记录不带库归属
+        // （只有类/名/偏移），所以 --lib / --exclude-lib / --no-sdk / --app 对它无从生效。
+        // `dae help members` 里写了这个不对称，但帮助只在被问到时才看到；而输出里
+        // 「已筛的方法」与「未筛的字段」长得一模一样，用户无从分辨。所以在**恰好会产生
+        // 误解的那一次调用**上说一声，措辞讲「命中的字段数」而不是「上面的行」——
+        // 默认 -n 200 时字段行可能全被截掉，而摘要里的 60 个字段同样是未筛的。
+        // 走 stderr：stdout 是数据通道，多一行就毁了管道。
+        if n_f > 0 && (!o.libs.is_empty() || !o.exclude_libs.is_empty() || o.no_sdk || o.app) {
+            eprintln!(
+                "{}",
+                tr(
+                    lang,
+                    &format!(
+                        "dae：注意——库筛选只作用于方法，命中的 {n_f} 个字段未经筛选（Field 记录不带库归属）"
+                    ),
+                    &format!(
+                        "dae: note -- library filters apply to methods only; the {n_f} matched fields are unfiltered (Field records carry no library attribution)"
+                    )
+                )
+            );
+        }
         emit(&o, &out, lang, "members")
     })
 }
