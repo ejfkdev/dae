@@ -175,42 +175,50 @@ export done -> /绝对路径/to/out:
 先查、再定点反编译（`dae help` 有全部命令，`dae help <cmd>` 有单条命令的选项与输出列）：
 
 ```
-先摸清全貌
-  dae info      <binary>                        快照 / SDK / 规模——不写任何产物
-  dae libs      <binary> [pattern]              库（包）清单 + 类数/函数数
-  dae classes   <binary> [pattern] [--lib P]    类清单
-  dae functions <binary> [pattern] [--lib P]    函数清单（入口 / 字节数 / 归属）
-  dae largest   <binary> [-n N]                 按代码字节数排前 N
+  概览
+    dae info      <binary>                      快照、SDK 与规模概况
+    dae libs      <binary> [pattern]            库（包）清单，含类数与函数数
+    dae classes   <binary> [pattern] [--lib P]  类清单（只列至少拥有一个函数的类）
+    dae functions <binary> [pattern] [--lib P]  函数清单：入口地址、字节数、归属
+    dae largest   <binary> [-n N]               按字节数排序的前 N 个函数
 
-找东西
-  dae strings   <binary> [-f TEXT]              快照字符串表检索
-  dae fields    <binary> [pattern]              具名字段（来源 + 字节偏移）
-  dae members   <binary> [NAME] [--class X]     方法与字段的统一名字检索
-  dae findrefs  <binary> string TEXT            哪些代码位置加载了这个字面量
-  dae findrefs  <binary> kind NAME              ……或加载了这个种类的对象
-  dae callers   <binary> <NAME|0xADDR>          谁调用了它（静态直接调用边）
-  dae callees   <binary> <NAME|0xADDR>          它调用了谁（列与 callers 相同）
+  检索
+    dae strings   <binary> [-f TEXT]            字符串表检索
+    dae fields    <binary> [pattern]            恢复出的字段名，含来源与字节偏移
+    dae members   <binary> [NAME] [--class X]   方法与字段的名字检索
+    dae findrefs  <binary> string TEXT          从对象池加载该字面量的代码位置
+    dae findrefs  <binary> kind NAME            从对象池加载该种类对象的代码位置
+    dae callers   <binary> <NAME|0xADDR>        调用给定函数的位置
+    dae callees   <binary> <NAME|0xADDR>        给定函数调用的目标（列同 callers）
 
-对象层（与 text/ 里的同名产物同源）
-  dae pp        <binary> [pattern]              对象池条目
-  dae objs      <binary> [pattern]              用户类实例（含字段值）
-  dae stubs     <binary> [pattern]              指令表里没有被任何 Function 引用的条目
+  对象层（text/ 产物的查询入口，数据同源）
+    dae pp        <binary> [pattern]            对象池条目
+    dae objs      <binary> [pattern]            用户类实例，含字段值
+    dae stubs     <binary> [pattern]            没有被任何 Function 引用的指令表条目
 
-反编译
-  dae getclass  <binary> <CLASS>                只反编译这个类
-  dae getmethod <binary> <CLASS.method>         只反编译这个方法
-  dae getlib    <binary> <LIB>                  只反编译这个库（包）
-  dae decompile <binary> [-o DIR|FILE.dart|-]   全部，或你收窄后的全部
+  反编译
+    dae getclass  <binary> <CLASS>              反编译单个类
+    dae getmethod <binary> <CLASS.method>       反编译单个方法
+    dae getlib    <binary> <LIB>                反编译单个库；前缀选中整个包
+    dae decompile <binary> [-o DIR|FILE.dart|-] 只反编译，不写其它产物；默认全部库
 
-低层
-  dae disasm    <binary> <CLASS[.method]>       原始反汇编（arm64 保留 IL 注释）
-  dae disasm    <binary> 0xADDR                 ……也可以按地址：函数入口、stub 表项，
-                                                  或表项**内部**的子 stub（见下文）
+  底层
+    dae disasm    <binary> <NAME|0xADDR>        单个函数或表项的反汇编（arm64）
 
-全量导出
-  dae export    <binary> <out_dir> [--decompile]
-  dae           <binary> <out_dir> [--decompile]   快捷形，与上面完全等价
+  导出
+    dae export    <binary> <out_dir> [options]  把全部产物写进 out_dir
+    第一个参数不是子命令时自动补 export，故快捷形与显式形完全等价。
+
+  其它
+    dae help      [command]                     本说明；带命令名时给该命令的说明
+    dae version                                 打印名字与版本
 ```
+`dae disasm <binary> 0xADDR` 认三种地址：函数入口、stub 表条目、以及**表条目内部的子 stub**
+（写屏障族：一个 640 字节表项其实是 20 个 32 字节变体，调用方直接 bl 到内部地址，所以两个表都
+查不到）。窗口长度只从可证的地方取——函数表/stub 表自己给的长度，或形状校验要求的恰好 8 条指令；
+三处都不认就报错而不猜长度，因为猜出来的长度会反汇编到别的字节上、而输出看起来完全正常。
+
+权威清单是 `dae help`；上面这张表是它「命令」一节的副本。
 
 几条为了「能组合」而定的口径：
 

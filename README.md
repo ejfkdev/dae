@@ -187,42 +187,53 @@ answer to "where is this string used". Query first, decompile surgically (`dae h
 option, `dae help <cmd>` has one command's):
 
 ```
-get oriented
-  dae info      <binary>                        snapshot, SDK, sizes -- writes nothing
-  dae libs      <binary> [pattern]              libraries (packages) with class/function counts
-  dae classes   <binary> [pattern] [--lib P]    classes
-  dae functions <binary> [pattern] [--lib P]    functions (entry, size, owner)
-  dae largest   <binary> [-n N]                 biggest functions by code size
+  Overview
+    dae info      <binary>                      snapshot, SDK and size summary
+    dae libs      <binary> [pattern]            libraries with class and function counts
+    dae classes   <binary> [pattern] [--lib P]  classes that own at least one function
+    dae functions <binary> [pattern] [--lib P]  functions: entry address, size, owner
+    dae largest   <binary> [-n N]               the N largest functions by size
 
-find things
-  dae strings   <binary> [-f TEXT]              snapshot string table
-  dae fields    <binary> [pattern]              named fields (source + byte offset)
-  dae members   <binary> [NAME] [--class X]     methods and fields in one search
-  dae findrefs  <binary> string TEXT            every code site that loads this literal
-  dae findrefs  <binary> kind NAME              ...or an object of this kind
-  dae callers   <binary> <NAME|0xADDR>          who calls it (static direct-call edges)
-  dae callees   <binary> <NAME|0xADDR>          what it calls (same columns as callers)
+  Search
+    dae strings   <binary> [-f TEXT]            search the string table
+    dae fields    <binary> [pattern]            recovered field names with source and byte offset
+    dae members   <binary> [NAME] [--class X]   method and field name search
+    dae findrefs  <binary> string TEXT          code sites loading this literal from the object pool
+    dae findrefs  <binary> kind NAME            code sites that load an object of this kind
+    dae callers   <binary> <NAME|0xADDR>        callers of a function
+    dae callees   <binary> <NAME|0xADDR>        callees of a function; same columns as callers
 
-object layer (same data as the text/ artifacts)
-  dae pp        <binary> [pattern]              object pool entries
-  dae objs      <binary> [pattern]              user class instances with field values
-  dae stubs     <binary> [pattern]              instruction-table entries with no Code object
+  Object layer (query interface to the text/ artifacts; same data)
+    dae pp        <binary> [pattern]            object pool entries
+    dae objs      <binary> [pattern]            instances of user classes, with field values
+    dae stubs     <binary> [pattern]            table entries no Function object references
 
-decompile
-  dae getclass  <binary> <CLASS>                just this class
-  dae getmethod <binary> <CLASS.method>         just this method
-  dae getlib    <binary> <LIB>                  just this library (package)
-  dae decompile <binary> [-o DIR|FILE.dart|-]   everything, or everything you scoped
+  Decompilation
+    dae getclass  <binary> <CLASS>              decompile a single class
+    dae getmethod <binary> <CLASS.method>       decompile a single method
+    dae getlib    <binary> <LIB>                decompile one library; a prefix selects the package
+    dae decompile <binary> [-o DIR|FILE.dart|-] decompile only; no other artifacts; all libraries
 
-low level
-  dae disasm    <binary> <CLASS[.method]>       raw disassembly (arm64 keeps the IL comments)
-  dae disasm    <binary> 0xADDR                 ...or by address: a function entry, a stub-table
-                                                  entry, or a sub-stub inside one (see below)
+  Low-level
+    dae disasm    <binary> <NAME|0xADDR>        disassembly of a function or table entry (arm64)
 
-full export
-  dae export    <binary> <out_dir> [--decompile]
-  dae           <binary> <out_dir> [--decompile]   shortcut, exactly equivalent
+  Export
+    dae export    <binary> <out_dir> [options]  write every artifact under out_dir
+    export is prepended when the first argument is not a command, so the two forms are equivalent.
+
+  Meta
+    dae help      [command]                     this text; with a command name, that command's help
+    dae version                                 print the name and version
 ```
+`dae disasm <binary> 0xADDR` accepts three kinds of address: a function entry, a stub-table entry,
+and a sub-stub *inside* one entry (the write-barrier family: a single 640-byte table entry is really
+20 32-byte variants and callers branch straight to an inner address, so neither table lists it).
+The window length is taken only from somewhere provable -- the function/stub table's own length, or
+the exact 8 instructions a shape check requires; an address none of the three accepts is an error
+rather than a guessed window, because a guessed length disassembles unrelated bytes and still looks
+plausible.
+
+The authoritative list is `dae help`; the table above is a copy of its COMMANDS section.
 
 Conventions, chosen so the commands compose:
 

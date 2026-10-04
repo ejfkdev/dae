@@ -17,16 +17,22 @@ fn main() {
     let s = dae::locale::messages(lang);
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // 无参数：打帮助并以 2 退出（用法错误）。文本用本项目双语版而不是 clap 自动生成的。
+    // 无参数、`-h`、`--help`、`help` 四种形态打印**同一份**文本并以 0 退出。
+    //
+    // 无参数为什么是 0 而不是 2：它不是一个失败的调用，而是「我想知道怎么用」，
+    // 与 `-h` 语义相同。文本用本项目自己的双语版（[`dae::cli::help`]）而不是 clap 自动
+    // 生成的那份——项目自己的文本写了每条命令的输出列格式与命名口径，而 clap 只会列 flag。
+    //
+    // ⚠️ 这里以前有一份**独立的** `print_help`，与 `cli::help` 各写一遍：`-h` 出 50 行、
+    // `dae help` 出 64 行，子命令表只在后者里完整。同一份文档写两遍就只会更新一遍，
+    // 现在只剩 `cli::help` 一处。
     if args.is_empty() {
-        print_help(&s);
-        std::process::exit(2);
+        println!("{}", dae::cli::help(lang));
+        std::process::exit(0);
     }
-    // 帮助与版本先截获：clap 的那份是英文通用 flag 列表，而本项目的帮助写了每个命令的
-    // 输出列格式与命名口径，且是双语的。
     match args[0].as_str() {
         "-h" | "--help" => {
-            print_help(&s);
+            println!("{}", dae::cli::help(lang));
             std::process::exit(0);
         }
         "-V" | "--version" => {
@@ -74,104 +80,4 @@ fn main() {
         }
     };
     std::process::exit(dae::cli::run_cmd(cli.cmd, lang, &s));
-}
-
-fn print_help(s: &dae::locale::Messages) {
-    if s.lang == dae::locale::Lang::Zh {
-        // 中文语系
-        println!("dae {} — Dart AOT 快照调试信息静态导出工具（支持 Dart 2.7–3.14β；Mach-O/ELF/PE，x64/arm64）", env!("GIT_VERSION"));
-        println!("https://github.com/ejfkdev/dae");
-        println!();
-        println!("用法: dae <binary> <out_dir> [选项]        # 全量或筛选导出（快捷形）");
-        println!("      dae export <binary> <out_dir> [选项] # 同上，显式动词（两者完全等价）");
-        println!("      dae <子命令> <binary> [选项]        # 渐进式：先查清单，再定点反编译");
-        println!("                                          （dae help 看全部子命令）");
-        println!();
-        println!("参数:");
-        println!("  <binary>              目标二进制（Mach-O/ELF/PE，含 Dart AOT 快照）");
-        println!("                         支持 .app / .framework 目录，自动定位内部二进制");
-        println!("  <out_dir>             输出目录（自动创建）");
-        println!();
-        println!("选项:");
-        println!("  --sdk-profile PATH     强制指定 SDK Profile（默认: 内嵌 26 版，按版本指纹自动识别）");
-        println!("  --platform-profile PATH 强制指定平台 Profile（默认: 按容器+架构自动选择）");
-        println!("  --decompile            额外产出 dart/ 伪 Dart（实验性：已做 if/else 与循环结构化）");
-        println!("  --lib PATTERN          只导出这些库（可重复；库名前缀即整个包）");
-        println!("  --class PATTERN        只导出这些类（可重复）");
-        println!("  --func PATTERN         只导出这些函数（可重复，可写 Class.method）");
-        println!("  --fuzzy                上面三个模式串改为子串匹配（默认精确）");
-        println!("  --exclude-lib PATTERN  排除这些库（可重复；前缀规则与 --lib 相同）");
-        println!("  --no-sdk               排除 SDK 库（URL 以 dart: 开头的）");
-        println!("  --app                  只留应用侧代码（再排除 package:flutter）");
-        println!();
-        println!("  -h, --help            显示此帮助");
-        println!("  -V, --version         显示版本");
-        println!();
-        println!("退出码: 0 成功；1 运行期错误（含没命中、解析漂移）；2 用法错误");
-        println!();
-        println!("输出:");
-        println!("  ida_script/    IDA 命名脚本 + 结构头（addNames.py / ida_dart_struct.h）");
-        println!("  r2_script/     radare2 命名脚本 + 结构头（addNames.r2 / r2_dart_struct.h）");
-        println!("  frida.js       Frida 运行时 Classes 数组模板");
-        println!("  asm/           capstone 反汇编 + IL 注释（arm64）");
-        println!("  text/          pp · objs · strings · libs · classes · functions ·");
-        println!("                 arrays · maps · call_edges（各类文本 dump）");
-        println!("  callgraph.dot  已命名函数之间的直接调用图（Graphviz）");
-        println!("  dart/          --decompile 时的伪 Dart（已结构化 if/else 与循环，实验性）");
-        println!();
-        println!("示例:");
-        println!("  dae App.app out/");
-        println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
-    } else {
-        println!("dae {} — static Dart AOT snapshot debug-info exporter (Dart 2.7–3.14β; Mach-O/ELF/PE, x64/arm64)", env!("GIT_VERSION"));
-        println!("https://github.com/ejfkdev/dae");
-        println!();
-        println!("usage: dae <binary> <out_dir> [options]        # full or filtered export (shortcut)");
-        println!("       dae export <binary> <out_dir> [options] # same thing, explicit verb (equivalent)");
-        println!("       dae <subcommand> <binary> [options]     # progressive: list first, then");
-        println!("                                               decompile one class/library");
-        println!("                                               (`dae help` lists every subcommand)");
-        println!();
-        println!("arguments:");
-        println!("  <binary>              target binary (Mach-O/ELF/PE with a Dart AOT snapshot);");
-        println!("                         accepts .app / .framework directories (locates the binary inside)");
-        println!("  <out_dir>             output directory (created if missing)");
-        println!();
-        println!("options:");
-        println!("  --sdk-profile PATH     force an SDK profile (default: 26 embedded, auto-detected by version fingerprint)");
-        println!("  --platform-profile PATH force a platform profile (default: auto by container + arch)");
-        println!("  --decompile            also emit dart/ pseudocode (experimental; if/else + loops structured)");
-        println!("  --lib PATTERN          export only these libraries (repeatable; a prefix = whole package)");
-        println!("  --class PATTERN        export only these classes (repeatable)");
-        println!("  --func PATTERN         export only these functions (repeatable; Class.method works)");
-        println!("  --fuzzy                make the three patterns substring matches (default: exact)");
-        println!("  --exclude-lib PATTERN  exclude these libraries (repeatable; same prefix rule as --lib)");
-        println!("  --no-sdk               exclude SDK libraries (URL starts with dart:)");
-        println!("  --app                  app-side code only (also excludes package:flutter)");
-        println!("  -h, --help            show this help");
-        println!("  -V, --version         show version");
-        println!();
-        println!("exit codes: 0 ok; 1 runtime error (including a miss and parse drift); 2 usage error");
-        println!();
-        println!("progressive (writes no full export):");
-        println!("  get oriented   dae info | libs | classes | functions | largest");
-        println!("  find things    dae strings | fields | members | findrefs | callers | callees");
-        println!("  object layer   dae pp | objs | stubs");
-        println!("  decompile one  dae getclass | getmethod | getlib | decompile");
-        println!("  low-level      dae disasm                  -- see `dae help` for each");
-        println!();
-        println!("outputs:");
-        println!("  ida_script/    IDA naming script + struct header (addNames.py / ida_dart_struct.h)");
-        println!("  r2_script/     radare2 naming script + struct header (addNames.r2 / r2_dart_struct.h)");
-        println!("  frida.js       Frida runtime Classes array template");
-        println!("  asm/           capstone disassembly + IL comments (arm64)");
-        println!("  text/          pp, objs, strings, libs, classes, functions,");
-        println!("                 arrays, maps, call_edges (all text dumps)");
-        println!("  callgraph.dot  direct-call graph between named functions (Graphviz)");
-        println!("  dart/          per-function pseudocode (with --decompile, experimental)");
-        println!();
-        println!("examples:");
-        println!("  dae App.app out/");
-        println!("  dae app.dylib out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json");
-    }
 }

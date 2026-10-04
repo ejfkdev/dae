@@ -144,7 +144,12 @@ fn apply_scope(a: &Analyzer, o: &Opts, mut sel: Selection) -> Selection {
 /// `-h/--help` 走本项目自己的双语文本（写了输出列格式与命名口径），不是 clap 自动生成的。
 /// 命中就直接退出 0——与手写解析器时代的行为一致。
 fn maybe_help(c: &Common, cmd: &str, lang: Lang) {
-    if c.help {
+    maybe_help2(c.help, cmd, lang);
+}
+
+/// `version` 没有共享选项组（它不接受任何参数），所以单独走这一个入口。
+fn maybe_help2(flag: bool, cmd: &str, lang: Lang) {
+    if flag {
         println!("{}", help_for(cmd, lang));
         std::process::exit(0);
     }
@@ -394,17 +399,91 @@ fn no_match(cmd: &str, sel: &Selection, libs: &LibGroups, lang: Lang) -> String 
 
 // ---------------------------------------------------------------- 子命令
 
+/// 失败分两类，因为**退出码不同**：`Run` 是运行期错误（1，`error: …` 走 stderr），
+/// `Usage` 是用法错误（2，与 clap 自己的用法错误同码）。
+///
+/// 为什么用法错误要在这里出现而不全交给 clap：clap 的必填位置参数校验发生在解析阶段、
+/// 早于 handler，于是 `dae libs -h` 会先撞上「required arguments were not provided」而以 2
+/// 退出，`-h` 永远执行不到（18 个子命令全中）。所以位置参数在 `src/args.rs` 里声明成
+/// `Option<String>`、由这里校验，`-h` 才有机会先跑（见 `maybe_help`）。
+enum Fail {
+    Run(String),
+    Usage,
+}
+
+/// 取一个必填位置参数；缺失时印双语用法错误并返回 `Fail::Usage`。
+///
+/// 顺带修掉 clap 那条更难看的诊断：它把我们的 `-h` 当成一个名叫 `help` 的普通 flag，
+/// 于是生成的 usage 行是 `dae libs --help <BINARY> [PATTERN]`，看起来像 `--help` 是必填项。
+fn need(v: Option<String>, cmd: &str, arg: &str, lang: Lang, s: &Messages) -> Result<String, Fail> {
+    match v {
+        Some(x) => Ok(x),
+        None => {
+            eprintln!(
+                "{}: {}",
+                s.err_prefix,
+                match lang {
+                    Lang::Zh => {
+                        format!("缺少参数 <{arg}>。用法见 `dae help {cmd}`；全部命令见 `dae help`")
+                    }
+                    Lang::En => {
+                        format!("missing argument <{arg}>. Usage: see `dae help {cmd}`; all commands: `dae help`")
+                    }
+                }
+            );
+            Err(Fail::Usage)
+        }
+    }
+}
+
 /// 分派 clap 解析好的命令树。
 ///
 /// 退出码口径与手写时代一致：**0 成功、1 运行期错误**（`error: …` 走 stderr）、
-/// 用法错误由 clap 在 `main` 里以 **2** 收尾。
+/// **2 用法错误**（clap 的解析错误在 `main` 里收尾，缺位置参数的在这里）。
 pub fn run_cmd(cmd: Cmd, lang: Lang, s: &Messages) -> i32 {
-    let r = match cmd {
-        Cmd::Version => {
+    match dispatch(cmd, lang, s) {
+        Ok(()) => 0,
+        Err(Fail::Run(e)) => {
+            eprintln!("{}: {e}", s.err_prefix);
+            1
+        }
+        Err(Fail::Usage) => 2,
+    }
+}
+
+/// 命令分派本体。抽出来是因为分派臂里要用 `?` 传播 `Fail`，而 `run_cmd` 返回的是退出码。
+fn dispatch(cmd: Cmd, lang: Lang, s: &Messages) -> Result<(), Fail> {
+    match cmd {
+        Cmd::Version(v) => {
+            maybe_help2(v.help, "version", lang);
             println!("dae {}", env!("GIT_VERSION"));
-            return 0;
+            Ok(())
         }
         Cmd::Help(h) => {
+            // `dae help -h` 要给 help 自己的说明。没有这个 flag 时 `-h` 会被当成命令名，
+            // 于是走进下面的「未知命令」分支报 2——22 条命令里唯一一条不支持 -h 的。
+            maybe_help2(h.help, "help", lang);
+            // 未知命令名按用法错误处理。以前这里无条件走 help_for 的兜底臂、把整份指南
+            // 打出来并返回 0，于是 `dae help libss` 看起来像成功了——拼写错误被藏起来。
+            if let Some(c) = h.cmd.as_deref() {
+                if !is_subcommand(c) {
+                    eprintln!(
+                        "{}: {}",
+                        s.err_prefix,
+                        match lang {
+                            Lang::Zh => format!(
+                                "没有名为 {c} 的命令。有效命令：{}",
+                                SUBCOMMANDS.join(" ")
+                            ),
+                            Lang::En => format!(
+                                "no such command: {c}. Valid commands: {}",
+                                SUBCOMMANDS.join(" ")
+                            ),
+                        }
+                    );
+                    return Err(Fail::Usage);
+                }
+            }
             println!(
                 "{}",
                 match h.cmd.as_deref() {
@@ -412,12 +491,14 @@ pub fn run_cmd(cmd: Cmd, lang: Lang, s: &Messages) -> i32 {
                     None => help(lang),
                 }
             );
-            return 0;
+            Ok(())
         }
         Cmd::Export(a) => {
             maybe_help(&a.common, "export", lang);
-            let o = opts_of(&a.common, a.binary, Vec::new());
-            cmd_export(o, &a.out_dir, a.decompile, s)
+            let bin = need(a.binary, "export", "binary", lang, s)?;
+            let out = need(a.out_dir, "export", "out_dir", lang, s)?;
+            let o = opts_of(&a.common, bin, Vec::new());
+            cmd_export(o, &out, a.decompile, s).map_err(Fail::Run)
         }
 
         // 清单类：`<binary> [pattern]`
@@ -436,12 +517,17 @@ pub fn run_cmd(cmd: Cmd, lang: Lang, s: &Messages) -> i32 {
 
         Cmd::Members(a) => {
             maybe_help(&a.common, "members", lang);
+            let bin = need(a.binary, "members", "binary", lang, s)?;
             let rest = a.pattern.into_iter().collect();
-            cmd_members(opts_of(&a.common, a.binary, rest), a.method, a.field, lang, s)
+            cmd_members(opts_of(&a.common, bin, rest), a.method, a.field, lang, s)
+                .map_err(Fail::Run)
         }
         Cmd::Findrefs(a) => {
             maybe_help(&a.common, "findrefs", lang);
-            cmd_findrefs(opts_of(&a.common, a.binary, vec![a.kind, a.query]), lang, s)
+            let bin = need(a.binary, "findrefs", "binary", lang, s)?;
+            let kind = need(a.kind, "findrefs", "string|kind", lang, s)?;
+            let query = need(a.query, "findrefs", "query", lang, s)?;
+            cmd_findrefs(opts_of(&a.common, bin, vec![kind, query]), lang, s).map_err(Fail::Run)
         }
 
         // 单目标类：`<binary> <name>`
@@ -455,34 +541,33 @@ pub fn run_cmd(cmd: Cmd, lang: Lang, s: &Messages) -> i32 {
         // 决定）。若硬套 Query，`dae decompile bin foo` 会收下 foo 再静默忽略——正是要避免的。
         Cmd::Decompile(a) => {
             maybe_help(&a.common, "decompile", lang);
-            cmd_decompile(opts_of(&a.common, a.binary, Vec::new()), lang, s)
-        }
-    };
-    match r {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("{}: {e}", s.err_prefix);
-            1
+            let bin = need(a.binary, "decompile", "binary", lang, s)?;
+            cmd_decompile(opts_of(&a.common, bin, Vec::new()), lang, s).map_err(Fail::Run)
         }
     }
 }
 
 type CmdFn = fn(Opts, Lang, &Messages) -> Result<(), String>;
 
-fn run_query(a: Query, cmd: &'static str, lang: Lang, s: &Messages, f: CmdFn) -> Result<(), String> {
+fn run_query(a: Query, cmd: &'static str, lang: Lang, s: &Messages, f: CmdFn) -> Result<(), Fail> {
     maybe_help(&a.common, cmd, lang);
+    let bin = need(a.binary, cmd, "binary", lang, s)?;
     let rest = a.pattern.into_iter().collect();
-    f(opts_of(&a.common, a.binary, rest), lang, s)
+    f(opts_of(&a.common, bin, rest), lang, s).map_err(Fail::Run)
 }
 
-fn run_target(a: Target, cmd: &'static str, lang: Lang, s: &Messages, f: CmdFn) -> Result<(), String> {
+fn run_target(a: Target, cmd: &'static str, lang: Lang, s: &Messages, f: CmdFn) -> Result<(), Fail> {
     maybe_help(&a.common, cmd, lang);
-    f(opts_of(&a.common, a.binary, vec![a.name]), lang, s)
+    let bin = need(a.binary, cmd, "binary", lang, s)?;
+    let name = need(a.name, cmd, "name", lang, s)?;
+    f(opts_of(&a.common, bin, vec![name]), lang, s).map_err(Fail::Run)
 }
 
-fn run_get(a: Target, cmd: &'static str, lang: Lang, s: &Messages) -> Result<(), String> {
+fn run_get(a: Target, cmd: &'static str, lang: Lang, s: &Messages) -> Result<(), Fail> {
     maybe_help(&a.common, cmd, lang);
-    cmd_get(cmd, opts_of(&a.common, a.binary, vec![a.name]), lang, s)
+    let bin = need(a.binary, cmd, "binary", lang, s)?;
+    let name = need(a.name, cmd, "name", lang, s)?;
+    cmd_get(cmd, opts_of(&a.common, bin, vec![name]), lang, s).map_err(Fail::Run)
 }
 
 
@@ -2068,7 +2153,7 @@ fn help_for(cmd: &str, lang: Lang) -> String {
     match cmd {
         "info" => format!(
             "{}\n\n  dae info <binary> [-o FILE]\n\n{}",
-            t("info —— 快照、SDK 与规模概况（不落盘）", "info -- snapshot, SDK and size overview (writes nothing)"),
+            t("info —— 快照、SDK 与规模概况（不写任何产物）", "info -- snapshot, SDK and size summary (writes no artifact)"),
             t(
                 "输出 TSV：容器 / 架构 / SDK / 状态 / 快照形态 / 指令段基址 / 指令表条目 /\n库 / 类 / 函数 / 字符串 / 对象数 / 告警数。",
                 "TSV out: container / arch / SDK / status / snapshot form / instructions base /\ninstructions table entries / libraries / classes / functions / strings / objects / warnings."
@@ -2077,47 +2162,47 @@ fn help_for(cmd: &str, lang: Lang) -> String {
         "libs" => format!(
             "{}\n\n  dae libs <binary> [pattern] [-n N] [-o FILE]\n\n{}\n{}\n{}",
             t("libs —— 库（包）清单", "libs -- library (package) listing"),
-            t("列：lib 名 \\t 类数 \\t 函数数 \\t 原始 URL（按函数数降序）", "columns: lib \\t classes \\t functions \\t source URL (sorted by function count)"),
+            t("列（制表符分隔）：lib 名, 类数, 函数数, 原始 URL（按函数数降序）", "tab-separated columns: lib, classes, functions, source URL (sorted by function count)"),
             t("pattern 是子串匹配（库名与 URL 都试）；库名三种写法等价，见下。", "pattern is a substring match over both the lib name and its URL."),
             t("库名前缀即「按包」：--lib testing_app 选中 testing_app/*。", "A lib prefix means \"whole package\": --lib testing_app selects testing_app/*.")
         ),
         "classes" => format!(
             "{}\n\n  dae classes <binary> [pattern] [--lib P] [-n N] [-o FILE]\n\n{}\n{}",
-            t("classes —— 类清单（**只含有函数的类**）", "classes -- class listing (only classes that own at least one function)"),
-            t("列：cid \\t lib \\t 类名 \\t 函数数", "columns: cid \\t lib \\t class \\t functions"),
+            t("classes —— 类清单（只含有函数的类）", "classes -- class listing (only classes that own at least one function)"),
+            t("列（制表符分隔）：cid, lib, 类名, 函数数", "tab-separated columns: cid, lib, class, functions"),
             t(
                 "pattern 子串匹配；--lib 限定库。\n\
-                 口径：本命令走 build_functions，所以只列**至少有一个函数**的类；\n\
+                 口径：本命令走 build_functions，所以只列至少有一个函数的类；\n\
                  `text/classes.txt` 列的是全部 Class 记录，两者能差很多（实测 animations\n\
                  2177 vs 3358——差的那些类方法全被内联/树摇，只剩记录）。要全量看 classes.txt。",
                 "pattern is a substring match; --lib narrows to a library.\n\
                  Scope: this command goes through build_functions, so it lists only classes that\n\
                  own at least one function; `text/classes.txt` lists every Class record. The two\n\
-                 can differ a lot (measured on animations: 2177 vs 3358 -- the rest had their\n\
+                 can differ substantially (measured on animations: 2177 vs 3358 -- the rest had their\n\
                  methods inlined/tree-shaken). Use classes.txt for the complete inventory."
             )
         ),
         "functions" => format!(
             "{}\n\n  dae functions <binary> [pattern] [--lib P] [--class P] [-n N] [-o FILE]\n\n{}\n{}",
             t("functions —— 函数清单", "functions -- function listing"),
-            t("列：入口地址 \\t 字节数 \\t lib \\t 类 \\t 方法名", "columns: entry \\t bytes \\t lib \\t class \\t member"),
+            t("列（制表符分隔）：入口地址, 字节数, lib, 类, 方法名", "tab-separated columns: entry, bytes, lib, class, member"),
             t("pattern 可与方法名、Class.method 或类名匹配。", "pattern matches the member, Class.method or the class name.")
         ),
         "fields" => format!(
             "{}\n\n  dae fields <binary> [pattern] [-n N] [-o FILE]\n\n{}\n{}",
             t("fields —— AOT 快照里保留下来的具名字段", "fields -- named fields the AOT snapshot keeps"),
-            t("列：类 \t 字段 \t 来源(rec/accessor) \t 字节偏移。", "columns: class \t field \t source(rec/accessor) \t byte offset"),
-            t("AOT 会丢掉绝大多数字段名（Precompiler::DropFields 只在非 PRODUCT 构建保留）。\n只列两条可证路径的结果：快照里的 Field 簇（rec）与隐式访问器名推断（accessor），不猜。", "AOT drops most field names (Precompiler::DropFields keeps them only in non-PRODUCT builds).\nLists only the two provable routes: the snapshot's own Field cluster (rec) and implicit-accessor names (accessor). Nothing is guessed.")
+            t("列（制表符分隔）：类, 字段, 来源(rec/accessor), 字节偏移。", "tab-separated columns: class, field, source (rec/accessor), byte offset"),
+            t("AOT 会丢掉绝大多数字段名（Precompiler::DropFields 只在非 PRODUCT 构建保留）。\n只列两条可证路径的结果：快照里的 Field 簇（rec）与隐式访问器名推断（accessor），不猜。", "AOT drops most field names (Precompiler::DropFields keeps them only in non-PRODUCT builds).\nLists only the two provable routes: the snapshot's own Field cluster (rec) and implicit-accessor names (accessor). No name is inferred.")
         ),
         "strings" => format!(
             "{}\n\n  dae strings <binary> [-f TEXT] [-n N] [-o FILE]\n\n{}",
             t("strings —— 快照字符串表检索（大小写不敏感子串）", "strings -- snapshot string table search (case-insensitive substring)"),
-            t("列：对象 ref \\t 文本。默认最多列 200 条，-n 调整。", "columns: object ref \\t text. Lists at most 200 by default; -n changes it.")
+            t("列（制表符分隔）：对象 ref, 文本。默认最多列 200 条，-n 调整。", "tab-separated columns: object ref, text. Lists at most 200 by default; -n changes it.")
         ),
         "largest" => format!(
             "{}\n\n  dae largest <binary> [-n N] [--lib P] [-o FILE]\n\n{}",
             t("largest —— 按代码字节数排前 N（默认 20）个函数", "largest -- top-N functions by code size (default 20)"),
-            t("列：字节数 \\t 入口 \\t lib/类.方法。", "columns: bytes \\t entry \\t lib/Class.member.")
+            t("列（制表符分隔）：字节数, 入口, lib/类.方法。", "tab-separated columns: bytes, entry, lib/Class.member.")
         ),
         "callers" => format!(
             "{}\n\n  dae callers <binary> <NAME|0xADDR> [--fuzzy] [-o FILE]\n\n{}\n{}",
@@ -2127,19 +2212,19 @@ fn help_for(cmd: &str, lang: Lang) -> String {
         ),
         "disasm" => format!(
             "{}\n\n  dae disasm <binary> <CLASS[.method] | 0xADDR> [-o FILE]\n\n{}\n{}\n{}",
-            t("disasm —— 单个函数、一个类，或**一个地址**的原始反汇编", "disasm -- raw disassembly of one function, a whole class, or **an address**"),
+            t("disasm —— 单个函数、一个类，或一个地址的原始反汇编", "disasm -- raw disassembly of one function, a whole class, or an address"),
             t(
-                "`0x…` 形式按地址反汇编，认三种地址：函数入口、**stub 表条目**、以及**表条目内部的子 stub**（写屏障族：一个 640 字节表项其实是 20 个 32 字节变体，调用方直接 bl 到内部地址，所以两个表都查不到）。这是看未命名 stub 的唯一途径：这些表项没有被任何 Function 对象引用、不在函数表里，按名字的路径结构上够不到它们。窗口长度只从**可证的地方**取——函数表/stub 表给的长度，或形状校验要求的恰好 8 条指令 = 32 字节；三处都不认就**报错而不猜长度**（猜长度会反汇编到别的字节上，而输出看起来完全正常）。",
-                "A positional `0x...` disassembles by address and accepts three kinds: a function entry, a **stub-table entry**, or a **sub-stub inside one** (the write-barrier family: one 640-byte table entry is really 20 32-byte variants, and callers bl straight to the inner addresses, so neither table lists them). This is the only way to look at an unnamed stub: these entries are referenced by no Function object and never appear in the function table, so the name-based path structurally cannot reach them. The window length comes only from somewhere provable -- the function/stub table's own length, or the exactly-8-instructions = 32 bytes that the shape check requires; an address none of the three accepts **errors instead of guessing a window** (a guessed length disassembles unrelated bytes and still looks plausible)."
+                "`0x…` 形式按地址反汇编，接受三种地址：函数入口、stub 表条目、以及表条目内部的子 stub（写屏障族：一个 640 字节表项实际上是 20 个 32 字节变体，调用方直接 bl 到内部地址，所以两个表都查不到）。这是查看未命名 stub 的唯一途径：这些表项没有被任何 Function 对象引用、不在函数表里，按名字的路径结构上够不到它们。窗口长度只从可证的地方取——函数表/stub 表给的长度，或形状校验要求的恰好 8 条指令 = 32 字节；三者都不匹配时报错，不推测窗口长度（推测长度会反汇编到无关字节上，且输出表面上完全正常）。",
+                "A positional `0x...` disassembles by address and accepts three kinds: a function entry, a stub-table entry, or a sub-stub inside one (the write-barrier family: one 640-byte table entry is really 20 32-byte variants, and callers bl straight to the inner addresses, so neither table lists them). This is the only way to look at an unnamed stub: these entries are referenced by no Function object and never appear in the function table, so the name-based path structurally cannot reach them. The window length comes only from somewhere provable -- the function/stub table's own length, or the exactly-8-instructions = 32 bytes that the shape check requires; an address none of the three accepts errors instead of guessing a window (a guessed length disassembles unrelated bytes and still looks plausible)."
             ),
             t("arm64 带 blutter 同形的 IL 分组注释（与 asm/ 产物一致）；x64 为纯反汇编。", "arm64 includes the blutter-shaped IL group comments (same as the asm/ artifact); x64 is plain disassembly."),
             t("寄存器已按框架名替换（PP/THR/SP/FP…）。", "Registers are already renamed to framework roles (PP/THR/SP/FP...).")
         ),
         "getclass" | "getmethod" | "getlib" => {
             let (what, what_en) = match cmd {
-                "getclass" => ("只反编译这一个类（含其方法）", "decompile just this class (with its methods)"),
-                "getmethod" => ("只反编译这一个方法", "decompile just this method"),
-                _ => ("只反编译这一个库（包）", "decompile just this library (package)"),
+                "getclass" => ("反编译单个类（含其方法）", "decompile a single class (with its methods)"),
+                "getmethod" => ("反编译单个方法", "decompile a single method"),
+                _ => ("反编译单个库（包）", "decompile a single library (package)"),
             };
             format!(
                 "{}\n\n  dae {cmd} <binary> <NAME> [-o FILE.dart|-o DIR|-]\n\n{}\n{}\n{}",
@@ -2153,20 +2238,20 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             "{}\n\n  dae decompile <binary> [-o DIR|FILE.dart|-] [--lib P] [--class P] [--func P]\n                [--exclude-lib P] [--no-sdk] [--app] [--fuzzy]\n\n{}\n{}\n{}\n{}\n{}",
             t("decompile —— 只反编译，不写其它产物", "decompile -- decompile only, writing no other artifact"),
             t(
-                "输出路由与 getclass/getmethod/getlib **同一份代码**：无 -o 或 -o - 走 stdout\n（每库一段 `// ===== name =====`）；-o FILE.dart 合并成单文件；-o DIR 写\n<DIR>/dart/<库>.dart，与全量导出同形。实测 `getlib X -o D` 与 `decompile --lib X -o D`\n产物逐字节相同。",
-                "Output routing is the **same code** as getclass/getmethod/getlib: no -o (or -o -) goes\nto stdout (one `// ===== name =====` block per library); -o FILE.dart merges into one\nfile; -o DIR writes <DIR>/dart/<lib>.dart, same shape as a full export. Verified that\n`getlib X -o D` and `decompile --lib X -o D` produce byte-identical trees.",
+                "输出路由与 getclass/getmethod/getlib 同一份代码：无 -o 或 -o - 走 stdout\n（每库一段 `// ===== name =====`）；-o FILE.dart 合并成单文件；-o DIR 写\n<DIR>/dart/<库>.dart，与全量导出同形。实测 `getlib X -o D` 与 `decompile --lib X -o D`\n产物逐字节相同。",
+                "Output routing is the same code as getclass/getmethod/getlib: no -o (or -o -) goes\nto stdout (one `// ===== name =====` block per library); -o FILE.dart merges into one\nfile; -o DIR writes <DIR>/dart/<lib>.dart, same shape as a full export. Verified that\n`getlib X -o D` and `decompile --lib X -o D` produce byte-identical trees.",
             ),
             t(
-                "与 `export --decompile` 的差别是**只出 dart/**：不写 ida_script / r2_script / asm / text。\n与 getlib 的差别是默认范围为全部。",
-                "Unlike `export --decompile` it writes **only dart/** -- no ida_script / r2_script /\nasm / text. Unlike getlib its default scope is everything.",
+                "与 `export --decompile` 的差别是只出 dart/：不写 ida_script / r2_script / asm / text。\n与 getlib 的差别是默认范围为全部。",
+                "Unlike `export --decompile` it writes only dart/ -- no ida_script / r2_script /\nasm / text. Unlike getlib, its default scope is all libraries.",
             ),
             t(
-                "范围收窄：--lib P（库名前缀=整个包）、--no-sdk（排除 URL 以 dart: 开头的库）、\n--app（再排除 package:flutter）。后两个按**库的原始 URL 前缀**判定，不是按 mangled\n名猜——library_name 把 dart:core 写成 dart_core，一个叫 dart_core_extra 的包会长得很像。\n实测 Flutter 应用：505 库/15796 函数 → --no-sdk 489/11016 → --app 56/765。",
-                "Scope: --lib P (a lib prefix = whole package), --no-sdk (drop libraries whose URL\nstarts with dart:), --app (also drop package:flutter). The last two are decided by the\nlibrary's **original URL prefix**, not by guessing from the mangled name -- library_name\nwrites dart:core as dart_core, and a package called dart_core_extra would look similar.\nMeasured on a Flutter app: 505 libs/15796 functions -> --no-sdk 489/11016 -> --app 56/765.",
+                "范围收窄：--lib P（库名前缀=整个包）、--no-sdk（排除 URL 以 dart: 开头的库）、\n--app（再排除 package:flutter）。后两个按库的原始 URL 前缀判定，不是按 mangled\n名猜——library_name 把 dart:core 写成 dart_core，一个叫 dart_core_extra 的包会长得很像。\n实测 Flutter 应用：505 库/15796 函数 → --no-sdk 489/11016 → --app 56/765。",
+                "Scope: --lib P (a lib prefix = whole package), --no-sdk (drop libraries whose URL\nstarts with dart:), --app (also drop package:flutter). The last two are decided by the\nlibrary's original URL prefix, not by guessing from the mangled name -- library_name\nwrites dart:core as dart_core, and a package called dart_core_extra would look similar.\nMeasured on a Flutter app: 505 libs/15796 functions -> --no-sdk 489/11016 -> --app 56/765.",
             ),
             t(
-                "并行与合并输出：各库并发渲染（默认 n_threads()，即核数、上限 8），\n`DAE_DEC_THREADS=N` 可覆盖——**任何设置下产物逐字节一致**，因为文件名与「每个入口地址\n归哪个库发射」都由一趟顺序预扫描先定死。合并输出（stdout 与 -o FILE.dart）只发\n**一份**前导声明：一个目标命中多个库时（混淆过的短类名很常见），逐库拼前导会让\nmem/memSet 等占位函数重复定义，产物直接过不了 dart analyze。",
-                "Parallelism and merged output: libraries are rendered concurrently (default\nn_threads(), i.e. core count capped at 8); override with `DAE_DEC_THREADS=N`. Output is\n**byte-identical at any setting**, because file names and \"which library emits each entry\npoint\" are settled by a sequential pre-pass first. Merged output (stdout and -o FILE.dart)\nemits exactly **one** preamble: when a target matches several libraries (common with short\nobfuscated class names), concatenating per-library preambles redefines the mem/memSet\nplaceholders and the result fails dart analyze.",
+                "并行与合并输出：各库并发渲染（默认 n_threads()，即核数、上限 8），\n`DAE_DEC_THREADS=N` 可覆盖——任何设置下产物逐字节一致，因为文件名与「每个入口地址\n归哪个库发射」都由一趟顺序预扫描先定死。合并输出（stdout 与 -o FILE.dart）只发\n一份前导声明：一个目标命中多个库时（混淆过的短类名很常见），逐库拼前导会让\nmem/memSet 等占位函数重复定义，产物直接过不了 dart analyze。",
+                "Parallelism and merged output: libraries are rendered concurrently (default\nn_threads(), i.e. core count capped at 8); override with `DAE_DEC_THREADS=N`. Output is\nbyte-identical at any setting, because file names and \"which library emits each entry\npoint\" are settled by a sequential pre-pass first. Merged output (stdout and -o FILE.dart)\nemits exactly one preamble: when a target matches several libraries (common with short\nobfuscated class names), concatenating per-library preambles redefines the mem/memSet\nplaceholders and the result fails dart analyze.",
             ),
             t(
                 "不做 ddc 的 `pkg --app`（从 manifest 取应用包名）：Dart 快照没有 manifest，\n猜包名就是编造。要更窄用 --lib <你的包> 或 --exclude-lib <不想要的包>。",
@@ -2177,25 +2262,25 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             "{}\n\n  dae export <binary> <out_dir> [--decompile] [--lib P] [--class P] [--func P] [--fuzzy]\n\n{}\n{}\n{}",
             t("export —— 全量（或按筛选）导出所有产物到 out_dir", "export -- write every artifact under out_dir (full or filtered)"),
             t(
-                "与快捷形 `dae <binary> <out_dir> …` **完全等价**：第一个参数不是已知子命令时，\n会自动补成 export。两种写法产出的产物树逐字节相同（有对拍验证）。",
+                "与快捷形 `dae <binary> <out_dir> …` 完全等价：第一个参数不是已知子命令时，\n会自动补成 export。两种写法产出的产物树逐字节相同（有对拍验证）。",
                 "Exactly equivalent to the shortcut `dae <binary> <out_dir> …`: when the first\nargument is not a known subcommand, `export` is prepended. Both forms produce a\nbyte-identical output tree (verified by diff).",
             ),
             t(
-                "筛选只作用于函数维度的产物（functions.txt / asm/ / dart/ / call_edges.txt /\ncallgraph.dot）；对象层 dump（pp / objs / strings / libs / classes / arrays / maps）\n始终完整——它们是「看有哪些东西」的索引，被筛掉反而没用。",
+                "筛选只作用于函数维度的产物（functions.txt / asm/ / dart/ / call_edges.txt /\ncallgraph.dot）；对象层 dump（pp / objs / strings / libs / classes / arrays / maps）\n始终完整——它们是清单类索引，筛选会使其失去意义。",
                 "Filters apply only to function-scoped artifacts (functions.txt / asm/ / dart/ /\ncall_edges.txt / callgraph.dot); the object-layer dumps (pp / objs / strings / libs /\nclasses / arrays / maps) stay complete -- they are the index you pick from.",
             ),
             t(
-                "注意：全量模式的摘要走 **stdout**（人读通道，门禁要解析它），与子命令\n「stdout 只放数据」的口径相反；告警与错误两种模式都走 stderr。",
-                "Note: in full-export mode the summary goes to **stdout** (the human channel, which\nthe gates parse) -- the opposite of subcommands, where stdout carries data only.\nWarnings and errors go to stderr in both modes.",
+                "注意：全量模式的摘要走 stdout（人读通道，门禁要解析它），与子命令\n「stdout 只放数据」的口径相反；告警与错误两种模式都走 stderr。",
+                "Note: in full-export mode the summary goes to stdout (the human channel, which\nthe gates parse) -- the opposite of subcommands, where stdout carries data only.\nWarnings and errors go to stderr in both modes.",
             )
         ),
         "pp" => format!(
             "{}\n\n  dae pp <binary> [pattern] [-n N] [-o FILE]\n\n{}\n{}\n{}",
             t("pp —— 对象池条目查询", "pp -- object pool entries"),
-            t("列：偏移 \\t 种类(obj|imm|stub) \\t 值（默认 200 行，-n 调）", "columns: offset \\t kind (obj|imm|stub) \\t value (default 200 rows)"),
+            t("列（制表符分隔）：偏移, 种类(obj|imm|stub), 值（默认 200 行，-n 调）", "tab-separated columns: offset, kind (obj|imm|stub), value (default 200 rows)"),
             t(
-                "值文本与 text/pp.txt **同一份代码**（ppobjs::pp_describe），所以两边必然一致。\n种类是槽位类型，值是能描述出的内容——`obj` 而行值是 `Stub` 表示「对象槽，但描述不出来」。",
-                "The value text comes from the **same function** as text/pp.txt (ppobjs::pp_describe),\nso the two cannot disagree. `kind` is the slot type while the value is what could be\ndescribed -- an `obj` row whose value reads `Stub` means \"object slot, not describable\".",
+                "值文本与 text/pp.txt 同一份代码（ppobjs::pp_describe），所以两边必然一致。\n种类是槽位类型，值是能描述出的内容——`obj` 而行值是 `Stub` 表示「对象槽，但描述不出来」。",
+                "The value text comes from the same function as text/pp.txt (ppobjs::pp_describe),\nso the two cannot disagree. `kind` is the slot type while the value is what could be\ndescribed -- an `obj` row whose value reads `Stub` means \"object slot, not describable\".",
             ),
             t(
                 "这些偏移就是反编译产物里 `x0 = \"Hello\" /* pp+0x17f8 */` 的落点，\n也是 `dae findrefs` 的检索面。",
@@ -2206,12 +2291,12 @@ fn help_for(cmd: &str, lang: Lang) -> String {
             "{}\n\n  dae objs <binary> [pattern] [-n N] [-o FILE]\n\n{}\n{}",
             t("objs —— 用户类实例（含字段值）", "objs -- user class instances with field values"),
             t(
-                "输出是**块**不是 TSV：与 text/objs.txt 同形（instance_block 是多行递归 dump），\n压成一行反而没法读。判据也与产物同一个：只有真解出实例块的（Obj! 开头）才算。",
-                "Output is **blocks**, not TSV: same shape as text/objs.txt (instance_block is a\nmulti-line recursive dump); squeezing it onto one line would make it unreadable.\nThe acceptance rule is the shared one too: only real instance blocks (starting\nwith `Obj!`) count.",
+                "输出是块不是 TSV：与 text/objs.txt 同形（instance_block 是多行递归 dump），\n压成一行会失去可读性。判据也与产物同一个：只有真解出实例块的（Obj! 开头）才算。",
+                "Output is blocks, not TSV: same shape as text/objs.txt (instance_block is a\nmulti-line recursive dump); squeezing it onto one line would make it unreadable.\nThe acceptance rule is the shared one too: only real instance blocks (starting\nwith `Obj!`) count.",
             ),
             t(
-                "⚠️ 块里按祖先分组的那部分**不可信**：它依赖 parent_of 的父类链，而那条链目前没有\n真值支撑（实测 App 的父类被解成 SceneBuilder 而非 StatefulWidget）。字段值本身可读，\n继承层级别当结论。详见 src/analyzer.rs 里 sid 处的注释。",
-                "⚠️ The ancestor grouping inside a block is **not trustworthy**: it relies on the\nparent_of chain, which currently has no ground-truth support (measured: App\'s super\nresolves to SceneBuilder instead of StatefulWidget). The field values themselves are\nreadable; do not treat the inheritance grouping as a conclusion. See the comment at\nthe `sid` site in src/analyzer.rs.",
+                "⚠️ 块里按祖先分组的那部分不可信：它依赖 parent_of 的父类链，而那条链目前没有\n真值支撑（实测 App 的父类被解成 SceneBuilder 而非 StatefulWidget）。字段值本身可读，\n继承层级别当结论。详见 src/analyzer.rs 里 sid 处的注释。",
+                "⚠️ The ancestor grouping inside a block is not trustworthy: it relies on the\nparent_of chain, which currently has no ground-truth support (measured: App\'s super\nresolves to SceneBuilder instead of StatefulWidget). The field values themselves are\nreadable; do not treat the inheritance grouping as a conclusion. See the comment at\nthe `sid` site in src/analyzer.rs.",
             )
         ),
         "stubs" => format!(
@@ -2220,57 +2305,85 @@ fn help_for(cmd: &str, lang: Lang) -> String {
                 "stubs —— 指令表里没有被任何 Function 引用的条目",
                 "stubs -- instruction-table entries not referenced by any Function",
             ),
-            t("列：入口 \\t 字节数 \\t 名字（解不出就留空）", "columns: entry \\t bytes \\t name (empty when unresolved)"),
+            t("列（制表符分隔）：入口, 字节数, 名字（解不出就留空）", "tab-separated columns: entry, bytes, name (empty when unresolved)"),
             t(
-                "functions.txt 只列「有 Function 对象引用」的表项，其余的在这里。\n⚠️ 它们**不全是 stub**，也不构成表的前缀：Reqable（first_entry_with_code=48455）里\n有 24932 条（53.4%、8.09 MB）以标准 Dart EnterFrame 序言开头、长度最长 27708 字节，\n是**没有名字的函数体**；同时 7798 条的下标 ≥ first_entry 而 9530 个已命名函数的下标 < 它。\nfirst_entry_with_code==0 的语料（material_3_demo/微博/ChatGLM）里这一比例只有 0.4–1.2%。",
-                "functions.txt lists only the entries a Function object references; this is the rest.\nThey are **not all stubs** and do not form a prefix of the table: on Reqable\n(first_entry_with_code=48455) 24932 of them (53.4%, 8.09 MB) start with a standard Dart\nEnterFrame prologue and run up to 27708 bytes -- they are **unnamed function bodies** --\nwhile 7798 sit at index >= first_entry and 9530 named functions sit below it. On corpora\nwith first_entry_with_code==0 (material_3_demo/Weibo/ChatGLM) that share is only 0.4-1.2%.",
+                "functions.txt 只列「有 Function 对象引用」的表项，其余的在这里。\n⚠️ 它们不全是 stub，也不构成表的前缀：Reqable（first_entry_with_code=48455）里\n有 24932 条（53.4%、8.09 MB）以标准 Dart EnterFrame 序言开头、长度最长 27708 字节，\n是没有名字的函数体；同时 7798 条的下标 ≥ first_entry 而 9530 个已命名函数的下标 < 它。\nfirst_entry_with_code==0 的语料（material_3_demo/微博/ChatGLM）里这一比例只有 0.4–1.2%。",
+                "functions.txt lists only the entries a Function object references; this is the rest.\nThey are not all stubs and do not form a prefix of the table: on Reqable\n(first_entry_with_code=48455) 24932 of them (53.4%, 8.09 MB) start with a standard Dart\nEnterFrame prologue and run up to 27708 bytes -- they are unnamed function bodies --\nwhile 7798 sit at index >= first_entry and 9530 named functions sit below it. On corpora\nwith first_entry_with_code==0 (material_3_demo/Weibo/ChatGLM) that share is only 0.4-1.2%.",
             ),
             t(
-                "名字解不出就是空——**绝不为凑覆盖率编名字**（门禁 alloc_stub_naming 盯着）。",
-                "An unresolved name stays empty -- names are **never invented** to pad coverage\n(the alloc_stub_naming gate enforces this).",
+                "名字解不出就是空——绝不为凑覆盖率编名字（门禁 alloc_stub_naming 盯着）。",
+                "An unresolved name stays empty -- names are never invented to pad coverage\n(the alloc_stub_naming gate enforces this).",
             )
         ),
         "members" => format!(
             "{}\n\n  dae members <binary> [NAME] [--class X] [--method|--field] [-n N] [-o FILE]\n\n{}\n{}\n{}",
             t("members —— 方法与字段的统一名字检索", "members -- unified method/field name search"),
             t(
-                "列：kind(method|field) \\t class \\t member \\t detail；\ndetail 对方法是入口地址，对字段是 `来源:偏移`（rec=快照里写着，accessor=访问器名推断）。",
-                "columns: kind (method|field) \\t class \\t member \\t detail; detail is the entry\naddress for a method and `source:offset` for a field (rec = written in the snapshot,\naccessor = inferred from an implicit accessor name).",
+                "列（制表符分隔）：kind(method|field), class, member, detail；\ndetail 对方法是入口地址，对字段是 `来源:偏移`（rec=快照里写着，accessor=访问器名推断）。",
+                "tab-separated columns: kind (method|field), class, member, detail; detail is the entry\naddress for a method and `source:offset` for a field (rec = written in the snapshot,\naccessor = inferred from an implicit accessor name).",
             ),
             t("NAME 是子串匹配，同时试成员名与类名；--class 按类名收窄；--method/--field 二选一。", "NAME is a substring match tried against both the member and the class name; --class narrows by class; --method/--field pick one kind."),
             t(
                 "一处有意的不对称：--lib 只作用于方法。字段行在快照里没有库归属（Field 簇给的是\n类/名/偏移），与其让 --lib 对字段静默无效，不如明说。",
-                "One deliberate asymmetry: --lib applies to methods only. Field rows carry no library\nattribution in the snapshot (the Field cluster gives class/name/offset), so rather than\nlet --lib silently do nothing for fields, it is stated here.",
+                "One deliberate asymmetry: --lib applies to methods only. Field rows carry no library\nattribution in the snapshot (the Field cluster gives class/name/offset), so instead of --lib\nsilently having no effect on fields, the restriction is documented here.",
             )
         ),
         "callees" => format!(
             "{}\n\n  dae callees <binary> <NAME|0xADDR> [--fuzzy] [-n N] [-o FILE]\n\n{}\n{}\n{}",
             t("callees —— 它调了谁（callers 的反方向）", "callees -- what it calls (the reverse of callers)"),
-            t("列与 callers **完全相同**：at \\t from_ep \\t from \\t -> \\t to_ep \\t to_name，方便两边对着看。", "Columns are **identical to callers**: at \\t from_ep \\t from \\t -> \\t to_ep \\t to_name, so the two read side by side."),
+            t("列与 callers 完全相同：at, from_ep, from, ->, to_ep, to_name，方便两边对着看。", "Columns are identical to callers: at, from_ep, from, ->, to_ep, to_name, so the two read side by side."),
             t(
-                "间接调用（blr x8 / 寄存器 call）的目标运行时才可定，**按设计不解析**、也不进表，\n只在 stderr 的计数里说明有多少个——列出来就得给个目标，而给不出真的目标。",
-                "Indirect call targets (blr x8 / register call) are only known at runtime, so they are\n**not resolved by design** and do not appear as rows; the stderr count says how many\nthere are. Listing them would require naming a target, and there is no true target to name.",
+                "间接调用（blr x8 / 寄存器 call）的目标运行时才可定，按设计不解析、也不进表，\n只在 stderr 的计数里说明有多少个——列出来就得给个目标，而给不出真的目标。",
+                "Indirect call targets (blr x8 / register call) are only known at runtime, so they are\nnot resolved by design and do not appear as rows; the stderr count says how many\nthere are. Listing them would require naming a target, and there is no true target to name.",
             ),
             t(
-                "与 callers 一样扫整个程序，所以 --lib/--class/--func 在这里**明确报错**而不是被\n静默忽略（否则「它调谁」是不完整的答案，而你看不出来）。",
-                "Like callers it scans the whole program, so --lib/--class/--func are **rejected\nexplicitly** rather than silently ignored (otherwise \"what it calls\" would be an\nincomplete answer with no way to tell).",
+                "与 callers 一样扫整个程序，所以 --lib/--class/--func 在这里明确报错而不是被\n静默忽略（否则「它调谁」是不完整的答案，而你看不出来）。",
+                "Like callers it scans the whole program, so --lib/--class/--func are rejected\nexplicitly rather than silently ignored (otherwise \"what it calls\" would be an\nincomplete answer with no way to tell).",
             )
         ),
         "findrefs" => format!(
             "{}\n\n  dae findrefs <binary> string TEXT\n  dae findrefs <binary> kind NAME\n\n{}\n{}\n{}\n{}",
             t("findrefs —— 哪些代码位置从对象池里加载了它", "findrefs -- which code sites load it from the object pool"),
-            t("列：at \\t from_ep \\t from \\t pp_offset \\t value（按地址排序去重）", "columns: at \\t from_ep \\t from \\t pp_offset \\t value (address-sorted, deduped)"),
+            t("列（制表符分隔）：at, from_ep, from, pp_offset, value（按地址排序去重）", "tab-separated columns: at, from_ep, from, pp_offset, value (address-sorted, deduped)"),
             t(
-                "零编造判据：偏移解析走 decompiler::PoolRefs，与产物里 `/* pp+0x… */` 注释**同一份\n代码**；门禁 tests/cli_query.rs 另外用两条独立路径复核每个命中——值列与 text/pp.txt\n逐字相同，且 at+偏移能在 `dae disasm` 的原始行里字面看到（实测 679/679）。",
-                "Zero-fabrication criterion: offsets resolve through decompiler::PoolRefs, the **same\ncode** that emits the `/* pp+0x… */` annotations; the tests/cli_query.rs gate\ncross-checks every hit two independent ways -- the value column matches text/pp.txt\nverbatim, and at+offset is literally visible in `dae disasm` output (measured 679/679).",
+                "零编造判据：偏移解析走 decompiler::PoolRefs，与产物里 `/* pp+0x… */` 注释同一份\n代码；门禁 tests/cli_query.rs 另外用两条独立路径复核每个命中——值列与 text/pp.txt\n逐字相同，且 at+偏移能在 `dae disasm` 的原始行里字面看到（实测 679/679）。",
+                "Zero-fabrication criterion: offsets resolve through decompiler::PoolRefs, the same\ncode that emits the `/* pp+0x… */` annotations; the tests/cli_query.rs gate\ncross-checks every hit two independent ways -- the value column matches text/pp.txt\nverbatim, and at+offset is literally visible in `dae disasm` output (measured 679/679).",
             ),
             t(
                 "只有 `string TEXT`（池里的字符串字面量，子串、大小写不敏感）与 `kind NAME`\n（对象种类整名，即 dart/ 里 /* TypeArguments */ 那个词）两种。",
                 "Only `string TEXT` (pool string literals; substring, case-insensitive) and\n`kind NAME` (exact object kind -- the /* TypeArguments */ word in dart/).",
             ),
             t(
-                "不提供 field：编译后的机器码里没有符号化的字段引用，只剩裸位移，按位移匹配会把\n大量无关的 [x, #0x18] 报成命中——那是猜不是查。也不叫 type：池条目描述形是\n`Kind: 内容`，那个前缀是对象类别而非类型名，当类型名搜会既漏又误。",
-                "No `field`: compiled code carries no symbolic field reference, only a bare\ndisplacement, so matching on displacement would report unrelated [x, #0x18] as hits --\nguessing, not querying. Not called `type` either: a pool entry\'s description is\n`Kind: content`, and that prefix is the object category, not a type name.",
+                "不提供 field：编译后的机器码里没有符号化的字段引用，只剩裸位移，按位移匹配会把\n大量无关的 [x, #0x18] 报成命中——那是推测而非检索。也不叫 type：池条目描述形是\n`Kind: 内容`，那个前缀是对象类别而非类型名，当类型名搜会既漏又误。",
+                "No `field`: compiled code carries no symbolic field reference, only a bare\ndisplacement, so matching on displacement would report unrelated [x, #0x18] as hits --\nthat would be inference rather than lookup. Not called `type` either: a pool entry\'s description is\n`Kind: content`, and that prefix is the object category, not a type name.",
+            )
+        ),
+        "version" => format!(
+            "{}\n\n  dae version\n\n{}\n{}",
+            t("version —— 打印名字与版本", "version -- print the name and version"),
+            t(
+                "输出一行 `dae <版本>`。版本取自构建时确定的 GIT_VERSION：CI 发版用 tag，\n本地构建用 `git describe --tags --exact-match`，都不适用时回落到 Cargo.toml 的版本号。",
+                "Prints one line, `dae <version>`. The version comes from GIT_VERSION, resolved at\nbuild time: the tag in CI releases, `git describe --tags --exact-match` locally, and\nthe Cargo.toml version when neither applies."
+            ),
+            t(
+                "顶层的 -V 与 --version 等价于本命令。本命令不接受其它参数。",
+                "The top-level -V and --version are equivalent to this command. It takes no other argument."
+            )
+        ),
+        "help" => format!(
+            "{}\n\n  dae help\n  dae help <command>\n\n{}\n{}\n{}",
+            t("help —— 打印使用说明", "help -- print the usage guide"),
+            t(
+                "不带参数时打印完整指南：用法、参数、全部子命令（按用途分组）、选项、输出、\n命名口径、退出码与示例。带命令名时只打印那一条命令的说明。",
+                "Without an argument, prints the full guide: usage, arguments, every command grouped by\npurpose, options, output, naming rules, exit status and examples. With a command name,\nprints only that command's help."
+            ),
+            t(
+                "以下四种形态输出完全相同：dae、dae -h、dae --help、dae help。\n每条命令也都接受 -h 与 --help，且与 `dae help <命令>` 输出相同。",
+                "These four invocations produce identical output: dae, dae -h, dae --help, dae help.\nEvery command also accepts -h and --help, with the same output as `dae help <command>`."
+            ),
+            t(
+                "命令名不存在时按用法错误处理（退出码 2）并列出有效命令名，\n而不是退回打印整份指南——那会把拼写错误藏起来。",
+                "An unknown command name is a usage error (exit status 2) and lists the valid names,\nrather than falling back to the whole guide, which would hide a typo."
             )
         ),
         _ => help(lang),
@@ -2281,100 +2394,315 @@ pub fn help(lang: Lang) -> String {
     let zh = matches!(lang, Lang::Zh);
     let t = |z: &str, e: &str| if zh { z.to_string() } else { e.to_string() };
     let mut h = String::new();
-    // 每条命令一行：`dae <cmd> <args>` 左对齐到 44 列，后面跟一句双语说明。
+
+    // 每条命令一行：`dae <cmd> <args>` 左对齐到 40 列，后接一句说明。
     // 用一个闭包而不是 30 段 writeln!，是为了让「对齐宽度」只有一处——手写 30 遍必然对不齐。
     let row = |h: &mut String, cmd: &str, desc: String| {
-        // 44 列是按最长的一条（`export    <binary> <out_dir> [--decompile]`，42 字符）定的；
-        // 窄了会让说明紧贴参数、读起来像粘在一起。
-        let _ = writeln!(h, "  dae {cmd:<44}{}", desc);
+        // 40 列按最长的一条定（`decompile <binary> [-o DIR|FILE.dart|-]`，39 字符）。
+        let _ = writeln!(h, "    dae {cmd:<40}{}", desc);
     };
+    let group = |h: &mut String, name: String| {
+        let _ = writeln!(h, "  {name}");
+    };
+
+    // ---- 头部 ----
+    // 两行而不是一行：合成一行时英文有 117 列，超过终端宽度就会被折行、把对齐全毁掉。
     let _ = writeln!(
         h,
         "{}",
         t(
-            "渐进式用法：先查清单，再定点反编译某个类或库（不做全量导出）。",
-            "Progressive usage: list first, then decompile one class or library (no full export)."
+            &format!("dae {} — Dart AOT 快照调试信息静态导出工具", env!("GIT_VERSION")),
+            &format!("dae {} -- static exporter of Dart AOT snapshot debug information", env!("GIT_VERSION"))
+        )
+    );
+    let _ = writeln!(
+        h,
+        "{}",
+        t(
+            "支持 Dart 2.7–3.14β；容器 Mach-O / ELF / PE；架构 x64 / arm64。",
+            "Supports Dart 2.7-3.14b; containers Mach-O, ELF and PE; architectures x64 and arm64."
+        )
+    );
+    let _ = writeln!(h, "https://github.com/ejfkdev/dae");
+    let _ = writeln!(h);
+
+    // 用法行两种语言都用 ASCII：SYNOPSIS 按 man-page 惯例不翻译，只翻译行尾说明。
+    // 否则 `[选项]` 这类全角字符会让 `{:<N}` 的按字符补宽在终端里对不齐（CJK 是双宽）。
+    let usage = |h: &mut String, form: &str, zh_desc: &str, en_desc: &str| {
+        let _ = writeln!(h, "  {form:<40}{}", t(zh_desc, en_desc));
+    };
+
+    // ---- 用法 ----
+    let _ = writeln!(h, "{}", t("用法", "USAGE"));
+    usage(&mut h, "dae <binary> <out_dir> [options]",
+        "导出全部产物（快捷形）", "export all artifacts (shortcut form)");
+    usage(&mut h, "dae export <binary> <out_dir> [options]",
+        "导出全部产物（显式形，与上等价）", "export all artifacts (explicit form; equivalent)");
+    usage(&mut h, "dae <command> <binary> [arguments]",
+        "执行单条查询或反编译命令", "run one query or decompilation command");
+    usage(&mut h, "dae help [command]",
+        "打印本说明，或某一条命令的说明", "print this text, or the help of one command");
+    usage(&mut h, "dae version", "打印版本", "print the version");
+    let _ = writeln!(h);
+    let _ = writeln!(
+        h,
+        "  {}",
+        t(
+            "不带参数运行 dae 时打印本说明。每条命令都接受 -h 与 --help。",
+            "Running dae with no argument prints this text. Every command accepts -h and --help."
         )
     );
     let _ = writeln!(h);
 
-    let _ = writeln!(h, "{}", t("先摸清全貌：", "Get oriented:"));
-    row(&mut h, "info      <binary>", t("快照 / SDK / 规模概况", "snapshot / SDK / size overview"));
-    row(&mut h, "libs      <binary> [pattern]", t("库（包）清单 + 类数/函数数", "library (package) listing with counts"));
-    row(&mut h, "classes   <binary> [pattern] [--lib P]", t("类清单", "class listing"));
-    row(&mut h, "functions <binary> [pattern] [--lib P]", t("函数清单（入口 / 字节数 / 归属）", "function listing (entry / size / owner)"));
-    row(&mut h, "largest   <binary> [-n N]", t("最大的 N 个函数", "top-N functions by size"));
+    // ---- 参数 ----
+    // 续行缩进 13 列：2 列前导 + `<binary>` 8 字符 + 3 列间隔，与上一行的说明起点对齐。
+    let _ = writeln!(h, "{}", t("参数", "ARGUMENTS"));
+    let _ = writeln!(
+        h,
+        "  <binary>   {}",
+        t(
+            "目标文件：含 Dart AOT 快照的 Mach-O、ELF 或 PE。",
+            "Target file: Mach-O, ELF or PE containing a Dart AOT snapshot."
+        )
+    );
+    let _ = writeln!(
+        h,
+        "             {}",
+        t(
+            "也接受 .app 与 .framework 目录，会自动定位其中的二进制。",
+            "A .app or .framework directory is accepted; the binary inside it is located."
+        )
+    );
+    let _ = writeln!(
+        h,
+        "  <out_dir>  {}",
+        t("输出目录；不存在则创建。", "Output directory. Created if absent.")
+    );
     let _ = writeln!(h);
 
-    let _ = writeln!(h, "{}", t("找东西：", "Find things:"));
-    row(&mut h, "strings   <binary> [-f TEXT]", t("字符串表检索", "string table search"));
-    row(&mut h, "fields    <binary> [pattern]", t("具名字段（来源 + 字节偏移）", "named fields (source + byte offset)"));
-    row(&mut h, "members   <binary> [NAME] [--class X]", t("方法与字段的统一名字检索", "unified method/field name search"));
-    row(&mut h, "findrefs  <binary> string TEXT", t("哪些代码位置从池里加载了这个字面量", "which code sites load this literal from the pool"));
-    row(&mut h, "findrefs  <binary> kind NAME", t("…或加载了这个种类的对象", "...or an object of this kind"));
-    row(&mut h, "callers   <binary> <NAME|0xADDR>", t("谁调用了它", "who calls it"));
-    row(&mut h, "callees   <binary> <NAME|0xADDR>", t("它调用了谁（列与 callers 相同）", "what it calls (same columns as callers)"));
+ 
+
+    // ---- 命令 ----
+    let _ = writeln!(h, "{}", t("命令", "COMMANDS"));
+    group(&mut h, t("概览", "Overview"));
+    row(&mut h, "info      <binary>", t("快照、SDK 与规模概况", "snapshot, SDK and size summary"));
+    row(&mut h, "libs      <binary> [pattern]", t("库（包）清单，含类数与函数数", "libraries with class and function counts"));
+    row(&mut h, "classes   <binary> [pattern] [--lib P]", t("类清单（只列至少拥有一个函数的类）", "classes that own at least one function"));
+    row(&mut h, "functions <binary> [pattern] [--lib P]", t("函数清单：入口地址、字节数、归属", "functions: entry address, size, owner"));
+    row(&mut h, "largest   <binary> [-n N]", t("按字节数排序的前 N 个函数", "the N largest functions by size"));
     let _ = writeln!(h);
 
-    let _ = writeln!(h, "{}", t("对象层（与 text/ 里的同名产物同源）：", "Object layer (same source as the text/ artifacts):"));
+    group(&mut h, t("检索", "Search"));
+    row(&mut h, "strings   <binary> [-f TEXT]", t("字符串表检索", "search the string table"));
+    row(&mut h, "fields    <binary> [pattern]", t("恢复出的字段名，含来源与字节偏移", "recovered field names with source and byte offset"));
+    row(&mut h, "members   <binary> [NAME] [--class X]", t("方法与字段的名字检索", "method and field name search"));
+    row(&mut h, "findrefs  <binary> string TEXT", t("从对象池加载该字面量的代码位置", "code sites loading this literal from the object pool"));
+    row(&mut h, "findrefs  <binary> kind NAME", t("从对象池加载该种类对象的代码位置", "code sites that load an object of this kind"));
+    row(&mut h, "callers   <binary> <NAME|0xADDR>", t("调用给定函数的位置", "callers of a function"));
+    row(&mut h, "callees   <binary> <NAME|0xADDR>", t("给定函数调用的目标（列同 callers）", "callees of a function; same columns as callers"));
+    let _ = writeln!(h);
+
+    group(&mut h, t("对象层（text/ 产物的查询入口，数据同源）", "Object layer (query interface to the text/ artifacts; same data)"));
     row(&mut h, "pp        <binary> [pattern]", t("对象池条目", "object pool entries"));
-    row(&mut h, "objs      <binary> [pattern]", t("用户类实例（含字段值）", "user class instances with field values"));
-    row(&mut h, "stubs     <binary> [pattern]", t("指令表里没有被任何 Function 引用的条目（不全是 stub，见 dae help stubs）", "instruction-table entries no Function references (not all stubs -- see dae help stubs)"));
+    row(&mut h, "objs      <binary> [pattern]", t("用户类实例，含字段值", "instances of user classes, with field values"));
+    row(&mut h, "stubs     <binary> [pattern]", t("没有被任何 Function 引用的指令表条目", "table entries no Function object references"));
     let _ = writeln!(h);
 
-    let _ = writeln!(h, "{}", t("定点反编译：", "Decompile surgically:"));
-    row(&mut h, "getclass  <binary> <CLASS>", t("单类", "one class"));
-    row(&mut h, "getmethod <binary> <CLASS.method>", t("单方法", "one method"));
-    row(&mut h, "getlib    <binary> <LIB>", t("单库（包）；库名前缀即整个包", "one library (package); a prefix = whole package"));
-    row(&mut h, "decompile <binary> [-o DIR|FILE.dart|-]", t("只反编译（默认全部；无 -o 走 stdout）", "decompile only (everything by default; stdout without -o)"));
+    group(&mut h, t("反编译", "Decompilation"));
+    row(&mut h, "getclass  <binary> <CLASS>", t("反编译单个类", "decompile a single class"));
+    row(&mut h, "getmethod <binary> <CLASS.method>", t("反编译单个方法", "decompile a single method"));
+    row(&mut h, "getlib    <binary> <LIB>", t("反编译单个库；前缀选中整个包", "decompile one library; a prefix selects the package"));
+    row(&mut h, "decompile <binary> [-o DIR|FILE.dart|-]", t("只反编译，不写其它产物；默认全部库", "decompile only; no other artifacts; all libraries"));
     let _ = writeln!(h);
 
-    let _ = writeln!(h, "{}", t("低层：", "Low-level:"));
-    row(&mut h, "disasm    <binary> <CLASS[.method]>", t("原始反汇编（arm64 带 IL 注释）", "raw disassembly (arm64 with IL comments)"));
+    group(&mut h, t("底层", "Low-level"));
+    row(&mut h, "disasm    <binary> <NAME|0xADDR>", t("单个函数或表项的反汇编（arm64）", "disassembly of a function or table entry (arm64)"));
     let _ = writeln!(h);
 
-    let _ = writeln!(h, "{}", t("全量导出：", "Full export:"));
-    row(&mut h, "export    <binary> <out_dir> [--decompile]", t("所有产物写进 out_dir", "every artifact under out_dir"));
+    group(&mut h, t("导出", "Export"));
+    row(&mut h, "export    <binary> <out_dir> [options]", t("把全部产物写进 out_dir", "write every artifact under out_dir"));
     let _ = writeln!(
         h,
-        "{}",
+        "    {}",
         t(
-            "          快捷形 dae <binary> <out_dir> 与它完全等价（第一个参数不是子命令时自动补 export）。",
-            "          The shortcut dae <binary> <out_dir> is exactly equivalent (export is prepended when the first argument is not a subcommand)."
+            "第一个参数不是子命令时自动补 export，故快捷形与显式形完全等价。",
+            "export is prepended when the first argument is not a command, so the two forms are equivalent."
         )
     );
     let _ = writeln!(h);
-    let _ = writeln!(h, "{}", t("其它：", "Meta:"));
-    row(&mut h, "help      [cmd]", t("本指南；带 cmd 看单条命令", "this guide; with cmd, one command's help"));
-    row(&mut h, "version", t("打印名字与版本", "print name and version"));
+
+    group(&mut h, t("其它", "Meta"));
+    row(&mut h, "help      [command]", t("本说明；带命令名时给该命令的说明", "this text; with a command name, that command's help"));
+    row(&mut h, "version", t("打印名字与版本", "print the name and version"));
     let _ = writeln!(h);
 
+    // ---- 选项 ----
+    let _ = writeln!(h, "{}", t("选项", "OPTIONS"));
     let _ = writeln!(
         h,
-        "{}",
+        "  {}",
         t(
-            "通用选项：-o FILE 落盘（默认 stdout，-o - 也是），\n          -n N 限制条数，--lib/--class/--func 过滤（可重复），--fuzzy 放宽为子串，\n          --exclude-lib P 排除库（可重复），--no-sdk 排除 dart: 库，--app 再排除 package:flutter，\n          --sdk-profile P / --platform-profile P 覆盖自动识别，-h 看子命令帮助。",
-            "Common options: -o FILE to write (stdout by default; -o - is the same),\n          -n N to limit rows, --lib/--class/--func filters (repeatable), --fuzzy for substring\n          matching, --exclude-lib P to drop libraries (repeatable), --no-sdk to drop dart: libraries,\n          --app to also drop package:flutter, --sdk-profile P / --platform-profile P to override\n          detection, -h for per-command help."
+            "除 --decompile 只对导出命令有效外，下列选项对所有命令有效。",
+            "All options apply to every command except --decompile, which is export-only."
         )
     );
+    let opt = |h: &mut String, flag: &str, zh_desc: &str, en_desc: &str| {
+        let _ = writeln!(h, "  {flag:<26}{}", t(zh_desc, en_desc));
+    };
+    opt(&mut h, "--sdk-profile PATH",
+        "指定 SDK Profile（默认：内嵌 26 版，按快照版本指纹识别）",
+        "SDK profile to use (default: 26 embedded, detected by fingerprint)");
+    opt(&mut h, "--platform-profile PATH",
+        "指定平台 Profile（默认：按容器与架构选择）",
+        "platform profile to use (default: by container and architecture)");
+    opt(&mut h, "--decompile",
+        "额外产出 dart/ 伪 Dart（实验性；已结构化 if/else 与循环）",
+        "also emit dart/ pseudocode (experimental; structured if/else and loops)");
+    opt(&mut h, "--lib PATTERN",
+        "只保留这些库（可重复；库名前缀即整个包）",
+        "restrict to these libraries (repeatable; prefix = whole package)");
+    opt(&mut h, "--class PATTERN",
+        "只保留这些类（可重复）",
+        "restrict to these classes (repeatable)");
+    opt(&mut h, "--func PATTERN",
+        "只保留这些函数（可重复；接受 Class.method）",
+        "restrict to these functions (repeatable; Class.method is accepted)");
+    opt(&mut h, "--fuzzy",
+        "上面三个模式串按子串匹配（默认精确）",
+        "treat the three patterns above as substrings (default: exact)");
+    opt(&mut h, "--exclude-lib PATTERN",
+        "排除这些库（可重复；前缀规则与 --lib 相同）",
+        "exclude these libraries (repeatable; same prefix rule as --lib)");
+    opt(&mut h, "--no-sdk",
+        "排除 SDK 库（URL 以 dart: 开头者）",
+        "exclude SDK libraries (those whose URL begins with dart:)");
+    opt(&mut h, "--app",
+        "只保留应用侧代码（再排除 package:flutter）；与 --no-sdk 互斥",
+        "keep app-side code only (excludes package:flutter; not with --no-sdk)");
+    opt(&mut h, "-o, --output PATH",
+        "写入 PATH 而非 stdout；-o - 等价于 stdout",
+        "write to PATH instead of stdout; -o - is equivalent to stdout");
+    opt(&mut h, "-n, --limit N", "最多打印 N 行", "print at most N rows");
+    opt(&mut h, "-f, --find TEXT", "检索文本（strings 使用）", "filter text (used by strings)");
+    opt(&mut h, "-h, --help", "打印该命令的说明", "print the help of this command");
+    opt(&mut h, "-V, --version",
+        "打印版本（仅顶层；另见 dae version）",
+        "print the version (top level only; see also dae version)");
     let _ = writeln!(h);
+
+    // ---- 输出 ----
+    let _ = writeln!(h, "{}", t("输出", "OUTPUT"));
     let _ = writeln!(
         h,
-        "{}",
-        t(
-            "命名口径（要能猜中，也要能把上一条命令的输出抄回来）：\n             - 库名三种写法等价——functions.txt 的 lib 列（testing_app$screens$home）、libs.txt 的 URL\n             -   （package:testing_app/screens/home.dart）、产物文件名（testing_app_screens_home）；\n             -   库名支持前缀，所以 --lib testing_app = 整个包，getlib testing_app 也是。\n             - 类名默认精确（大小写不敏感兜底），加 --fuzzy 才是子串。\n             - 函数名四种写法都认：Class.method、lib/Class.method、产物里的下划线形式 Class_method，\n             -   以及 callers/callees/findrefs/text/call_edges.txt 输出里的全点号形式 lib.Class.method\n             -   ——最后这种是为了让「上一条命令的输出直接抄进下一条」不断链。",
-            "Naming (guessable, and pasteable from the previous command's output):\n             - A library can be written three ways -- the lib column of functions.txt\n             -   (testing_app$screens$home), the URL from libs.txt\n             -   (package:testing_app/screens/home.dart), or the artifact file name\n             -   (testing_app_screens_home). Library names match by prefix, so --lib testing_app\n             -   and getlib testing_app both mean the whole package.\n             - Class names are exact by default (case-insensitive fallback); --fuzzy makes them substrings.\n             - Function names accept four forms: Class.method, lib/Class.method, the artifact underscore\n             -   form Class_method, and the all-dots form lib.Class.method used by callers/callees/\n             -   findrefs/text/call_edges.txt -- the last one exists so output can be fed straight back in."
-        )
+        "  {}",
+        t("导出命令写入 <out_dir> 的内容：", "Written under <out_dir> by the export commands:")
     );
+    let out_row = |h: &mut String, name: &str, desc: String| {
+        let _ = writeln!(h, "    {name:<15}{desc}");
+    };
+    out_row(&mut h, "ida_script/", t(
+        "IDA 命名脚本与结构头（addNames.py、ida_dart_struct.h）",
+        "IDA naming script and struct header (addNames.py, ida_dart_struct.h)"));
+    out_row(&mut h, "r2_script/", t(
+        "radare2 命名脚本与结构头（addNames.r2、r2_dart_struct.h）",
+        "radare2 naming script and struct header (addNames.r2, r2_dart_struct.h)"));
+    out_row(&mut h, "frida.js", t(
+        "Frida 运行时模板，含 Classes 数组",
+        "Frida runtime template with the Classes array"));
+    out_row(&mut h, "asm/", t(
+        "capstone 反汇编与 IL 注释（仅 arm64）",
+        "capstone disassembly with IL comments (arm64 only)"));
+    out_row(&mut h, "text/", t(
+        "制表符分隔的各类清单：pp、objs、strings、libs、classes、functions、",
+        "tab-separated dumps: pp, objs, strings, libs, classes, functions,"));
+    let _ = writeln!(h, "    {:<15}{}", "", t(
+        "arrays、maps、fields、stubs、call_edges",
+        "arrays, maps, fields, stubs, call_edges"));
+    out_row(&mut h, "callgraph.dot", t(
+        "已命名函数之间的直接调用图（Graphviz）",
+        "direct call graph between named functions (Graphviz)"));
+    out_row(&mut h, "dart/", t(
+        "逐函数伪 Dart；需要 --decompile",
+        "per-function pseudocode; requires --decompile"));
     let _ = writeln!(h);
-    let _ = writeln!(
-        h,
-        "{}",
-        t(
-            "退出码：0 成功；1 运行期错误（含没命中、解析漂移）；2 用法错误。\n             stdout/stderr：子命令 stdout 只放数据、诊断一律走 stderr（可直接管道）；\n             全量导出相反，摘要走 stdout（人读通道，门禁要解析它），告警仍走 stderr。\n             每条子命令都会重新解析一次快照（几十毫秒）——省下的是「不写全量产物」。",
-            "Exit codes: 0 ok; 1 runtime error (including a miss and parse drift); 2 usage error.\n             stdout/stderr: for subcommands stdout carries data only and every diagnostic goes to\n             stderr (so pipes work); full export is the opposite -- its summary goes to stdout (the\n             human channel, which the gates parse) while warnings still go to stderr.\n             Every subcommand re-parses the snapshot (tens of milliseconds) -- what you save is not\n             writing the full export."
-        )
-    );
+
+    // ---- 命名口径 ----
+    // 逐行 writeln! 而不是一个多行字符串：Rust 的 `\` 续行会吃掉下一行的前导空格，
+    // 于是要靠占位符再 replace 回来——那正是容易写错的地方（本版曾因此截断过文件）。
+    let _ = writeln!(h, "{}", t("命名口径", "NAMING"));
+    let _ = writeln!(h, "  {}", t(
+        "名字既接受手写形式，也接受上一条命令输出里的原样形式：",
+        "Names are accepted both as written by hand and as printed by the previous command:"));
+    for line in [
+        t("库名有三种等价写法——functions.txt 的 lib 列（testing_app$screens$home）、",
+          "A library has three equivalent forms: the lib column of functions.txt"),
+        t("libs.txt 的 URL（package:testing_app/screens/home.dart）、产物文件名",
+          "(testing_app$screens$home), the URL from libs.txt"),
+        t("（testing_app_screens_home）。库名按前缀匹配，故 --lib testing_app 与",
+          "(package:testing_app/screens/home.dart), and the artifact file name"),
+        t("getlib testing_app 都指整个包。",
+          "(testing_app_screens_home). Library names match by prefix, so --lib testing_app"),
+        t("类名默认精确匹配（大小写不敏感兜底）；加 --fuzzy 才按子串。",
+          "and getlib testing_app both denote the whole package."),
+        t("函数名接受四种写法：Class.method、lib/Class.method、产物中的下划线形式",
+          "Class names match exactly by default, with a case-insensitive fallback;"),
+        t("Class_method，以及 callers/callees/findrefs/text/call_edges.txt 输出中的",
+          "--fuzzy makes them substrings."),
+        t("全点号形式 lib.Class.method。最后一种的存在是为了让上一条命令的输出",
+          "Function names accept four forms: Class.method, lib/Class.method, the artifact"),
+        t("可以直接作为下一条命令的输入。",
+          "underscore form Class_method, and the all-dots form lib.Class.method used by"),
+    ] {
+        let _ = writeln!(h, "    {line}");
+    }
+    for line in [
+        t("", "callers, callees, findrefs and text/call_edges.txt. The last exists so that the"),
+        t("", "output of one command can be fed directly into the next."),
+    ] {
+        if !line.is_empty() {
+            let _ = writeln!(h, "    {line}");
+        }
+    }
+    let _ = writeln!(h);
+
+    // ---- 退出码 ----
+    let _ = writeln!(h, "{}", t("退出码", "EXIT STATUS"));
+    let _ = writeln!(h, "  {}", t("0  成功。", "0   Success."));
+    let _ = writeln!(h, "  {}", t(
+        "1  运行期错误，含没有命中与解析漂移。",
+        "1   Runtime error, including no match and parse drift."));
+    let _ = writeln!(h, "  {}", t("2  用法错误。", "2   Usage error."));
+    let _ = writeln!(h);
+    let _ = writeln!(h, "  {}", t(
+        "查询类命令的 stdout 只承载数据，诊断一律走 stderr，因此可直接接入管道。",
+        "For query commands stdout carries data only and every diagnostic goes to stderr, so"));
+    let _ = writeln!(h, "  {}", t(
+        "导出命令相反：摘要走 stdout，告警走 stderr。",
+        "output can be piped directly. The export commands are the opposite: their summary"));
+    let _ = writeln!(h, "  {}", t(
+        "每条查询命令都会重新解析一次快照（数十毫秒），它省去的是写全量产物。",
+        "goes to stdout and warnings to stderr. Each query command re-parses the snapshot"));
+    // 这一行只有英文有（中文三行就说完了）；空串时必须整行不写，否则会留下一行
+    // 只有两个空格的空白行——终端里看不出来，但 wc -l 与门禁的行数断言都会数到它。
+    let tail = t("", "(tens of milliseconds); what it avoids is writing the full export.");
+    if !tail.is_empty() {
+        let _ = writeln!(h, "  {tail}");
+    }
+    let _ = writeln!(h);
+
+    // ---- 示例 ----
+    let _ = writeln!(h, "{}", t("示例", "EXAMPLES"));
+    for ex in [
+        "dae App.app out/",
+        "dae App.app out/ --decompile --app",
+        "dae libs app.so | head",
+        "dae getmethod app.so HomePage._increment",
+        "dae callers app.so 0x48098c",
+        "dae app.so out/ --sdk-profile profiles/sdk/dart-3.3.4-w64-no-compressed.json",
+    ] {
+        let _ = writeln!(h, "  {ex}");
+    }
+
     h
 }
 
@@ -2404,9 +2732,9 @@ mod tests {
         ])
         .unwrap();
         let Cmd::Classes(q) = cli.cmd else { panic!("expected classes") };
-        assert_eq!(q.binary, "bin.so");
+        assert_eq!(q.binary.as_deref(), Some("bin.so"));
         assert_eq!(q.pattern.as_deref(), Some("HomePage"));
-        let o = opts_of(&q.common, q.binary, q.pattern.into_iter().collect());
+        let o = opts_of(&q.common, q.binary.unwrap(), q.pattern.into_iter().collect());
         assert_eq!(o.bin.as_deref(), Some("bin.so"));
         assert_eq!(o.rest, vec!["HomePage".to_string()]);
         assert_eq!(o.n, Some(5));
@@ -2424,9 +2752,82 @@ mod tests {
         ])
         .unwrap();
         let Cmd::Info(q) = cli.cmd else { panic!("expected info") };
-        assert_eq!(q.binary, "bin.so");
+        assert_eq!(q.binary.as_deref(), Some("bin.so"));
         assert_eq!(q.common.limit, Some(3));
         assert_eq!(q.common.lib, vec!["app".to_string()]);
+    }
+
+    /// 取出任意子命令的 help 标记。
+    ///
+    /// 故意**不用 `_ =>` 兜底**：新增一条命令而忘了给它 help 标记时，这里会编译不过，
+    /// 而不是让下面那条测试静默放过它。
+    fn help_flag(c: &Cmd) -> bool {
+        match c {
+            Cmd::Export(a) => a.common.help,
+            Cmd::Members(a) => a.common.help,
+            Cmd::Findrefs(a) => a.common.help,
+            Cmd::Decompile(a) => a.common.help,
+            Cmd::Info(a)
+            | Cmd::Libs(a)
+            | Cmd::Classes(a)
+            | Cmd::Functions(a)
+            | Cmd::Largest(a)
+            | Cmd::Strings(a)
+            | Cmd::Fields(a)
+            | Cmd::Pp(a)
+            | Cmd::Objs(a)
+            | Cmd::Stubs(a) => a.common.help,
+            Cmd::Callers(a)
+            | Cmd::Callees(a)
+            | Cmd::Disasm(a)
+            | Cmd::Getclass(a)
+            | Cmd::Getmethod(a)
+            | Cmd::Getlib(a) => a.common.help,
+            Cmd::Help(a) => a.help,
+            Cmd::Version(a) => a.help,
+        }
+    }
+
+    /// `-h/--help` 必须在**缺少位置参数**时也能解析成功。
+    ///
+    /// 这条盯的是一个曾经对**全部 22 条命令**生效的缺陷：clap 的必填位置参数校验发生在
+    /// 解析阶段、早于 handler，于是 `dae libs -h` 先撞上「required arguments were not
+    /// provided: <BINARY>」而以 2 退出，`-h` 永远没机会执行。而 `dae help libs` 是好的
+    /// （它没有必填位置参数），所以只测后者的门禁整整一个版本没发现前者全坏。
+    ///
+    /// 修法是把位置参数声明成 `Option<String>`、由 handler 校验（见 `src/args.rs` 顶部），
+    /// 这条测试就是那个约定的看守：任何一条命令退回必填位置参数、或新增命令时忘了
+    /// help 标记，都会在这里失败。
+    #[test]
+    fn help_flag_parses_without_positionals() {
+        use clap::Parser;
+        for cmd in SUBCOMMANDS {
+            for flag in ["-h", "--help"] {
+                let argv = ["dae", cmd, flag];
+                let cli = crate::args::Cli::try_parse_from(argv).unwrap_or_else(|e| {
+                    panic!("`dae {cmd} {flag}` 解析失败（位置参数又变必填了？）: {e}")
+                });
+                assert!(
+                    help_flag(&cli.cmd),
+                    "`dae {cmd} {flag}` 没有把 help 标记解析出来"
+                );
+            }
+        }
+        // help 自己也要能吃 -h（它的结构体没有共享选项组，容易漏）
+        for argv in [["dae", "help", "-h"], ["dae", "help", "--help"]] {
+            let cli = crate::args::Cli::try_parse_from(argv).unwrap();
+            assert!(help_flag(&cli.cmd), "{argv:?} 没有把 help 标记解析出来");
+        }
+    }
+
+    /// 缺少位置参数时必须是**用法错误**：`Opts` 拿不到 binary，handler 无从运行。
+    /// 这条钉住「位置参数改成 Option 之后仍然会报错」，否则漏参数会静默变成空结果。
+    #[test]
+    fn missing_positional_still_parses_but_is_incomplete() {
+        use clap::Parser;
+        let cli = crate::args::Cli::try_parse_from(["dae", "libs"]).unwrap();
+        let Cmd::Libs(q) = cli.cmd else { panic!("expected libs") };
+        assert!(q.binary.is_none(), "缺 binary 时应当是 None，由 handler 报用法错误");
     }
 
     #[test]

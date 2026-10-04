@@ -13,6 +13,15 @@
 //! 函数名的下划线形式），比 clap 的通用 flag 列表有用得多，而且是双语的。所以这里
 //! `disable_help_flag`，把 `-h/--help` 声明成普通 bool 交给 handler。
 //!
+//! ⚠️ **代价：位置参数必须声明成 `Option<String>`，由 handler 自己校验。** 因为 clap 的
+//! 必填位置参数校验发生在解析阶段、**早于** handler，于是 `dae libs -h` 会先撞上
+//! 「required arguments were not provided: <BINARY>」而以 2 退出，`-h` 永远没机会执行——
+//! 18 个子命令全部如此（`dae help libs` 反而是好的，因为它没有必填位置参数）。
+//! 自己校验换来两样东西：`<cmd> -h` 在缺参数时也能出帮助；错误文本可以是双语的、
+//! 并且指向 `dae help <cmd>`。顺带修掉一个更难看的副作用：clap 把我们的 `-h` 当成一个
+//! 名叫 `help` 的普通 flag，于是它生成的 usage 行印成 `dae libs --help <BINARY> [PATTERN]`，
+//! 看起来像 `--help` 是必填项。
+//!
 //! 共享选项只声明一次（[`Common`]），各命令用 `#[command(flatten)]` 引入——这是 ddc 那
 //! 9 处重复 `--dex` 转发块的反面。
 
@@ -84,7 +93,19 @@ pub enum Cmd {
     /// this guide (bilingual), or `dae help <cmd>` for one command
     Help(Help),
     /// print name and version
-    Version,
+    Version(VersionArgs),
+}
+
+/// `version`
+///
+/// 只为了 `-h/--help` 存在：`dae version -h` 与其它 21 个子命令保持一致的行为，
+/// 而不是报「unexpected argument '-h' found」。
+#[derive(Args)]
+#[command(disable_help_flag = true)]
+pub struct VersionArgs {
+    /// show this command's help (bilingual)
+    #[arg(short = 'h', long = "help")]
+    pub help: bool,
 }
 
 /// 所有子命令共享的选项。
@@ -158,7 +179,7 @@ pub struct Query {
     pub common: Common,
 
     /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
-    pub binary: String,
+    pub binary: Option<String>,
 
     /// optional name filter
     pub pattern: Option<String>,
@@ -172,10 +193,10 @@ pub struct Target {
     pub common: Common,
 
     /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
-    pub binary: String,
+    pub binary: Option<String>,
 
     /// what to look up: a name, or 0xADDRESS where the command accepts one
-    pub name: String,
+    pub name: Option<String>,
 }
 
 /// `<binary> <out_dir> [--decompile]`
@@ -186,10 +207,10 @@ pub struct Export {
     pub common: Common,
 
     /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
-    pub binary: String,
+    pub binary: Option<String>,
 
     /// output directory (created if missing)
-    pub out_dir: String,
+    pub out_dir: Option<String>,
 
     /// also emit dart/ pseudocode
     #[arg(long = "decompile")]
@@ -206,7 +227,7 @@ pub struct Members {
     pub common: Common,
 
     /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
-    pub binary: String,
+    pub binary: Option<String>,
 
     /// optional name filter (substring)
     pub pattern: Option<String>,
@@ -237,13 +258,13 @@ pub struct FindRefs {
     pub common: Common,
 
     /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
-    pub binary: String,
+    pub binary: Option<String>,
 
     /// what to look for: `string` (pool string literals) or `kind` (object kind)
-    pub kind: String,
+    pub kind: Option<String>,
 
     /// the text to search (substring) or the object kind name (exact)
-    pub query: String,
+    pub query: Option<String>,
 }
 
 /// `decompile <binary> [-o DIR|FILE.dart|-]`
@@ -257,13 +278,17 @@ pub struct Decompile {
     pub common: Common,
 
     /// target binary (Mach-O/ELF/PE with a Dart AOT snapshot; .app/.framework accepted)
-    pub binary: String,
+    pub binary: Option<String>,
 }
 
 /// `help [cmd]`
 #[derive(Args)]
 #[command(disable_help_flag = true)]
 pub struct Help {
+    /// show this command's help (bilingual)
+    #[arg(short = 'h', long = "help")]
+    pub help: bool,
+
     /// command to show help for; omit for the whole guide
     pub cmd: Option<String>,
 }
