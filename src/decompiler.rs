@@ -47,11 +47,31 @@ enum Expr {
     Text(String),
 }
 
+/// 立即数的渲染口径：**小值十进制，机器位型十六进制**。
+///
+/// 阈值 0x100 是按实际分布定的，不是拍脑袋：本语料里所有 ≥ 256 的 `Imm` 都是
+/// 位型 / 掩码 / 码点（`0xdc00`、`0xfffd`、`0xffff`、`0x7ffff`、`0x3fffffff`、
+/// `0x7fffffffffffffff`），十进制完全读不出来；而 < 256 的全是 0..11 这类计数，
+/// 十六进制反而难读。
+///
+/// **负数保持十进制**：Rust 的 `{:#x}` 对负数印的是补码，`-4096` 会变成
+/// `0xfffffffffffff000`——那不是「更专业」，是换了一种误导。
+///
+/// 只在这里定义一次：渲染点有两处（[`Expr::text`] 与发射时的折枝路径），
+/// 各写一遍就只会改一处（本仓库在 `edges_resolved` 上吃过这个亏）。
+fn imm_text(v: i64) -> String {
+    if v >= 0x100 {
+        format!("{v:#x}")
+    } else {
+        format!("{v}")
+    }
+}
+
 impl Expr {
     fn text(&self, rl: &Roles) -> String {
         match self {
             Expr::Reg(r) => r.clone(),
-            Expr::Imm(v) => format!("{v}"),
+            Expr::Imm(v) => imm_text(*v),
             Expr::Pool(i) => format!("pp[0x{i:x}]"),
             Expr::Mem(m) => mem_read(rl, m),
             Expr::Text(x) => x.clone(),
@@ -1850,7 +1870,21 @@ impl MemOperand {
 
 #[cfg(test)]
 mod literal_tests {
-    use super::dart_literal;
+    use super::{dart_literal, imm_text};
+
+    /// 立即数：小计数十进制、机器位型十六进制、负数恒十进制。
+    #[test]
+    fn immediate_rendering_uses_hex_for_bit_patterns() {
+        for v in [0i64, 1, 4, 11, 255] {
+            assert_eq!(imm_text(v), v.to_string(), "{v} 应保持十进制");
+        }
+        assert_eq!(imm_text(0x100), "0x100");
+        assert_eq!(imm_text(1073741823), "0x3fffffff");
+        assert_eq!(imm_text(0xffff), "0xffff");
+        assert_eq!(imm_text(i64::MAX), "0x7fffffffffffffff");
+        assert_eq!(imm_text(-2), "-2");
+        assert_eq!(imm_text(-4096), "-4096");
+    }
 
     /// 池里的字符串要变成**合法 Dart 字面量**：每个元字符都得转义。
     /// `$` 那条是真机应用里踩出来的——`"$IsolateException"` 不转义就是插值，
@@ -4850,7 +4884,7 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
                         .get(r)
                         .map(|(e, _, _)| e.clone())
                         .unwrap_or_else(|| r.clone()),
-                    Expr::Imm(v) => format!("{v}"),
+                    Expr::Imm(v) => imm_text(*v),
                     Expr::Pool(i) => format!("pp[0x{i:x}]"),
                     Expr::Mem(m) => {
                         let d = pending.values().map(|(_, d, _)| *d).max().unwrap_or(0);
