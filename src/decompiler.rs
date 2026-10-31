@@ -1872,6 +1872,27 @@ impl MemOperand {
 mod literal_tests {
     use super::{dart_literal, imm_text};
 
+    /// 替换进操作数时，只有**非裸标识符**才需要括号。
+    #[test]
+    fn substitution_parenthesises_only_when_needed() {
+        use super::subst_needs_parens;
+        // 裸标识符：不加括号（`local_*` 带下划线但仍是单个标识符）
+        for e in ["local_m10", "x0", "BARRIER", "THR", "FP", "_tmp"] {
+            assert!(!subst_needs_parens(e), "{e} 是裸标识符，不该加括号");
+        }
+        // 单个后置调用也是原子：括号多余
+        for e in ["mem(x0, 7)", "mem(mem(x, 7), 0xf)", "callIndirect(LR)", "mem(a, b, c, d)"] {
+            assert!(!subst_needs_parens(e), "{e} 是单个调用，不该加括号");
+        }
+        // 带运算符 / 字面量 / 调用之后再运算的，一律加括号（优先级可能改变解析）
+        for e in [
+            "x0 + 8", "a << 3", "0x1cf2", "-2", "pp[0x78]", "", "mem(x, 7) + 8",
+            "mem(x, 7) >> 2", "foo(a) * 2", "f(a).b", "f(a)(", "f(", "f(a))",
+        ] {
+            assert!(subst_needs_parens(e), "{e:?} 需要括号");
+        }
+    }
+
     /// 立即数：小计数十进制、机器位型十六进制、负数恒十进制。
     #[test]
     fn immediate_rendering_uses_hex_for_bit_patterns() {
@@ -4966,6 +4987,59 @@ fn nest_block(stmts: &[Stmt], rl: &Roles) -> Vec<Stmt> {
 }
 
 /// 把操作数文本里的寄存器替换成待定表达式（词边界匹配，深度受 pending 自身限制）
+/// 替换进操作数文本时是否需要加括号。
+///
+/// 两种形态在任何表达式位置都是**原子**，去掉括号不改解析：
+/// 1. **裸标识符**——`local_m10`、`BARRIER`、`THR`。按形状判（首字符字母或下划线、
+///    其余字母数字或下划线），并排除 Dart 保留字（本项目的寄存器名撞不上，但判据该完备）。
+/// 2. **单个后置调用**——`mem(x0, 7)`、`mem(mem(x, 7), 0xf)`。判据是「标识符开头、
+///    紧跟一个深度配平的括号组、且配平点正好在末尾」：`f(a) + b` 与 `f(a) * 2` 都
+///    不满足（末尾不是配平点），因此照旧加括号；`f(a).b` 也不满足（末尾是 `.b`）。
+///
+/// 其余一律加括号（优先级可能改变解析，宁可多一层）。
+fn subst_needs_parens(e: &str) -> bool {
+    if e.is_empty() {
+        return true;
+    }
+    let mut it = e.chars();
+    let head_ok = it
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false);
+    let rest: String = it.collect();
+    if !head_ok {
+        return true;
+    }
+    // 形态 1：整串就是一个标识符
+    if rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return is_dart_keyword(e); // 保留字才需要括号（实际不会发生，保持判据完备）
+    }
+    // 形态 2：`name(...)`，且配平的右括号正好是最后一个字符
+    let Some(open) = rest.find('(') else { return true };
+    if !rest[..open].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return true; // `name` 与 `(` 之间还有别的东西
+    }
+    let body = &rest[open..];
+    let mut depth = 0i32;
+    for (i, c) in body.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // 配平点必须正好在末尾，否则说明后面还有运算
+                    return i + 1 != body.len();
+                }
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    true // 括号没配平
+}
+
 fn subst_regs(text: &str, pending: &BTreeMap<String, (String, usize, u64)>, rl: &Roles) -> String {
     let mut s = text.to_string();
     let mut names: Vec<&String> = pending.keys().collect();
@@ -5006,7 +5080,18 @@ fn subst_regs(text: &str, pending: &BTreeMap<String, (String, usize, u64)>, rl: 
         if !s.contains(n.as_str()) {
             continue;
         }
-        s = replace_word(&s, n, &format!("({e})"));
+        // 裸标识符替换时**不要加括号**——它在任何表达式位置都是原子的。
+        // 原来这里无条件包一层，于是 `ldur r1,[fp,#-0x10]` 之后的
+        // `ldur r3,[r1,#0x17]` 渲染成 `mem((local_m10), 0x17)`：
+        // `local_m10` 带下划线，被上面「纯别名」的字符计数判据（按非字母数字切分）
+        // 算成两个 token，既走了替换、又被裹了括号。实测 Reqable 这类多余括号
+        // **53375 处**（正是 cure 的 `dart_paren_removal` 命中的那些）。
+        let repl = if subst_needs_parens(e) {
+            format!("({e})")
+        } else {
+            e.clone()
+        };
+        s = replace_word(&s, n, &repl);
     }
     let _ = rl;
     s
