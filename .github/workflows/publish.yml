@@ -14,9 +14,13 @@ jobs:
     # 凭据在 crates 环境里（CARGO_REGISTRY_TOKEN），手动触发时选择同一环境
     environment: crates
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # 与 release.yml 保持一致：v2 不再默认注入 `RUSTFLAGS=-D warnings`，
+          # 显式要求警告即失败（`cargo publish` 会本地构建验证 crate）。
+          build-warnings: deny
 
       - name: Publish to crates.io
         env:
